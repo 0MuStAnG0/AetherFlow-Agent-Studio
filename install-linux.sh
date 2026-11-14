@@ -30,6 +30,9 @@ BRANCH="${AETHERFLOW_BRANCH:-main}"
 TARGET_DIR="${AETHERFLOW_DIR:-}"
 CUSTOM_PORT="${AETHERFLOW_PORT:-}"
 UPDATE_ONLY=false
+ENABLE_NGINX=false
+SSL_DOMAIN="${AETHERFLOW_DOMAIN:-}"
+SSL_EMAIL="${AETHERFLOW_EMAIL:-}"
 
 usage() {
   cat <<'EOF'
@@ -42,6 +45,9 @@ One-Line Remote Install (run on Ubuntu / Debian / RHEL / Rocky / Alma / Alpine):
 With Systemd Background Service:
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
 
+With Nginx Reverse Proxy + Let's Encrypt SSL:
+  curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --nginx --domain studio.example.com
+
 With Docker Compose:
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --docker
 
@@ -49,10 +55,13 @@ Options:
   --repo <url|owner/repo>  Override GitHub repository (default: 0MuStAnG0/AetherFlow-Agent-Studio)
   --branch <name>          Git branch to deploy (default: main)
   --dir <path>             Target install directory (default: /opt/aetherflow-studio for root, ~/aetherflow-studio otherwise)
-  --port <number>          Configure PORT in .env (default: 3000)
+  --port <number>          Configure internal PORT in .env (default: 3000)
   --docker                 Install Docker (if missing) and start via Docker Compose
   --native                 Install Node.js 22+ (if missing), build UI, and run in foreground
   --systemd                Install Node.js 22+ (if missing), build UI, and enable systemd service
+  --nginx                  Install and configure Nginx reverse proxy (ports 80/443 -> app PORT)
+  --domain <hostname>      Domain name for Nginx + automatic Let's Encrypt SSL certificate (implies --nginx)
+  --email <email>          Optional email for Let's Encrypt SSL expiry notifications
   --update                 Pull latest changes from GitHub and rebuild/restart
   --skip-deps              Skip automatic OS prerequisite package installation
   --check                  Check Linux prerequisites without modifying the system
@@ -65,6 +74,17 @@ while [[ $# -gt 0 ]]; do
     --docker) MODE="docker"; shift ;;
     --native) MODE="native"; shift ;;
     --systemd) MODE="native"; INSTALL_SYSTEMD=true; shift ;;
+    --nginx) ENABLE_NGINX=true; shift ;;
+    --domain)
+      [[ $# -ge 2 ]] || { echo "Missing value for --domain" >&2; exit 1; }
+      SSL_DOMAIN="$2"; ENABLE_NGINX=true; shift 2 ;;
+    --domain=*)
+      SSL_DOMAIN="${1#*=}"; ENABLE_NGINX=true; shift ;;
+    --email)
+      [[ $# -ge 2 ]] || { echo "Missing value for --email" >&2; exit 1; }
+      SSL_EMAIL="$2"; shift 2 ;;
+    --email=*)
+      SSL_EMAIL="${1#*=}"; shift ;;
     --check) RUN_CHECK_ONLY=true; shift ;;
     --update) UPDATE_ONLY=true; shift ;;
     --skip-deps) SKIP_DEPS=true; shift ;;
@@ -375,6 +395,15 @@ if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
   if [[ -n "$CUSTOM_PORT" ]]; then
     FORWARD_ARGS+=(--port "$CUSTOM_PORT")
   fi
+  if [[ "$ENABLE_NGINX" == true ]]; then
+    FORWARD_ARGS+=(--nginx)
+  fi
+  if [[ -n "$SSL_DOMAIN" ]]; then
+    FORWARD_ARGS+=(--domain "$SSL_DOMAIN")
+  fi
+  if [[ -n "$SSL_EMAIL" ]]; then
+    FORWARD_ARGS+=(--email "$SSL_EMAIL")
+  fi
   if [[ "$SKIP_DEPS" == true ]]; then
     FORWARD_ARGS+=(--skip-deps)
   fi
@@ -427,6 +456,138 @@ if [[ "$MODE" == "auto" ]]; then
   fi
 fi
 
+setup_nginx_and_ssl() {
+  if [[ "$ENABLE_NGINX" != true && -z "$SSL_DOMAIN" ]]; then
+    return 0
+  fi
+
+  local pm
+  pm="$(detect_pkg_mgr)"
+  local app_port="${PORT:-3000}"
+  local server_name="_"
+
+  if [[ -n "$SSL_DOMAIN" ]]; then
+    if [[ ! "$SSL_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+      err "Invalid --domain hostname: $SSL_DOMAIN"
+      exit 1
+    fi
+    server_name="$SSL_DOMAIN"
+  fi
+
+  if [[ "$SKIP_DEPS" == false ]]; then
+    log "Installing Nginx reverse proxy${SSL_DOMAIN:+ and Certbot SSL}..."
+    case "$pm" in
+      apt)
+        run_priv env DEBIAN_FRONTEND=noninteractive apt-get update -y
+        if [[ -n "$SSL_DOMAIN" ]]; then
+          run_priv env DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot python3-certbot-nginx
+        else
+          run_priv env DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+        fi
+        ;;
+      dnf)
+        if [[ -n "$SSL_DOMAIN" ]]; then
+          run_priv dnf install -y nginx certbot python3-certbot-nginx
+        else
+          run_priv dnf install -y nginx
+        fi
+        ;;
+      yum)
+        if [[ -n "$SSL_DOMAIN" ]]; then
+          run_priv yum install -y nginx certbot python3-certbot-nginx
+        else
+          run_priv yum install -y nginx
+        fi
+        ;;
+      apk)
+        if [[ -n "$SSL_DOMAIN" ]]; then
+          run_priv apk add --no-cache nginx certbot certbot-nginx
+        else
+          run_priv apk add --no-cache nginx
+        fi
+        ;;
+      *)
+        warn "Unsupported package manager for automatic Nginx install; skipping Nginx setup."
+        return 0
+        ;;
+    esac
+  fi
+
+  local tmp_conf
+  tmp_conf="$(mktemp)"
+  cat > "$tmp_conf" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name};
+
+    client_max_body_size 30M;
+
+    location /ws {
+        proxy_pass http://127.0.0.1:${app_port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${app_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 120s;
+    }
+}
+EOF
+
+  if [[ -d /etc/nginx/sites-available ]]; then
+    run_priv mv "$tmp_conf" /etc/nginx/sites-available/aetherflow-studio
+    run_priv ln -sf /etc/nginx/sites-available/aetherflow-studio /etc/nginx/sites-enabled/aetherflow-studio
+    run_priv rm -f /etc/nginx/sites-enabled/default || true
+  else
+    run_priv mkdir -p /etc/nginx/conf.d
+    run_priv mv "$tmp_conf" /etc/nginx/conf.d/aetherflow-studio.conf
+  fi
+
+  run_priv nginx -t
+  if command -v systemctl >/dev/null 2>&1; then
+    run_priv systemctl enable --now nginx || true
+    run_priv systemctl reload nginx || run_priv systemctl restart nginx
+  else
+    run_priv nginx -s reload || run_priv nginx
+  fi
+  log "Nginx reverse proxy configured (port 80 -> 127.0.0.1:${app_port})."
+
+  if [[ -n "$SSL_DOMAIN" ]] && command -v certbot >/dev/null 2>&1; then
+    log "Requesting Let's Encrypt SSL certificate for ${SSL_DOMAIN}..."
+    local cert_args=(--nginx -d "$SSL_DOMAIN" --non-interactive --agree-tos --redirect)
+    if [[ -n "$SSL_EMAIL" ]]; then
+      cert_args+=(--email "$SSL_EMAIL")
+    else
+      cert_args+=(--register-unsafely-without-email)
+    fi
+    if run_priv certbot "${cert_args[@]}"; then
+      if [[ -f "$APP_DIR/.env" ]]; then
+        if grep -qE '^APP_URL=' "$APP_DIR/.env"; then
+          sed -i.bak -E "s|^APP_URL=.*|APP_URL=\"https://${SSL_DOMAIN}\"|" "$APP_DIR/.env" && rm -f "$APP_DIR/.env.bak"
+        else
+          printf "\nAPP_URL=\"https://%s\"\n" "$SSL_DOMAIN" >> "$APP_DIR/.env"
+        fi
+      fi
+      log "HTTPS SSL active at https://${SSL_DOMAIN}"
+    else
+      warn "Certbot SSL issuance failed (ensure DNS A-record points to this server and port 80 is open). Re-run: sudo certbot --nginx -d ${SSL_DOMAIN}"
+    fi
+  fi
+}
+
 ensure_env_file
 mkdir -p "$APP_DIR/data" /tmp/aetherflow_sandboxes /tmp/aetherflow_projects
 
@@ -437,11 +598,17 @@ if [[ "$MODE" == "docker" ]]; then
   log "Waiting for http://127.0.0.1:${PORT:-3000}/api/health ..."
   for _ in $(seq 1 30); do
     if curl -fsS "http://127.0.0.1:${PORT:-3000}/api/health" >/dev/null 2>&1; then
-      log "AetherFlow Agent Studio is live at http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):${PORT:-3000}"
+      setup_nginx_and_ssl
+      if [[ -n "$SSL_DOMAIN" ]]; then
+        log "AetherFlow Agent Studio is live at https://${SSL_DOMAIN}"
+      else
+        log "AetherFlow Agent Studio is live at http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):${PORT:-3000}"
+      fi
       exit 0
     fi
     sleep 2
   done
+  setup_nginx_and_ssl
   warn "Container started; inspect logs with: docker compose logs -f"
   exit 0
 fi
@@ -481,14 +648,24 @@ if [[ "$INSTALL_SYSTEMD" == true ]]; then
   run_priv mv "$TMP_UNIT" "$SERVICE_DEST"
   run_priv systemctl daemon-reload
   run_priv systemctl enable --now aetherflow-studio.service
+  run_priv systemctl restart aetherflow-studio.service || true
   run_priv systemctl status --no-pager aetherflow-studio.service || true
 
+  setup_nginx_and_ssl
+
   SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost)"
-  log "Installed systemd service! URL: http://${SERVER_IP}:${PORT:-3000}"
+  if [[ -n "$SSL_DOMAIN" ]]; then
+    log "Installed systemd + Nginx SSL! URL: https://${SSL_DOMAIN}"
+  elif [[ "$ENABLE_NGINX" == true ]]; then
+    log "Installed systemd + Nginx! URL: http://${SERVER_IP}"
+  else
+    log "Installed systemd service! URL: http://${SERVER_IP}:${PORT:-3000}"
+  fi
   log "Manage service: sudo systemctl status|restart|stop aetherflow-studio"
   log "View live logs: sudo journalctl -u aetherflow-studio -f"
   exit 0
 fi
 
+setup_nginx_and_ssl
 log "Build complete! Starting AetherFlow Agent Studio in production mode on port ${PORT:-3000}..."
-exec env NODE_ENV=production ./node_modules/.bin/tsx server.ts
+exec env NODE_ENV=production NODE_USE_ENV_PROXY=1 ./node_modules/.bin/tsx server.ts

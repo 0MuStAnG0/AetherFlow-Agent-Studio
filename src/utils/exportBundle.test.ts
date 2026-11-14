@@ -5,18 +5,22 @@ import { DEFAULT_SEED_WORKFLOWS } from '../data/agentTemplates.ts';
 import { createZipBufferFromBundle } from '../../server/zipBundle.ts';
 import {
   assembleExportBundleFiles,
+  buildContentDispositionHeader,
   isSafeExportFilePath,
   slugifyBundleName,
   validateGitHubPushParams,
 } from './exportBundle.ts';
 
-test('isSafeExportFilePath blocks .env secrets, databases, and path traversal while allowing .env.example', () => {
+test('isSafeExportFilePath blocks .env secrets, databases, and path traversal while allowing .env.example and .gitignore', () => {
   assert.equal(isSafeExportFilePath('src/App.tsx'), true);
+  assert.equal(isSafeExportFilePath('.gitignore'), true);
+  assert.equal(isSafeExportFilePath('.dockerignore'), true);
   assert.equal(isSafeExportFilePath('.env.example'), true);
   assert.equal(isSafeExportFilePath('deploy/.env.example'), true);
   assert.equal(isSafeExportFilePath('.env'), false);
   assert.equal(isSafeExportFilePath('.env.local'), false);
   assert.equal(isSafeExportFilePath('data/studio.db'), false);
+  assert.equal(isSafeExportFilePath('.playwright-cli/snap.yml'), false);
   assert.equal(isSafeExportFilePath('../etc/passwd'), false);
   assert.equal(isSafeExportFilePath('node_modules/pkg/index.js'), false);
 });
@@ -67,7 +71,26 @@ test('assembleExportBundleFiles merges project and sandbox files and creates val
   assert.ok(zipEntries.includes('AETHERFLOW_WORKFLOW.md'));
 });
 
-test('validateGitHubPushParams parses owner/repo, URL, branch, and default commit message', () => {
+test('assembleExportBundleFiles produces clean minimal ZIP for non-ASCII workflow with no test artifacts', () => {
+  const wf = { ...DEFAULT_SEED_WORKFLOWS[0], name: 'تیم مهندسی نرم‌افزار' };
+  assert.equal(slugifyBundleName(wf.name), 'aetherflow-project');
+  const files = assembleExportBundleFiles({
+    scope: 'project_bundle',
+    workflow: wf,
+    sandboxFiles: [],
+    importedProjectFiles: [],
+    bugReports: [],
+  });
+  assert.deepEqual(
+    files.map((f) => f.path),
+    ['.aetherflow/aetherflow-project.workflow.json', 'AETHERFLOW_WORKFLOW.md'],
+  );
+  const zipBuf = createZipBufferFromBundle(files);
+  const zip = new AdmZip(zipBuf);
+  assert.equal(zip.getEntries().length, 2);
+});
+
+test('validateGitHubPushParams and buildContentDispositionHeader handle valid/invalid inputs safely', () => {
   const valid = validateGitHubPushParams({
     repoInput: 'https://github.com/0MuStAnG0/AetherFlow-Agent-Studio',
     branch: 'feat/agents-export',
@@ -85,4 +108,8 @@ test('validateGitHubPushParams parses owner/repo, URL, branch, and default commi
   });
   assert.equal(invalid.valid, false);
   assert.equal(slugifyBundleName('Full-Stack Pipeline!'), 'full-stack-pipeline');
+
+  const header = buildContentDispositionHeader('my-bundle.zip');
+  assert.ok(header.includes('attachment; filename="my-bundle.zip"'));
+  assert.ok(header.includes("filename*=UTF-8''my-bundle.zip"));
 });

@@ -28,7 +28,7 @@ export interface GitHubPushRequestValidation {
   error?: string;
 }
 
-const FORBIDDEN_EXPORT_PATHS = /(^|\/)(\.env(\..+)?|.*\.db|.*\.sqlite.*|node_modules|dist|\.git)(\/|$)/i;
+const FORBIDDEN_EXPORT_PATHS = /(^|\/)(\.env(\..+)?|.*\.db|.*\.sqlite.*|node_modules|dist|\.git|\.playwright-cli)(\/|$)/i;
 const textEncoder = new TextEncoder();
 
 export function isSafeExportFilePath(relPath: string): boolean {
@@ -50,6 +50,13 @@ export function slugifyBundleName(rawName: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return slug || 'aetherflow-project';
+}
+
+export function buildContentDispositionHeader(filename: string): string {
+  const cleaned = filename.replace(/[\r\n"\\]/g, '_').trim() || 'aetherflow-bundle.zip';
+  const asciiFallback = cleaned.replace(/[^\x20-\x7E]/g, '_') || 'aetherflow-bundle.zip';
+  const encoded = encodeURIComponent(cleaned);
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
 }
 
 export function buildWorkflowMarkdownSummary(

@@ -268,6 +268,7 @@ export function SettingsView({
 
   const handleTestProviderKey = async (provider: LLMProvider) => {
     const secretName = getSecretNameForProvider(provider);
+    const pendingKey = apiKeyInputs[provider].trim();
     setKeyBusy((prev) => ({ ...prev, [provider]: true }));
     try {
       const res = await fetch('/api/provider-keys/test', {
@@ -277,6 +278,9 @@ export function SettingsView({
           provider,
           secretName,
           baseUrl: draft.providers[provider].baseUrl,
+          model: draft.providers[provider].defaultModel,
+          apiKey: pendingKey || undefined,
+          language: draft.language,
         }),
       });
       const data = (await res.json()) as { ok?: boolean; message?: string };
@@ -664,7 +668,7 @@ export function SettingsView({
                       {feedback && (
                         <p
                           data-testid={`api-key-feedback-${provider}`}
-                          className={`mt-1.5 text-[11px] font-medium ${
+                          className={`mt-1.5 break-words text-[11px] leading-relaxed font-medium ${
                             feedback.ok
                               ? 'text-emerald-700 dark:text-emerald-400'
                               : 'text-red-600 dark:text-red-400'
@@ -697,6 +701,13 @@ export function SettingsView({
                         }
                         className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                       />
+                      {provider === 'gemini' && (
+                        <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                          {isFa
+                            ? 'در صورت خطای 403 (محدودیت منطقه/IP)، آدرس پراکسی یا ورکر Gemini را اینجا وارد کرده و Save Settings را بزنید.'
+                            : 'If direct Google access returns 403 (region/IP block), set a Gemini proxy/relay URL here and save settings.'}
+                        </p>
+                      )}
                     </div>
 
                     <div className="grid grid-cols-2 gap-3">

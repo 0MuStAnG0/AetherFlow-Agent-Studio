@@ -21,6 +21,8 @@ export interface LinuxOneLineCommandOptions {
   mode?: LinuxInstallMode;
   installDir?: string;
   port?: string | number;
+  enableNginx?: boolean;
+  domain?: string;
 }
 
 export interface GeneratedLinuxInstallCommands {
@@ -204,6 +206,16 @@ export function buildLinuxOneLineCommand(
     flags.push('--port', String(portNum));
   }
 
+  const cleanDomain = (options.domain ?? '').trim();
+  const validDomain = /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(cleanDomain)
+    ? cleanDomain
+    : '';
+  if (validDomain) {
+    flags.push('--nginx', '--domain', shellQuoteIfNeeded(validDomain));
+  } else if (options.enableNginx) {
+    flags.push('--nginx');
+  }
+
   const oneLineCurlCommand =
     flags.length === 0
       ? `curl -fsSL ${rawScriptUrl} | bash`
@@ -216,6 +228,11 @@ export function buildLinuxOneLineCommand(
   else if (mode === 'native') localFlags.push('--native');
   if (Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535 && portNum !== 3000) {
     localFlags.push('--port', String(portNum));
+  }
+  if (validDomain) {
+    localFlags.push('--nginx', '--domain', shellQuoteIfNeeded(validDomain));
+  } else if (options.enableNginx) {
+    localFlags.push('--nginx');
   }
   const localFlagSuffix = localFlags.length > 0 ? ` ${localFlags.join(' ')}` : '';
   const targetDirName = dir ? shellQuoteIfNeeded(dir) : effectiveRepo;

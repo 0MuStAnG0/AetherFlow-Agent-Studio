@@ -81,4 +81,14 @@ test('buildLinuxOneLineCommand uses concise curl | bash without redundant --repo
     dockerCmd.oneLineCurlCommand,
     'curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --docker'
   );
+
+  const sslCmd = buildLinuxOneLineCommand({
+    repoInput: DEFAULT_GITHUB_REPO_URL,
+    mode: 'systemd',
+    domain: 'studio.example.com',
+  });
+  assert.equal(
+    sslCmd.oneLineCurlCommand,
+    'curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --nginx --domain studio.example.com'
+  );
 });

@@ -57,11 +57,15 @@ import {
   type ScannedProjectFile,
 } from './src/utils/projectAnalyzer.ts';
 import {
+  formatGeminiApiError,
   normalizeSecretName,
+  parseGeminiBaseUrl,
   validateApiKeyValue,
+  type GeminiApiVersion,
 } from './src/utils/secretUtils.ts';
 import {
   assembleExportBundleFiles,
+  buildContentDispositionHeader,
   isSafeExportFilePath,
   slugifyBundleName,
   validateGitHubPushParams,
@@ -104,20 +108,51 @@ const runSubscribers = new Map<string, Set<WebSocket>>();
 const runEventBuffers = new Map<string, ExecutionEvent[]>();
 const pendingApprovals = new Map<string, (approved: boolean) => void>();
 
-function getAiClient(secretRef?: string): GoogleGenAI | null {
+function getAiClient(
+  secretRef?: string,
+  options?: {
+    baseUrl?: string;
+    apiKey?: string;
+    apiVersion?: GeminiApiVersion;
+    vertexai?: boolean;
+  },
+): GoogleGenAI | null {
   const settings = getAppSettings();
   const primaryRef = secretRef || settings.providers.gemini?.envVarName || 'GEMINI_API_KEY';
   const resolved =
-    resolveServerSecret(primaryRef).value ??
+    options?.apiKey?.trim() ||
+    resolveServerSecret(primaryRef).value ||
     (primaryRef !== 'GEMINI_API_KEY' ? resolveServerSecret('GEMINI_API_KEY').value : null);
   if (!resolved) return null;
+
+  const rawBase =
+    options?.baseUrl?.trim() ||
+    settings.providers.gemini?.baseUrl?.trim() ||
+    process.env.GOOGLE_GEMINI_BASE_URL?.trim() ||
+    '';
+  const parsedBase = options?.vertexai ? {} : parseGeminiBaseUrl(rawBase);
+
+  const httpOptions: {
+    baseUrl?: string;
+    apiVersion?: string;
+    headers: Record<string, string>;
+  } = {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    },
+  };
+  if (parsedBase.baseUrl) {
+    httpOptions.baseUrl = parsedBase.baseUrl;
+  }
+  const effectiveVersion = options?.apiVersion || parsedBase.apiVersion;
+  if (effectiveVersion) {
+    httpOptions.apiVersion = effectiveVersion;
+  }
+
   return new GoogleGenAI({
     apiKey: resolved,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
+    ...(options?.vertexai ? { vertexai: true } : {}),
+    httpOptions,
   });
 }
 
@@ -1159,13 +1194,18 @@ async function generateLiveGeminiReply(params: {
         msg.toLowerCase().includes('timeout') ||
         msg.toLowerCase().includes('abort');
       if (!retryable) {
-        throw err;
+        const formatted = formatGeminiApiError(err, settings.language);
+        throw new Error(formatted.message);
       }
       await new Promise((r) => setTimeout(r, 300));
     }
   }
 
-  throw lastErr instanceof Error ? lastErr : new Error('All Gemini fallback models failed');
+  if (lastErr) {
+    const formatted = formatGeminiApiError(lastErr, settings.language);
+    throw new Error(formatted.message);
+  }
+  throw new Error('All Gemini fallback models failed');
 }
 
 async function processAgentTools(params: {
@@ -1698,7 +1738,9 @@ async function executeWorkflowRun(params: {
       completed: true,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unexpected execution failure';
+    const settings = getAppSettings();
+    const formatted = formatGeminiApiError(err, settings.language);
+    const message = formatted.message || (err instanceof Error ? err.message : 'Unexpected execution failure');
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
@@ -1765,93 +1807,211 @@ app.delete('/api/provider-keys/:secretName', (req, res) => {
 });
 
 app.post('/api/provider-keys/test', async (req, res) => {
-  const { provider, secretName, baseUrl } = req.body as {
+  const { provider, secretName, baseUrl, apiKey, model, language } = req.body as {
     provider?: WorkflowNode['data']['provider'];
     secretName?: string;
     baseUrl?: string;
+    apiKey?: string;
+    model?: string;
+    language?: 'en' | 'fa';
   };
   const settings = getAppSettings();
+  const lang: 'en' | 'fa' = language === 'fa' || language === 'en' ? language : settings.language;
+  const isFa = lang === 'fa';
   const targetProvider = provider || 'gemini';
   const ref =
     normalizeSecretName(secretName || '') ||
     settings.providers[targetProvider]?.envVarName ||
     'GEMINI_API_KEY';
-  const resolved = resolveServerSecret(ref);
-  const effectiveBase = (baseUrl || settings.providers[targetProvider]?.baseUrl || '').replace(/\/+$/, '');
 
-  if (targetProvider !== 'ollama' && targetProvider !== 'opencode' && !resolved.value) {
+  let inlineKey: string | undefined;
+  if (typeof apiKey === 'string' && apiKey.trim()) {
+    const check = validateApiKeyValue(apiKey);
+    if (!check.valid) {
+      res.status(400).json({
+        ok: false,
+        status: 400,
+        message: check.error || 'Invalid API key.',
+      });
+      return;
+    }
+    inlineKey = check.cleaned;
+  }
+
+  const resolved = resolveServerSecret(ref);
+  const fallbackGemini =
+    targetProvider === 'gemini' && ref !== 'GEMINI_API_KEY' && !resolved.value
+      ? resolveServerSecret('GEMINI_API_KEY').value
+      : null;
+  const keyToTest = inlineKey ?? resolved.value ?? fallbackGemini;
+  const effectiveBase = (baseUrl ?? settings.providers[targetProvider]?.baseUrl ?? '')
+    .trim()
+    .replace(/\/+$/, '');
+
+  if (targetProvider !== 'ollama' && targetProvider !== 'opencode' && !keyToTest) {
     res.status(400).json({
       ok: false,
       status: 400,
-      message: `No key found for ${ref}. Save an API key first.`,
+      message: isFa
+        ? `کلیدی برای ${ref} ذخیره یا وارد نشده است. ابتدا کلید API را وارد کنید.`
+        : `No key found for ${ref}. Enter or save an API key first.`,
     });
     return;
   }
 
   try {
     if (targetProvider === 'gemini') {
-      const client = getAiClient(ref);
-      if (!client) {
-        res.status(400).json({ ok: false, status: 400, message: `Key ${ref} is not configured.` });
+      const parsedBase = parseGeminiBaseUrl(effectiveBase);
+      if (parsedBase.error) {
+        res.status(400).json({
+          ok: false,
+          status: 400,
+          message: parsedBase.error,
+        });
         return;
       }
-      const resp = await client.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: 'Reply with OK',
-        config: { httpOptions: { timeout: 10000 } },
-      });
+
+      const candidateModels = Array.from(
+        new Set(
+          [
+            model?.trim(),
+            settings.providers.gemini?.defaultModel,
+            'gemini-3.1-flash-lite',
+            'gemini-4-hydrogen',
+            'gemini-4-argon',
+          ].filter((m): m is string => Boolean(m && m.startsWith('gemini-'))),
+        ),
+      );
+
+      const attemptConfigs: Array<{ apiVersion?: GeminiApiVersion; vertexai?: boolean }> = [
+        { apiVersion: parsedBase.apiVersion },
+      ];
+      if (!parsedBase.apiVersion) {
+        attemptConfigs.push({ apiVersion: 'v1beta' });
+      }
+      if (keyToTest && keyToTest.startsWith('AQ.') && !parsedBase.baseUrl) {
+        attemptConfigs.push({ vertexai: true });
+      }
+
+      let lastErr: unknown = null;
+      let sawOnlyNotFound = true;
+
+      for (const cfg of attemptConfigs) {
+        const client = getAiClient(ref, {
+          baseUrl: effectiveBase,
+          apiKey: keyToTest || undefined,
+          apiVersion: cfg.apiVersion,
+          vertexai: cfg.vertexai,
+        });
+        if (!client) continue;
+
+        for (const candidateModel of candidateModels) {
+          try {
+            const resp = await client.models.generateContent({
+              model: candidateModel,
+              contents: 'Reply with OK',
+              config: { httpOptions: { timeout: 12000 } },
+            });
+            const replyPreview = (resp.text || 'OK').trim().slice(0, 32);
+            const unsavedNote = inlineKey
+              ? isFa
+                ? ' (برای ذخیره دائمی دکمه Save Key را بزنید)'
+                : ' (click Save Key to store it)'
+              : '';
+            res.json({
+              ok: true,
+              status: 200,
+              model: candidateModel,
+              message: isFa
+                ? `اتصال Gemini با موفقیت برقرار شد (${candidateModel}: ${replyPreview})${unsavedNote}`
+                : `Gemini connected (${candidateModel}: ${replyPreview})${unsavedNote}`,
+            });
+            return;
+          } catch (err) {
+            lastErr = err;
+            const formatted = formatGeminiApiError(err, lang);
+            if (formatted.status !== 404) {
+              sawOnlyNotFound = false;
+            }
+            // Invalid key or geo/permission 403 won't be fixed by trying other models on same transport
+            if (
+              formatted.code === 'API_KEY_INVALID' ||
+              formatted.code === 'GEO_OR_ENDPOINT_FORBIDDEN' ||
+              formatted.code === 'LOCATION_NOT_SUPPORTED'
+            ) {
+              break;
+            }
+          }
+        }
+        if (!sawOnlyNotFound && !(keyToTest && keyToTest.startsWith('AQ.'))) {
+          break;
+        }
+      }
+
+      const formatted = formatGeminiApiError(lastErr, lang);
       res.json({
-        ok: true,
-        status: 200,
-        message: `Gemini connected (${(resp.text || 'OK').trim().slice(0, 32)})`,
+        ok: false,
+        status: formatted.status,
+        code: formatted.code,
+        message: formatted.message,
       });
       return;
     }
 
     if (targetProvider === 'openai' || targetProvider === 'opencode') {
       const headers: Record<string, string> = {};
-      if (resolved.value) headers.Authorization = `Bearer ${resolved.value}`;
+      if (keyToTest) headers.Authorization = `Bearer ${keyToTest}`;
       const r = await fetch(`${effectiveBase}/models`, {
         headers,
         signal: AbortSignal.timeout(8000),
       });
       if (!r.ok) {
         const body = await r.text().catch(() => '');
+        const cleanBody = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
         res.json({
           ok: false,
           status: r.status,
-          message: `HTTP ${r.status}: ${body.slice(0, 120) || 'Authentication failed'}`,
+          message: `HTTP ${r.status}: ${cleanBody.slice(0, 140) || 'Authentication failed'}`,
         });
         return;
       }
-      res.json({ ok: true, status: r.status, message: `${targetProvider} endpoint reachable (HTTP ${r.status})` });
+      res.json({
+        ok: true,
+        status: r.status,
+        message: `${targetProvider} endpoint reachable (HTTP ${r.status})`,
+      });
       return;
     }
 
     if (targetProvider === 'anthropic') {
       const r = await fetch(`${effectiveBase}/v1/models`, {
         headers: {
-          'x-api-key': resolved.value || '',
+          'x-api-key': keyToTest || '',
           'anthropic-version': '2023-06-01',
         },
         signal: AbortSignal.timeout(8000),
       });
       if (!r.ok) {
         const body = await r.text().catch(() => '');
+        const cleanBody = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
         res.json({
           ok: false,
           status: r.status,
-          message: `HTTP ${r.status}: ${body.slice(0, 120) || 'Authentication failed'}`,
+          message: `HTTP ${r.status}: ${cleanBody.slice(0, 140) || 'Authentication failed'}`,
         });
         return;
       }
-      res.json({ ok: true, status: r.status, message: `Anthropic endpoint reachable (HTTP ${r.status})` });
+      res.json({
+        ok: true,
+        status: r.status,
+        message: `Anthropic endpoint reachable (HTTP ${r.status})`,
+      });
       return;
     }
 
     // ollama
     const headers: Record<string, string> = {};
-    if (resolved.value) headers.Authorization = `Bearer ${resolved.value}`;
+    if (keyToTest) headers.Authorization = `Bearer ${keyToTest}`;
     const r = await fetch(`${effectiveBase}/api/tags`, {
       headers,
       signal: AbortSignal.timeout(5000),
@@ -1862,10 +2022,11 @@ app.post('/api/provider-keys/test', async (req, res) => {
       message: r.ok ? `Ollama reachable at ${effectiveBase}` : `Ollama returned HTTP ${r.status}`,
     });
   } catch (err) {
+    const formatted = formatGeminiApiError(err, lang);
     res.json({
       ok: false,
-      status: 0,
-      message: err instanceof Error ? err.message : 'Connection failed',
+      status: formatted.status,
+      message: formatted.message,
     });
   }
 });
@@ -2437,7 +2598,8 @@ async function executeDirectAgentTurn(params: {
       completed: true,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Direct agent chat failed';
+    const formatted = formatGeminiApiError(err, getAppSettings().language);
+    const message = formatted.message || (err instanceof Error ? err.message : 'Direct agent chat failed');
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
@@ -2689,7 +2851,8 @@ async function executeGroupDiscussionRound(params: {
       completed: true,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Group discussion failed';
+    const formatted = formatGeminiApiError(err, getAppSettings().language);
+    const message = formatted.message || (err instanceof Error ? err.message : 'Group discussion failed');
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
@@ -3097,6 +3260,8 @@ function listStudioSourceFilesFromDisk(): Array<{ path: string; content: string 
   const topLevelFiles = [
     'package.json',
     '.npmrc',
+    '.gitignore',
+    '.dockerignore',
     'tsconfig.json',
     'vite.config.ts',
     'index.html',
@@ -3156,7 +3321,7 @@ function resolveSandboxFilesForExport(workflow: WorkflowConfig, runId?: string):
     if (direct.length > 0) return direct;
   }
   const summaries = listRunSummaries();
-  const matchingRun = summaries.find((r) => r.workflowId === workflow.id) ?? summaries[0];
+  const matchingRun = summaries.find((r) => r.workflowId === workflow.id);
   if (matchingRun) {
     return listSandboxFiles(matchingRun.id);
   }
@@ -3243,6 +3408,36 @@ app.post('/api/export/preview', (req, res) => {
   }
 });
 
+const pendingZipDownloads = new Map<
+  string,
+  { filename: string; buffer: Buffer; expiresAt: number }
+>();
+
+function pruneExpiredZipDownloads() {
+  const now = Date.now();
+  for (const [token, entry] of pendingZipDownloads.entries()) {
+    if (entry.expiresAt <= now) {
+      pendingZipDownloads.delete(token);
+    }
+  }
+  while (pendingZipDownloads.size > 40) {
+    const oldest = pendingZipDownloads.keys().next().value;
+    if (!oldest) break;
+    pendingZipDownloads.delete(oldest);
+  }
+}
+
+function registerZipDownloadToken(filename: string, buffer: Buffer): string {
+  pruneExpiredZipDownloads();
+  const token = crypto.randomBytes(16).toString('hex');
+  pendingZipDownloads.set(token, {
+    filename,
+    buffer,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  });
+  return token;
+}
+
 app.post('/api/export/zip', (req, res) => {
   try {
     const body = req.body as {
@@ -3253,17 +3448,54 @@ app.post('/api/export/zip', (req, res) => {
     };
     const bundle = collectExportBundleForServer(body);
     const zipBuffer = createZipBufferFromBundle(bundle.files);
+    const token = registerZipDownloadToken(bundle.filename, zipBuffer);
     res.json({
       filename: bundle.filename,
       scope: bundle.scope,
       fileCount: bundle.files.length,
       totalBytes: zipBuffer.length,
+      downloadUrl: `/api/export/zip/download/${token}`,
       zipBase64: zipBuffer.toString('base64'),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to build ZIP archive.';
     res.status(400).json({ error: message });
   }
+});
+
+app.post('/api/export/zip/binary', (req, res) => {
+  try {
+    const body = req.body as {
+      scope?: ExportBundleScope;
+      workflow?: WorkflowConfig;
+      workflowId?: string;
+      runId?: string;
+    };
+    const bundle = collectExportBundleForServer(body);
+    const zipBuffer = createZipBufferFromBundle(bundle.files);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', buildContentDispositionHeader(bundle.filename));
+    res.setHeader('Content-Length', String(zipBuffer.length));
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(zipBuffer);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to build ZIP archive.';
+    res.status(400).json({ error: message });
+  }
+});
+
+app.get('/api/export/zip/download/:token', (req, res) => {
+  pruneExpiredZipDownloads();
+  const entry = pendingZipDownloads.get(req.params.token);
+  if (!entry) {
+    res.status(404).json({ error: 'ZIP download link expired or not found.' });
+    return;
+  }
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', buildContentDispositionHeader(entry.filename));
+  res.setHeader('Content-Length', String(entry.buffer.length));
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(entry.buffer);
 });
 
 app.post('/api/github/push', async (req, res) => {

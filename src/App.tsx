@@ -167,9 +167,8 @@ export default function App() {
     secrets: {},
   });
   const [executionMode, setExecutionMode] = useState<'live' | 'dry_run'>('dry_run');
-  const [taskPrompt, setTaskPrompt] = useState(
-    'Design a rate-limited FastAPI health endpoint with input validation, unit tests, and Docker verification.',
-  );
+  const [taskPrompt, setTaskPrompt] = useState('');
+  const [isDownloadingZip, setIsDownloadingZip] = useState(false);
   const [targetAgentId, setTargetAgentId] = useState<string>('all');
   const [isSendingChat, setIsSendingChat] = useState(false);
   const [isConvertingPrompt, setIsConvertingPrompt] = useState(false);
@@ -470,10 +469,13 @@ export default function App() {
     const link = document.createElement('a');
     link.href = url;
     link.download = `${slug}.workflow.json`;
+    link.style.display = 'none';
     document.body.appendChild(link);
     link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(() => {
+      link.remove();
+      URL.revokeObjectURL(url);
+    }, 60_000);
     showNotice('success', COPY[lang].exportedNotice);
   };
 
@@ -496,7 +498,10 @@ export default function App() {
   };
 
   const handleDownloadZip = useCallback(
-    async (scope: ExportBundleScope = 'project_bundle') => {
+    async (
+      scope: ExportBundleScope = 'project_bundle',
+    ): Promise<{ ok: boolean; error?: string; filename?: string; fileCount?: number }> => {
+      setIsDownloadingZip(true);
       try {
         const res = await fetch('/api/export/zip', {
           method: 'POST',
@@ -509,36 +514,66 @@ export default function App() {
         });
         const data = (await res.json().catch(() => ({}))) as {
           filename?: string;
+          downloadUrl?: string;
           zipBase64?: string;
           fileCount?: number;
           error?: string;
         };
-        if (!res.ok || !data.zipBase64) {
-          showNotice('error', data.error || 'Failed to build ZIP archive.');
-          return;
+        if (!res.ok || (!data.downloadUrl && !data.zipBase64)) {
+          const errMsg =
+            data.error ||
+            (lang === 'fa' ? 'خطا در ساخت فایل فشرده ZIP.' : 'Failed to build ZIP archive.');
+          showNotice('error', errMsg);
+          return { ok: false, error: errMsg };
         }
-        const binaryStr = window.atob(data.zipBase64);
-        const bytes = new Uint8Array(binaryStr.length);
-        for (let i = 0; i < binaryStr.length; i += 1) {
-          bytes[i] = binaryStr.charCodeAt(i);
+
+        const filename = data.filename || 'aetherflow-bundle.zip';
+
+        if (data.downloadUrl) {
+          const link = document.createElement('a');
+          link.href = data.downloadUrl;
+          link.download = filename;
+          link.rel = 'noopener';
+          link.style.display = 'none';
+          document.body.appendChild(link);
+          link.click();
+          setTimeout(() => link.remove(), 5000);
+        } else if (data.zipBase64) {
+          const binaryStr = window.atob(data.zipBase64);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let i = 0; i < binaryStr.length; i += 1) {
+            bytes[i] = binaryStr.charCodeAt(i);
+          }
+          const blob = new Blob([bytes], { type: 'application/zip' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = filename;
+          link.style.display = 'none';
+          document.body.appendChild(link);
+          link.click();
+          setTimeout(() => {
+            link.remove();
+            URL.revokeObjectURL(url);
+          }, 60_000);
         }
-        const blob = new Blob([bytes], { type: 'application/zip' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = data.filename || 'aetherflow-bundle.zip';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(url);
+
         showNotice(
           'success',
           lang === 'fa'
-            ? `فایل فشرده «${data.filename}» (${data.fileCount ?? 0} فایل) با موفقیت دانلود شد.`
-            : `Downloaded "${data.filename}" (${data.fileCount ?? 0} files).`,
+            ? `فایل فشرده «${filename}» (${data.fileCount ?? 0} فایل) آماده و دانلود شد.`
+            : `Downloaded "${filename}" (${data.fileCount ?? 0} files).`,
         );
+        return { ok: true, filename, fileCount: data.fileCount };
       } catch {
-        showNotice('error', 'Network error while generating ZIP archive.');
+        const errMsg =
+          lang === 'fa'
+            ? 'خطای شبکه هنگام ساخت و دانلود فایل ZIP.'
+            : 'Network error while generating ZIP archive.';
+        showNotice('error', errMsg);
+        return { ok: false, error: errMsg };
+      } finally {
+        setIsDownloadingZip(false);
       }
     },
     [activeRunId, lang, showNotice, workflow],
@@ -1069,9 +1104,16 @@ export default function App() {
   const handleStartRun = async () => {
     setValidationError(null);
     setPromptEnhancedNotice(null);
-    const effectivePrompt =
-      taskPrompt.trim() ||
-      'Design a rate-limited FastAPI health endpoint with input validation, unit tests, and Docker verification.';
+    const effectivePrompt = taskPrompt.trim();
+    if (!effectivePrompt) {
+      setRightTab('execution');
+      setValidationError(
+        lang === 'fa'
+          ? 'لطفاً ابتدا دستور یا تسک مورد نظر را وارد کنید.'
+          : 'Enter a task prompt before starting a workflow run.',
+      );
+      return;
+    }
     if (workflow.nodes.length === 0) {
       setValidationError('Add at least one Agent node to the canvas before running.');
       return;
@@ -1400,8 +1442,9 @@ export default function App() {
                 <button
                   type="button"
                   data-testid="toolbar-download-zip-btn"
+                  disabled={isDownloadingZip}
                   onClick={() => void handleDownloadZip('project_bundle')}
-                  className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                  className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
                 >
                   <Archive className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
                   {t.saveZip}
@@ -1858,6 +1901,7 @@ export default function App() {
             }
             onRunDeployAudit={() => void handleRunTestAndDeploy()}
             onDownloadZip={() => void handleDownloadZip('full_studio')}
+            downloadingZip={isDownloadingZip}
             onOpenGitHubPush={() =>
               setGitHubPushModal({ open: true, initialScope: 'full_studio' })
             }

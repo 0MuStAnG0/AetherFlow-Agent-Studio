@@ -27,7 +27,9 @@ interface GitHubPushModalProps {
   capabilities: CapabilitiesState;
   onCapabilitiesUpdated: (cap: CapabilitiesState) => void;
   onClose: () => void;
-  onDownloadZip: (scope: ExportBundleScope) => Promise<void>;
+  onDownloadZip: (
+    scope: ExportBundleScope,
+  ) => Promise<{ ok: boolean; error?: string; filename?: string; fileCount?: number }>;
 }
 
 interface PreviewSummary {
@@ -155,7 +157,10 @@ export function GitHubPushModal({
     setError(null);
     setZipDownloading(true);
     try {
-      await onDownloadZip(scope);
+      const result = await onDownloadZip(scope);
+      if (result && !result.ok) {
+        setError(result.error || 'Failed to download ZIP archive.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to download ZIP archive.');
     } finally {

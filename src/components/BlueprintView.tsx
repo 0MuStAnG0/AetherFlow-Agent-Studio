@@ -24,6 +24,7 @@ interface BlueprintViewProps {
   defaultBranch?: string;
   onRunDeployAudit?: () => void;
   onDownloadZip?: () => void;
+  downloadingZip?: boolean;
   onOpenGitHubPush?: () => void;
 }
 
@@ -70,6 +71,7 @@ export function BlueprintView({
   defaultBranch,
   onRunDeployAudit,
   onDownloadZip,
+  downloadingZip = false,
   onOpenGitHubPush,
 }: BlueprintViewProps) {
   const [files, setFiles] = useState<BlueprintFile[]>([]);
@@ -97,6 +99,7 @@ export function BlueprintView({
   const [installMode, setInstallMode] = useState<LinuxInstallMode>('auto');
   const [installDir, setInstallDir] = useState<string>('');
   const [portInput, setPortInput] = useState<string>('3000');
+  const [domainInput, setDomainInput] = useState<string>('');
 
   useEffect(() => {
     if (defaultRepoUrl?.trim() && !repoInput.trim()) {
@@ -145,8 +148,9 @@ export function BlueprintView({
         mode: installMode,
         installDir,
         port: portInput,
+        domain: domainInput,
       }),
-    [repoInput, branchInput, installMode, installDir, portInput]
+    [repoInput, branchInput, installMode, installDir, portInput, domainInput]
   );
 
   const currentFile = files.find((f) => f.path === selectedPath) ?? files[0] ?? null;
@@ -191,8 +195,9 @@ export function BlueprintView({
             <button
               type="button"
               data-testid="blueprint-download-zip-btn"
+              disabled={downloadingZip}
               onClick={onDownloadZip}
-              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
             >
               <Archive className="h-4 w-4 text-blue-600" />
               {lang === 'fa' ? 'دانلود فایل ZIP کامل' : 'Download Full ZIP'}
@@ -309,6 +314,28 @@ export function BlueprintView({
               className="rounded-lg border border-slate-300 bg-white px-2.5 py-2 font-mono text-xs text-slate-900 outline-none focus:border-blue-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
             />
           </label>
+        </div>
+
+        <div className="mt-2.5 flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between">
+          <label className="flex flex-1 items-center gap-2 text-xs text-slate-700 dark:text-slate-300">
+            <span className="shrink-0 font-semibold">
+              {lang === 'fa' ? 'دامنه Nginx + SSL (اختیاری):' : 'Nginx + SSL Domain (Optional):'}
+            </span>
+            <input
+              type="text"
+              dir="ltr"
+              data-testid="github-deploy-domain-input"
+              value={domainInput}
+              onChange={(e) => setDomainInput(e.target.value)}
+              placeholder="studio.example.com"
+              className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs text-slate-900 outline-none focus:border-blue-600 sm:max-w-xs dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            />
+          </label>
+          <span className="text-[11px] text-slate-500 dark:text-slate-400">
+            {lang === 'fa'
+              ? 'Nginx و گواهی رایگان Let’s Encrypt را نصب می‌کند (تغییری در محدودیت جغرافیایی Google API نمی‌دهد).'
+              : 'Installs Nginx + Let’s Encrypt HTTPS for your domain (does not bypass Google outbound geo-blocks).'}
+          </span>
         </div>
 
         <div className="mt-3 space-y-2">
