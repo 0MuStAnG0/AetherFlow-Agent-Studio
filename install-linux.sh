@@ -345,9 +345,10 @@ if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
 
   if [[ -d "$TARGET_DIR/.git" ]]; then
     log "Updating existing repository in $TARGET_DIR (branch: $BRANCH)..."
+    git -C "$TARGET_DIR" config core.fileMode false || true
     git -C "$TARGET_DIR" fetch origin "$BRANCH"
-    git -C "$TARGET_DIR" checkout "$BRANCH" 2>/dev/null || git -C "$TARGET_DIR" checkout -b "$BRANCH" "origin/$BRANCH"
-    git -C "$TARGET_DIR" pull --ff-only origin "$BRANCH"
+    git -C "$TARGET_DIR" checkout -f "$BRANCH" 2>/dev/null || git -C "$TARGET_DIR" checkout -f -B "$BRANCH" "origin/$BRANCH"
+    git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
   elif [[ -e "$TARGET_DIR" && -n "$(ls -A "$TARGET_DIR" 2>/dev/null || true)" ]]; then
     err "Target directory $TARGET_DIR already exists and is not a git repository. Pass --dir <empty-path>."
     exit 1
@@ -360,6 +361,7 @@ if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
       run_priv chown -R "${SUDO_USER:-$USER}":"${SUDO_USER:-$USER}" "$TARGET_DIR"
       git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR"
     fi
+    git -C "$TARGET_DIR" config core.fileMode false || true
   fi
 
   FORWARD_ARGS=()
@@ -387,7 +389,9 @@ install_base_prerequisites
 
 if [[ "$UPDATE_ONLY" == true && -d "$APP_DIR/.git" ]]; then
   log "Pulling latest updates from GitHub (branch: $BRANCH)..."
-  git -C "$APP_DIR" pull --ff-only origin "$BRANCH" || git -C "$APP_DIR" pull --ff-only
+  git -C "$APP_DIR" config core.fileMode false || true
+  git -C "$APP_DIR" fetch origin "$BRANCH"
+  git -C "$APP_DIR" reset --hard "origin/$BRANCH"
 fi
 
 ensure_env_file() {
