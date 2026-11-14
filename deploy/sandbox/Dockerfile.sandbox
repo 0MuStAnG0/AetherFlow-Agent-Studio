@@ -1,0 +1,20 @@
+FROM python:3.11-slim-bookworm
+
+RUN useradd --create-home --uid 1000 --shell /bin/bash sandboxuser && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    git \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    pytest==8.3.4 \
+    httpx==0.28.1 \
+    ruff==0.8.4
+
+WORKDIR /workspace
+RUN chown -R sandboxuser:sandboxuser /workspace
+
+USER sandboxuser
+
+CMD ["/bin/sh"]

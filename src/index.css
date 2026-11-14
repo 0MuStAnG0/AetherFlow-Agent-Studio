@@ -1,0 +1,61 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: "Plus Jakarta Sans", "Vazirmatn", system-ui, sans-serif;
+    --font-sans: "DM Sans", "Vazirmatn", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* React Flow crisp theme overrides */
+.react-flow__controls {
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid rgb(226 232 240);
+}
+
+.dark .react-flow__controls {
+  border-color: rgb(30 41 59);
+  background-color: rgb(15 23 42);
+}
+
+.dark .react-flow__controls-button {
+  background-color: rgb(15 23 42);
+  border-bottom-color: rgb(30 41 59);
+  fill: rgb(226 232 240);
+}
+
+.dark .react-flow__controls-button:hover {
+  background-color: rgb(30 41 59);
+}
+
+.react-flow__minimap {
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid rgb(226 232 240);
+}
+
+.dark .react-flow__minimap {
+  border-color: rgb(30 41 59);
+  background-color: rgb(15 23 42);
+}

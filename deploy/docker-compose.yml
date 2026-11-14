@@ -1,0 +1,45 @@
+services:
+  sandbox-image:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile.sandbox
+    image: aetherflow-sandbox:latest
+    command: ["true"]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aetherflow-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - SANDBOX_IMAGE=aetherflow-sandbox:latest
+      - SANDBOX_WORKSPACE_ROOT=/tmp/aetherflow_workspaces
+      - STUDIO_DB_PATH=/data/studio.db
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - aetherflow_data:/data
+      - /tmp/aetherflow_workspaces:/tmp/aetherflow_workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - sandbox-image
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/frontend/Dockerfile
+    container_name: aetherflow-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  aetherflow_data:

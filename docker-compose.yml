@@ -1,0 +1,27 @@
+services:
+  aetherflow-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aetherflow-studio
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - aetherflow_data:/app/data
+      - aetherflow_sandboxes:/tmp/aetherflow_sandboxes
+      - aetherflow_projects:/tmp/aetherflow_projects
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  aetherflow_data:
+  aetherflow_sandboxes:
+  aetherflow_projects:
