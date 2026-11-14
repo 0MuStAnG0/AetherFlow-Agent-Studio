@@ -14,9 +14,15 @@ export interface AgentToolsConfig {
   execBash: boolean;
 }
 
+export type AgentPowerLevel = 'eco' | 'standard' | 'pro' | 'ultra';
+
 export interface AgentNodeData extends Record<string, unknown> {
   label: string;
   role: AgentRole;
+  section?: string;
+  positionTitle?: string;
+  responsibility?: string;
+  powerLevel?: AgentPowerLevel;
   provider: LLMProvider;
   model: string;
   envSecretRef: string;
@@ -147,11 +153,34 @@ export interface BlueprintFile {
   content: string;
 }
 
+export interface ModelCatalogMeta {
+  displayName?: string;
+  power?: AgentPowerLevel;
+}
+
+export interface CustomAgentTemplate {
+  id: string;
+  role: AgentRole;
+  title: string;
+  subtitle: string;
+  section?: string;
+  positionTitle?: string;
+  responsibility?: string;
+  powerLevel?: AgentPowerLevel;
+  defaultProvider: LLMProvider;
+  defaultModel: string;
+  defaultTemperature: number;
+  defaultTools: AgentToolsConfig;
+  systemPrompt: string;
+}
+
 export interface ProviderEndpointConfig {
   defaultModel: string;
   baseUrl: string;
   envVarName: string;
   customModels: string[];
+  disabledModels?: string[];
+  modelMeta?: Record<string, ModelCatalogMeta>;
 }
 
 export interface AppSettings {
@@ -169,6 +198,8 @@ export interface AppSettings {
   showMiniMap: boolean;
   canvasGridVariant: 'dots' | 'lines' | 'cross';
   providers: Record<LLMProvider, ProviderEndpointConfig>;
+  customTemplates?: CustomAgentTemplate[];
+  hiddenTemplateIds?: string[];
   updatedAt: string;
 }
 
@@ -198,6 +229,9 @@ export interface RecommendedAgentSpec {
   id: string;
   title: string;
   role: AgentRole;
+  section?: string;
+  positionTitle?: string;
+  powerLevel?: AgentPowerLevel;
   specialty: string;
   reason: string;
   recommendedProvider: LLMProvider;
@@ -225,3 +259,19 @@ export interface ImportedProjectAnalysis {
   importedAt: string;
 }
 
+export interface ProviderSecretStatus {
+  secretName: string;
+  configured: boolean;
+  source: 'vault' | 'env' | 'none';
+  maskedHint: string;
+  updatedAt?: string;
+}
+
+export interface CapabilitiesState {
+  geminiConfigured: boolean;
+  openaiConfigured: boolean;
+  anthropicConfigured: boolean;
+  opencodeConfigured: boolean;
+  ollamaBaseUrl?: string;
+  secrets?: Record<string, ProviderSecretStatus>;
+}

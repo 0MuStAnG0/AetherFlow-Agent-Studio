@@ -341,6 +341,9 @@ export function analyzeProjectFiles(params: {
     id: 'rec-manager',
     title: isFa ? 'ایجنت مدیر فنی و معمار (Manager)' : 'Lead Manager & Architect Agent',
     role: 'manager',
+    section: 'Architecture & Management',
+    positionTitle: isFa ? 'مدیر فنی و معمار ارشد' : 'Lead Software Architect',
+    powerLevel: 'ultra',
     specialty: isFa
       ? `مدیریت معماری و هماهنگی پروژه ${frameworks.slice(0, 3).join(' + ') || name}`
       : `Architecture Orchestration & Review (${frameworks.slice(0, 3).join(' / ') || 'Multi-Module'})`,
@@ -393,6 +396,9 @@ export function analyzeProjectFiles(params: {
       id: 'rec-backend',
       title: isFa ? 'ایجنت مهندس بک‌اند (Backend)' : 'Backend API & Services Agent',
       role: 'backend',
+      section: 'Backend & API',
+      positionTitle: isFa ? 'مهندس ارشد بک‌اند' : 'Senior Backend Engineer',
+      powerLevel: 'pro',
       specialty: isFa
         ? `توسعه سرویس‌ها و API مبتنی بر ${backendStack}`
         : `${backendStack} API & Service Engineering`,
@@ -437,6 +443,9 @@ export function analyzeProjectFiles(params: {
       id: 'rec-frontend',
       title: isFa ? 'ایجنت رابط کاربری و فرانت‌اند (Frontend)' : 'Frontend & UI Specialist Agent',
       role: 'frontend',
+      section: 'Frontend & UI',
+      positionTitle: isFa ? 'مهندس ارشد فرانت‌اند و UI' : 'Principal Frontend Engineer',
+      powerLevel: 'pro',
       specialty: isFa
         ? `طراحی کامپوننت و مدیریت وضعیت با ${feStack}`
         : `${feStack} Component & State Engineering`,
@@ -462,6 +471,9 @@ export function analyzeProjectFiles(params: {
       id: 'rec-database',
       title: isFa ? 'ایجنت متخصص دیتابیس و مدل داده' : 'Database & Schema Architect Agent',
       role: 'custom',
+      section: 'Database & Storage',
+      positionTitle: isFa ? 'معمار دیتابیس و Schema' : 'Database Architect',
+      powerLevel: 'pro',
       specialty: isFa
         ? 'طراحی Schema، کوئری‌های بهینه و امنیت داده‌ها (SQL / ORM)'
         : 'Database Schema, Migrations & Query Optimization',
@@ -484,6 +496,9 @@ export function analyzeProjectFiles(params: {
       id: 'rec-ai-specialist',
       title: isFa ? 'ایجنت مهندس هوش مصنوعی و پرامپت' : 'AI & Prompt Systems Specialist',
       role: 'custom',
+      section: 'AI & Prompts',
+      positionTitle: isFa ? 'مهندس سیستم‌های هوش مصنوعی' : 'AI Systems Engineer',
+      powerLevel: 'pro',
       specialty: isFa
         ? 'بهینه‌سازی فراخوانی مدل‌های LLM، پرامپت‌نویسی و مدیریت توکن'
         : 'LLM Integration, Prompt Engineering & Guardrails',
@@ -508,6 +523,9 @@ export function analyzeProjectFiles(params: {
     id: 'rec-security-qa',
     title: isFa ? 'ایجنت امنیت و تست خودکار (Security & QA)' : 'Security & QA Auditor Agent',
     role: 'security_qa',
+    section: 'Security & QA',
+    positionTitle: isFa ? 'ممیز امنیت و تست خودکار' : 'Security & QA Lead',
+    powerLevel: 'ultra',
     specialty: isFa
       ? `ممیزی امنیت OWASP، بررسی احراز هویت و نوشتن تست خودکار`
       : hasAuthOrSecurity
@@ -535,6 +553,9 @@ export function analyzeProjectFiles(params: {
     id: 'rec-executor',
     title: isFa ? 'ایجنت اجراگر، تست و DevOps (Executor)' : 'DevOps & Sandbox Executor Agent',
     role: 'executor',
+    section: 'DevOps & Sandbox',
+    positionTitle: isFa ? 'مهندس DevOps و اجراگر سندباکس' : 'DevOps Sandbox Runner',
+    powerLevel: 'standard',
     specialty: isFa
       ? hasDocker || hasCI
         ? 'اجرای Docker، بررسی CI/CD و تست واقعی در سندباکس لینوکس'
@@ -634,6 +655,10 @@ export function buildWorkflowFromRecommendations(params: {
         data: {
           label: spec.title,
           role: spec.role,
+          ...(spec.section ? { section: spec.section } : {}),
+          ...(spec.positionTitle ? { positionTitle: spec.positionTitle } : {}),
+          ...(spec.specialty ? { responsibility: spec.specialty } : {}),
+          powerLevel: spec.powerLevel ?? (spec.role === 'manager' || spec.role === 'security_qa' ? 'ultra' : 'pro'),
           provider: spec.recommendedProvider,
           model: spec.recommendedModel,
           envSecretRef:

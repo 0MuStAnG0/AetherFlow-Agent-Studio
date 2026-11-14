@@ -15,6 +15,7 @@ import {
   createRunRecord,
   deleteBugReport,
   deleteImportedProject,
+  deleteProviderSecret,
   deleteWorkflow,
   getAppSettings,
   getDb,
@@ -23,11 +24,15 @@ import {
   getWorkflowById,
   listBugReports,
   listImportedProjects,
+  listProviderSecretStatuses,
   listRunSummaries,
   listWorkflows,
+  resolveServerSecret,
   saveAppSettings,
   saveImportedProject,
+  setProviderSecret,
   updateBugReportStatus,
+  updateImportedProject,
   updateRunRecord,
   upsertWorkflow,
 } from './server/db.ts';
@@ -44,13 +49,26 @@ import type {
   WorkflowConfig,
   WorkflowNode,
 } from './src/types/workflow.ts';
-import { PROVIDER_MODELS } from './src/data/agentTemplates.ts';
+import { POWER_LEVEL_META, PROVIDER_MODELS } from './src/data/agentTemplates.ts';
 import {
   analyzeProjectFiles,
   parseGitHubRepoInput,
   sanitizeArchiveEntryPath,
   type ScannedProjectFile,
 } from './src/utils/projectAnalyzer.ts';
+import {
+  normalizeSecretName,
+  validateApiKeyValue,
+} from './src/utils/secretUtils.ts';
+import {
+  assembleExportBundleFiles,
+  isSafeExportFilePath,
+  slugifyBundleName,
+  validateGitHubPushParams,
+  type BundleFileEntry,
+  type ExportBundleScope,
+} from './src/utils/exportBundle.ts';
+import { createZipBufferFromBundle } from './server/zipBundle.ts';
 import {
   buildManagerInspectionContext,
   buildStructuredAgentPrompt,
@@ -86,17 +104,77 @@ const runSubscribers = new Map<string, Set<WebSocket>>();
 const runEventBuffers = new Map<string, ExecutionEvent[]>();
 const pendingApprovals = new Map<string, (approved: boolean) => void>();
 
-function getAiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') return null;
+function getAiClient(secretRef?: string): GoogleGenAI | null {
+  const settings = getAppSettings();
+  const primaryRef = secretRef || settings.providers.gemini?.envVarName || 'GEMINI_API_KEY';
+  const resolved =
+    resolveServerSecret(primaryRef).value ??
+    (primaryRef !== 'GEMINI_API_KEY' ? resolveServerSecret('GEMINI_API_KEY').value : null);
+  if (!resolved) return null;
   return new GoogleGenAI({
-    apiKey,
+    apiKey: resolved,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
     },
   });
+}
+
+function getSecretForNode(node: WorkflowNode, settings: AppSettings): string | null {
+  const defaultRef = settings.providers[node.data.provider]?.envVarName;
+  const customRef = node.data.envSecretRef?.trim();
+  if (customRef) {
+    const customResolved = resolveServerSecret(customRef).value;
+    if (customResolved) return customResolved;
+  }
+  if (defaultRef && defaultRef !== customRef) {
+    return resolveServerSecret(defaultRef).value;
+  }
+  return null;
+}
+
+function canNodeRunLive(node: WorkflowNode, settings: AppSettings): boolean {
+  if (node.data.provider === 'opencode' || node.data.provider === 'ollama') {
+    return true;
+  }
+  if (getSecretForNode(node, settings)) {
+    return true;
+  }
+  return Boolean(getAiClient());
+}
+
+function canWorkflowRunLive(nodes: WorkflowNode[], settings: AppSettings): boolean {
+  if (getAiClient()) return true;
+  return nodes.length > 0 && nodes.every((n) => canNodeRunLive(n, settings));
+}
+
+function buildCapabilitiesPayload() {
+  const settings = getAppSettings();
+  const known = [...Object.values(settings.providers).map((p) => p.envVarName), 'GITHUB_TOKEN'];
+  const secrets = listProviderSecretStatuses(known);
+  const geminiRef = normalizeSecretName(settings.providers.gemini?.envVarName || '') || 'GEMINI_API_KEY';
+  const openaiRef = normalizeSecretName(settings.providers.openai?.envVarName || '') || 'OPENAI_API_KEY';
+  const anthropicRef =
+    normalizeSecretName(settings.providers.anthropic?.envVarName || '') || 'ANTHROPIC_API_KEY';
+  const opencodeRef =
+    normalizeSecretName(settings.providers.opencode?.envVarName || '') || 'OPENCODE_API_KEY';
+
+  return {
+    geminiConfigured: Boolean(secrets[geminiRef]?.configured || secrets.GEMINI_API_KEY?.configured),
+    openaiConfigured: Boolean(secrets[openaiRef]?.configured || secrets.OPENAI_API_KEY?.configured),
+    anthropicConfigured: Boolean(
+      secrets[anthropicRef]?.configured || secrets.ANTHROPIC_API_KEY?.configured,
+    ),
+    opencodeConfigured: Boolean(
+      secrets[opencodeRef]?.configured || secrets.OPENCODE_API_KEY?.configured,
+    ),
+    ollamaBaseUrl:
+      settings.providers.ollama?.baseUrl ||
+      process.env.OLLAMA_BASE_URL ||
+      'http://host.docker.internal:11434',
+    secrets,
+  };
 }
 
 function broadcastEvent(runId: string, event: ExecutionEvent): void {
@@ -875,10 +953,17 @@ async function generateLiveGeminiReply(params: {
     : `\n- Reply in the same language the user used where appropriate.\n` +
       `- If you are the Manager in an automated pipeline and verification is complete, include TERMINATE.\n`;
 
+  const powerKey = node.data.powerLevel ?? 'standard';
+  const powerMeta = POWER_LEVEL_META[powerKey] ?? POWER_LEVEL_META.standard;
+
   const systemInstruction =
     `${node.data.systemPrompt}\n\n` +
     `Agent Name: ${node.data.label}\n` +
     `Role: ${node.data.role}\n` +
+    (node.data.section ? `Department / Section: ${node.data.section}\n` : '') +
+    (node.data.positionTitle ? `Position / Post: ${node.data.positionTitle}\n` : '') +
+    (node.data.responsibility ? `Assigned Responsibility: ${node.data.responsibility}\n` : '') +
+    `Power & Reasoning Profile: ${powerMeta.en} — ${powerMeta.directive}\n` +
     `Configured Provider Profile: ${node.data.provider} (${node.data.model})\n` +
     `Authorized Tools: ${toolHints.length > 0 ? toolHints.join(', ') : 'None'}\n` +
     `Keep responses focused, technical, and concise (under 200 words). ` +
@@ -896,17 +981,19 @@ async function generateLiveGeminiReply(params: {
       .map((m) => `[${m.role.toUpperCase()}]:\n${m.content}`)
       .join('\n\n---\n\n') + snapshotBlock;
 
+  const settings = getAppSettings();
+  const nodeKey = getSecretForNode(node, settings);
+
   if (node.data.provider === 'opencode') {
-    const settings = getAppSettings();
     const baseUrl = (settings.providers.opencode?.baseUrl || 'https://opencode.ai/zen/v1').replace(/\/+$/, '');
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (process.env.OPENCODE_API_KEY) {
-      headers.Authorization = `Bearer ${process.env.OPENCODE_API_KEY}`;
+    if (nodeKey) {
+      headers.Authorization = `Bearer ${nodeKey}`;
     }
     const openCodeRes = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers,
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(15000),
       body: JSON.stringify({
         model: node.data.model.replace(/^opencode\//, ''),
         temperature: node.data.temperature,
@@ -932,8 +1019,110 @@ async function generateLiveGeminiReply(params: {
     }
   }
 
-  if (!ai) {
-    throw new Error('GEMINI_API_KEY is required to run non-OpenCode agents in live mode.');
+  if (node.data.provider === 'openai' && nodeKey) {
+    const baseUrl = (settings.providers.openai?.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
+    const openaiRes = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${nodeKey}`,
+      },
+      signal: AbortSignal.timeout(25000),
+      body: JSON.stringify({
+        model: node.data.model,
+        temperature: node.data.temperature,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
+        ],
+      }),
+    });
+    if (!openaiRes.ok) {
+      const errBody = await openaiRes.text().catch(() => '');
+      throw new Error(`OpenAI API error HTTP ${openaiRes.status}: ${errBody.slice(0, 200)}`);
+    }
+    const data = (await openaiRes.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const text = data.choices?.[0]?.message?.content;
+    if (text) return text;
+    throw new Error('OpenAI returned an empty response.');
+  }
+
+  if (node.data.provider === 'anthropic' && nodeKey) {
+    const baseUrl = (settings.providers.anthropic?.baseUrl || 'https://api.anthropic.com').replace(/\/+$/, '');
+    const antRes = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': nodeKey,
+        'anthropic-version': '2023-06-01',
+      },
+      signal: AbortSignal.timeout(25000),
+      body: JSON.stringify({
+        model: node.data.model,
+        max_tokens: powerMeta.maxTokens,
+        temperature: node.data.temperature,
+        system: systemInstruction,
+        messages: [
+          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
+        ],
+      }),
+    });
+    if (!antRes.ok) {
+      const errBody = await antRes.text().catch(() => '');
+      throw new Error(`Anthropic API error HTTP ${antRes.status}: ${errBody.slice(0, 200)}`);
+    }
+    const data = (await antRes.json()) as {
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    const text = data.content?.map((c) => c.text ?? '').join('') ?? '';
+    if (text) return text;
+    throw new Error('Anthropic returned an empty response.');
+  }
+
+  if (node.data.provider === 'ollama') {
+    const baseUrl = (settings.providers.ollama?.baseUrl || 'http://host.docker.internal:11434').replace(/\/+$/, '');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (nodeKey) {
+      headers.Authorization = `Bearer ${nodeKey}`;
+    }
+    const ollamaRes = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers,
+      signal: AbortSignal.timeout(8000),
+      body: JSON.stringify({
+        model: node.data.model.replace(/^ollama\//, ''),
+        stream: false,
+        options: { temperature: node.data.temperature },
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
+        ],
+      }),
+    }).catch(() => null);
+    if (ollamaRes?.ok) {
+      const data = (await ollamaRes.json()) as {
+        message?: { content?: string };
+      };
+      const text = data.message?.content;
+      if (text) return text;
+    }
+    if (!ai) {
+      const statusText = ollamaRes ? `HTTP ${ollamaRes.status}` : 'endpoint unreachable';
+      throw new Error(
+        `Local Ollama (${baseUrl}) failed: ${statusText}. Start Ollama or configure a Gemini/OpenAI API key in Settings.`,
+      );
+    }
+  }
+
+  const effectiveGeminiAi =
+    node.data.provider === 'gemini' ? getAiClient(node.data.envSecretRef) ?? ai : ai;
+
+  if (!effectiveGeminiAi) {
+    throw new Error(
+      `API key not configured for ${node.data.provider} (${node.data.envSecretRef || 'GEMINI_API_KEY'}). Add it in Settings.`,
+    );
   }
 
   const preferredModel =
@@ -948,11 +1137,12 @@ async function generateLiveGeminiReply(params: {
   let lastErr: unknown = null;
   for (const modelName of candidateModels) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await effectiveGeminiAi.models.generateContent({
         model: modelName,
         contents: `${transcript}\n\nNow respond as ${node.data.label}:`,
         config: {
           systemInstruction,
+          temperature: node.data.temperature,
           httpOptions: { timeout: 20000 },
         },
       });
@@ -1205,18 +1395,18 @@ async function executeWorkflowRun(params: {
   const ordered = computeExecutionOrder(workflow.nodes, workflow.edges);
   const managerNode = findManagerNode(ordered);
   const ai = mode === 'live' ? getAiClient() : null;
+  const bootSettings = getAppSettings();
 
   seedSandboxFromProject(runId, workflow.projectContext?.projectId);
 
-  const hasOpenCodeOnly = ordered.length > 0 && ordered.every((n) => n.data.provider === 'opencode');
-  if (mode === 'live' && !ai && !hasOpenCodeOnly) {
+  if (mode === 'live' && !canWorkflowRunLive(ordered, bootSettings)) {
     const errEvt: ExecutionEvent = {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: 0,
       content:
-        'GEMINI_API_KEY is not configured in environment secrets. Configure it in Settings > Secrets, or switch Execution Mode to Sandbox Dry-Run.',
+        'No live LLM API key is configured for the selected agents. Open Settings to add a Gemini, OpenAI, Anthropic, or OpenCode API key, or switch Execution Mode to Sandbox Dry-Run.',
       timestamp: new Date().toISOString(),
     };
     broadcastEvent(runId, errEvt);
@@ -1324,7 +1514,7 @@ async function executeWorkflowRun(params: {
         runStage === 'test_and_deploy' ? 'deploy' : allToolCalls.length > 0 ? 'test' : 'review';
 
       let rawReply: string;
-      if (mode === 'live' && (ai || speaker.data.provider === 'opencode')) {
+      if (mode === 'live' && canNodeRunLive(speaker, getAppSettings())) {
         rawReply = await generateLiveGeminiReply({
           ai,
           node: speaker,
@@ -1446,7 +1636,7 @@ async function executeWorkflowRun(params: {
         openBugs: finalBugs,
       });
       const rawFinalMgr =
-        mode === 'live' && (ai || managerNode.data.provider === 'opencode')
+        mode === 'live' && canNodeRunLive(managerNode, getAppSettings())
           ? await generateLiveGeminiReply({
               ai,
               node: managerNode,
@@ -1533,14 +1723,151 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/capabilities', (_req, res) => {
-  const key = process.env.GEMINI_API_KEY;
+  res.json(buildCapabilitiesPayload());
+});
+
+app.put('/api/provider-keys', (req, res) => {
+  const { secretName, apiKey } = req.body as {
+    secretName?: string;
+    apiKey?: string;
+  };
+  const normalized = normalizeSecretName(secretName || '');
+  if (!normalized) {
+    res.status(400).json({
+      error: 'Secret name must be uppercase letters, numbers, and underscores (e.g. OPENAI_API_KEY).',
+    });
+    return;
+  }
+  const check = validateApiKeyValue(apiKey || '');
+  if (!check.valid) {
+    res.status(400).json({ error: check.error || 'Invalid API key.' });
+    return;
+  }
+  const status = setProviderSecret(normalized, check.cleaned);
   res.json({
-    geminiConfigured: Boolean(key && key !== 'MY_GEMINI_API_KEY'),
-    openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
-    anthropicConfigured: Boolean(process.env.ANTHROPIC_API_KEY),
-    opencodeConfigured: Boolean(process.env.OPENCODE_API_KEY),
-    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434',
+    saved: true,
+    secret: status,
+    capabilities: buildCapabilitiesPayload(),
   });
+});
+
+app.delete('/api/provider-keys/:secretName', (req, res) => {
+  const normalized = normalizeSecretName(req.params.secretName || '');
+  if (!normalized) {
+    res.status(400).json({ error: 'Invalid secret name.' });
+    return;
+  }
+  const deleted = deleteProviderSecret(normalized);
+  res.json({
+    deleted,
+    capabilities: buildCapabilitiesPayload(),
+  });
+});
+
+app.post('/api/provider-keys/test', async (req, res) => {
+  const { provider, secretName, baseUrl } = req.body as {
+    provider?: WorkflowNode['data']['provider'];
+    secretName?: string;
+    baseUrl?: string;
+  };
+  const settings = getAppSettings();
+  const targetProvider = provider || 'gemini';
+  const ref =
+    normalizeSecretName(secretName || '') ||
+    settings.providers[targetProvider]?.envVarName ||
+    'GEMINI_API_KEY';
+  const resolved = resolveServerSecret(ref);
+  const effectiveBase = (baseUrl || settings.providers[targetProvider]?.baseUrl || '').replace(/\/+$/, '');
+
+  if (targetProvider !== 'ollama' && targetProvider !== 'opencode' && !resolved.value) {
+    res.status(400).json({
+      ok: false,
+      status: 400,
+      message: `No key found for ${ref}. Save an API key first.`,
+    });
+    return;
+  }
+
+  try {
+    if (targetProvider === 'gemini') {
+      const client = getAiClient(ref);
+      if (!client) {
+        res.status(400).json({ ok: false, status: 400, message: `Key ${ref} is not configured.` });
+        return;
+      }
+      const resp = await client.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: 'Reply with OK',
+        config: { httpOptions: { timeout: 10000 } },
+      });
+      res.json({
+        ok: true,
+        status: 200,
+        message: `Gemini connected (${(resp.text || 'OK').trim().slice(0, 32)})`,
+      });
+      return;
+    }
+
+    if (targetProvider === 'openai' || targetProvider === 'opencode') {
+      const headers: Record<string, string> = {};
+      if (resolved.value) headers.Authorization = `Bearer ${resolved.value}`;
+      const r = await fetch(`${effectiveBase}/models`, {
+        headers,
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        res.json({
+          ok: false,
+          status: r.status,
+          message: `HTTP ${r.status}: ${body.slice(0, 120) || 'Authentication failed'}`,
+        });
+        return;
+      }
+      res.json({ ok: true, status: r.status, message: `${targetProvider} endpoint reachable (HTTP ${r.status})` });
+      return;
+    }
+
+    if (targetProvider === 'anthropic') {
+      const r = await fetch(`${effectiveBase}/v1/models`, {
+        headers: {
+          'x-api-key': resolved.value || '',
+          'anthropic-version': '2023-06-01',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        res.json({
+          ok: false,
+          status: r.status,
+          message: `HTTP ${r.status}: ${body.slice(0, 120) || 'Authentication failed'}`,
+        });
+        return;
+      }
+      res.json({ ok: true, status: r.status, message: `Anthropic endpoint reachable (HTTP ${r.status})` });
+      return;
+    }
+
+    // ollama
+    const headers: Record<string, string> = {};
+    if (resolved.value) headers.Authorization = `Bearer ${resolved.value}`;
+    const r = await fetch(`${effectiveBase}/api/tags`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+    res.json({
+      ok: r.ok,
+      status: r.status,
+      message: r.ok ? `Ollama reachable at ${effectiveBase}` : `Ollama returned HTTP ${r.status}`,
+    });
+  } catch (err) {
+    res.json({
+      ok: false,
+      status: 0,
+      message: err instanceof Error ? err.message : 'Connection failed',
+    });
+  }
 });
 
 app.get('/api/opencode/free-models', async (req, res) => {
@@ -1633,8 +1960,33 @@ app.get('/api/projects/:id', (req, res) => {
   res.json(proj);
 });
 
+app.put('/api/projects/:id', (req, res) => {
+  const patch = req.body as Partial<ImportedProjectAnalysis>;
+  if (!patch || typeof patch !== 'object') {
+    res.status(400).json({ error: 'Invalid project update payload' });
+    return;
+  }
+  const updated = updateImportedProject(req.params.id, patch);
+  if (!updated) {
+    res.status(404).json({ error: 'Imported project not found' });
+    return;
+  }
+  res.json({ project: updated });
+});
+
 app.delete('/api/projects/:id', (req, res) => {
   const ok = deleteImportedProject(req.params.id);
+  try {
+    const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    if (safeId) {
+      const projDir = path.join(PROJECTS_BASE, safeId);
+      if (fs.existsSync(projDir)) {
+        fs.rmSync(projDir, { recursive: true, force: true });
+      }
+    }
+  } catch {
+    // ignore cleanup error
+  }
   res.json({ deleted: ok });
 });
 
@@ -1830,7 +2182,7 @@ app.post('/api/runs', (req, res) => {
   const resolvedMode: 'live' | 'dry_run' =
     mode === 'live' || mode === 'dry_run'
       ? mode
-      : getAiClient()
+      : canWorkflowRunLive(workflow.nodes, getAppSettings())
         ? 'live'
         : 'dry_run';
 
@@ -1883,7 +2235,7 @@ app.post('/api/deploy/verify', (req, res) => {
   const resolvedMode: 'live' | 'dry_run' =
     mode === 'live' || mode === 'dry_run'
       ? mode
-      : getAiClient()
+      : canWorkflowRunLive(workflow.nodes, getAppSettings())
         ? 'live'
         : 'dry_run';
 
@@ -2003,14 +2355,15 @@ async function executeDirectAgentTurn(params: {
   const { runId, workflow, targetNode, userMessage, mode, roundNum } = params;
   const ai = mode === 'live' ? getAiClient() : null;
 
-  if (mode === 'live' && !ai && targetNode.data.provider !== 'opencode') {
+  const settingsForDirect = getAppSettings();
+  if (mode === 'live' && !canNodeRunLive(targetNode, settingsForDirect)) {
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: roundNum,
       content:
-        'GEMINI_API_KEY is not configured in environment secrets. Switch to Sandbox Dry-Run or use an OpenCode agent.',
+        `No API key configured for ${targetNode.data.label} (${targetNode.data.provider}). Add the API key in Settings or switch to Sandbox Dry-Run.`,
       timestamp: new Date().toISOString(),
     });
     updateRunRecord({
@@ -2038,7 +2391,7 @@ async function executeDirectAgentTurn(params: {
     }
 
     const rawReply =
-      mode === 'live' && (ai || targetNode.data.provider === 'opencode')
+      mode === 'live' && canNodeRunLive(targetNode, settingsForDirect)
         ? await generateLiveGeminiReply({ ai, node: targetNode, history })
         : buildDryRunDirectReply(targetNode, userMessage);
 
@@ -2127,16 +2480,15 @@ async function executeGroupDiscussionRound(params: {
   );
 
   const ai = mode === 'live' ? getAiClient() : null;
-  const hasOpenCodeOnly =
-    activeSpeakers.length > 0 && activeSpeakers.every((n) => n.data.provider === 'opencode');
-  if (mode === 'live' && !ai && !hasOpenCodeOnly) {
+  const groupSettings = getAppSettings();
+  if (mode === 'live' && !canWorkflowRunLive(activeSpeakers, groupSettings)) {
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: baseRound,
       content:
-        'GEMINI_API_KEY is not configured in environment secrets. Switch to Sandbox Dry-Run or use OpenCode agents.',
+        'No live LLM API key is configured. Add an API key in Settings or switch to Sandbox Dry-Run.',
       timestamp: new Date().toISOString(),
     });
     updateRunRecord({
@@ -2175,7 +2527,7 @@ async function executeGroupDiscussionRound(params: {
       currentRound = baseRound + idx;
 
       const rawReply =
-        mode === 'live' && (ai || speaker.data.provider === 'opencode')
+        mode === 'live' && canNodeRunLive(speaker, groupSettings)
           ? await generateLiveGeminiReply({
               ai,
               node: speaker,
@@ -2271,7 +2623,7 @@ async function executeGroupDiscussionRound(params: {
       if (ctx.hasIssues || turnToolCalls.length > 0 || runBugs.length > 0) {
         currentRound += 1;
         const rawAudit =
-          mode === 'live' && (ai || managerNode.data.provider === 'opencode')
+          mode === 'live' && canNodeRunLive(managerNode, getAppSettings())
             ? await generateLiveGeminiReply({
                 ai,
                 node: managerNode,
@@ -2392,7 +2744,7 @@ app.post('/api/chat/message', (req, res) => {
   const resolvedMode: 'live' | 'dry_run' =
     mode === 'live' || mode === 'dry_run'
       ? mode
-      : getAiClient()
+      : canWorkflowRunLive(workflow.nodes, getAppSettings())
         ? 'live'
         : 'dry_run';
 
@@ -2701,6 +3053,458 @@ app.get('/api/blueprint', (_req, res) => {
     .filter((f): f is BlueprintFile => f !== null);
 
   res.json({ files });
+});
+
+function listImportedProjectFilesFromDisk(projectId?: string): Array<{ path: string; content: string }> {
+  if (!projectId) return [];
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return [];
+  const dir = path.join(PROJECTS_BASE, safeId);
+  if (!fs.existsSync(dir)) return [];
+
+  const result: Array<{ path: string; content: string }> = [];
+  function walk(curr: string) {
+    if (result.length >= 400) return;
+    for (const entry of fs.readdirSync(curr, { withFileTypes: true })) {
+      if (result.length >= 400) return;
+      const full = path.join(curr, entry.name);
+      const rel = path.relative(dir, full).replace(/\\/g, '/');
+      if (entry.isDirectory()) {
+        if (isSafeExportFilePath(rel)) {
+          walk(full);
+        }
+      } else if (entry.isFile() && isSafeExportFilePath(rel)) {
+        try {
+          const stat = fs.statSync(full);
+          if (stat.size <= 512 * 1024) {
+            result.push({
+              path: rel,
+              content: fs.readFileSync(full, 'utf-8'),
+            });
+          }
+        } catch {
+          // ignore unreadable file
+        }
+      }
+    }
+  }
+  walk(dir);
+  return result;
+}
+
+function listStudioSourceFilesFromDisk(): Array<{ path: string; content: string }> {
+  const rootDir = process.cwd();
+  const topLevelFiles = [
+    'package.json',
+    'tsconfig.json',
+    'vite.config.ts',
+    'index.html',
+    'metadata.json',
+    '.env.example',
+    'Dockerfile',
+    'docker-compose.yml',
+    'install-linux.sh',
+    'README.md',
+    'server.ts',
+  ];
+  const foldersToWalk = ['src', 'server', 'deploy'];
+  const collected: Array<{ path: string; content: string }> = [];
+
+  for (const rel of topLevelFiles) {
+    const full = path.join(rootDir, rel);
+    if (fs.existsSync(full) && fs.statSync(full).isFile() && isSafeExportFilePath(rel)) {
+      try {
+        collected.push({ path: rel, content: fs.readFileSync(full, 'utf-8') });
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  function walkFolder(relDir: string) {
+    const absDir = path.join(rootDir, relDir);
+    if (!fs.existsSync(absDir)) return;
+    for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
+      const full = path.join(absDir, entry.name);
+      const rel = path.relative(rootDir, full).replace(/\\/g, '/');
+      if (!isSafeExportFilePath(rel)) continue;
+      if (entry.isDirectory()) {
+        walkFolder(rel);
+      } else if (entry.isFile()) {
+        try {
+          const stat = fs.statSync(full);
+          if (stat.size <= 512 * 1024) {
+            collected.push({ path: rel, content: fs.readFileSync(full, 'utf-8') });
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  for (const folder of foldersToWalk) {
+    walkFolder(folder);
+  }
+  return collected;
+}
+
+function resolveSandboxFilesForExport(workflow: WorkflowConfig, runId?: string): SandboxFile[] {
+  if (runId) {
+    const direct = listSandboxFiles(runId);
+    if (direct.length > 0) return direct;
+  }
+  const summaries = listRunSummaries();
+  const matchingRun = summaries.find((r) => r.workflowId === workflow.id) ?? summaries[0];
+  if (matchingRun) {
+    return listSandboxFiles(matchingRun.id);
+  }
+  return [];
+}
+
+function collectExportBundleForServer(params: {
+  scope?: ExportBundleScope;
+  workflow?: WorkflowConfig;
+  workflowId?: string;
+  runId?: string;
+}): {
+  scope: ExportBundleScope;
+  workflow: WorkflowConfig;
+  filename: string;
+  files: BundleFileEntry[];
+  totalBytes: number;
+} {
+  const scope: ExportBundleScope =
+    params.scope === 'sandbox_only' || params.scope === 'full_studio'
+      ? params.scope
+      : 'project_bundle';
+  const workflow =
+    params.workflow ??
+    (params.workflowId ? getWorkflowById(params.workflowId) : null) ??
+    listWorkflows()[0];
+
+  if (!workflow) {
+    throw new Error('Workflow configuration not found.');
+  }
+
+  const sandboxFiles = resolveSandboxFilesForExport(workflow, params.runId);
+  const importedProjectFiles =
+    scope === 'project_bundle'
+      ? listImportedProjectFilesFromDisk(workflow.projectContext?.projectId)
+      : [];
+  const studioSourceFiles = scope === 'full_studio' ? listStudioSourceFilesFromDisk() : [];
+  const bugReports = listBugReports({ workflowId: workflow.id });
+
+  const files = assembleExportBundleFiles({
+    scope,
+    workflow,
+    sandboxFiles,
+    importedProjectFiles,
+    studioSourceFiles,
+    bugReports,
+  });
+
+  const slug = slugifyBundleName(
+    scope === 'full_studio'
+      ? `aetherflow-studio-${workflow.name}`
+      : workflow.projectContext?.name || workflow.name,
+  );
+  const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+
+  return {
+    scope,
+    workflow,
+    filename: `${slug}.zip`,
+    files,
+    totalBytes,
+  };
+}
+
+app.post('/api/export/preview', (req, res) => {
+  try {
+    const body = req.body as {
+      scope?: ExportBundleScope;
+      workflow?: WorkflowConfig;
+      workflowId?: string;
+      runId?: string;
+    };
+    const bundle = collectExportBundleForServer(body);
+    res.json({
+      filename: bundle.filename,
+      scope: bundle.scope,
+      fileCount: bundle.files.length,
+      totalBytes: bundle.totalBytes,
+      files: bundle.files.map((f) => ({ path: f.path, size: f.size })),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to preview export bundle.';
+    res.status(400).json({ error: message });
+  }
+});
+
+app.post('/api/export/zip', (req, res) => {
+  try {
+    const body = req.body as {
+      scope?: ExportBundleScope;
+      workflow?: WorkflowConfig;
+      workflowId?: string;
+      runId?: string;
+    };
+    const bundle = collectExportBundleForServer(body);
+    const zipBuffer = createZipBufferFromBundle(bundle.files);
+    res.json({
+      filename: bundle.filename,
+      scope: bundle.scope,
+      fileCount: bundle.files.length,
+      totalBytes: zipBuffer.length,
+      zipBase64: zipBuffer.toString('base64'),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to build ZIP archive.';
+    res.status(400).json({ error: message });
+  }
+});
+
+app.post('/api/github/push', async (req, res) => {
+  try {
+    const body = req.body as {
+      repoUrl?: string;
+      branch?: string;
+      commitMessage?: string;
+      scope?: ExportBundleScope;
+      workflow?: WorkflowConfig;
+      workflowId?: string;
+      runId?: string;
+      token?: string;
+      saveTokenToVault?: boolean;
+      createIfMissing?: boolean;
+      isPrivate?: boolean;
+    };
+
+    const validation = validateGitHubPushParams({
+      repoInput: body.repoUrl,
+      branch: body.branch,
+      commitMessage: body.commitMessage,
+    });
+
+    if (!validation.valid) {
+      res.status(400).json({ error: validation.error || 'Invalid GitHub repository target.' });
+      return;
+    }
+
+    const inlineToken = body.token?.trim() || '';
+    if (inlineToken && body.saveTokenToVault) {
+      const check = validateApiKeyValue(inlineToken);
+      if (check.valid) {
+        setProviderSecret('GITHUB_TOKEN', inlineToken);
+      }
+    }
+
+    const resolvedToken = inlineToken || resolveServerSecret('GITHUB_TOKEN').value;
+    if (!resolvedToken) {
+      res.status(400).json({
+        error:
+          'GitHub Personal Access Token (GITHUB_TOKEN) is required to push commits. Enter your token in the Push modal or save GITHUB_TOKEN in Settings.',
+      });
+      return;
+    }
+
+    const bundle = collectExportBundleForServer({
+      scope: body.scope,
+      workflow: body.workflow,
+      workflowId: body.workflowId,
+      runId: body.runId,
+    });
+
+    const { owner, repo, branch, commitMessage } = validation;
+    const ghHeaders: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${resolvedToken}`,
+      'User-Agent': 'AetherFlow-Agent-Studio',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+    };
+
+    const ghFetch = async (url: string, init?: RequestInit) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      try {
+        return await fetch(url, {
+          ...init,
+          headers: { ...ghHeaders, ...(init?.headers as Record<string, string> | undefined) },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // 1. Check repository existence (and optionally create it if 404)
+    let repoRes = await ghFetch(`https://api.github.com/repos/${owner}/${repo}`);
+    if (repoRes.status === 404 && body.createIfMissing) {
+      const createRes = await ghFetch('https://api.github.com/user/repos', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: repo,
+          private: Boolean(body.isPrivate),
+          auto_init: true,
+          description: bundle.workflow.description || 'Exported from AetherFlow Agent Studio',
+        }),
+      });
+      if (!createRes.ok) {
+        const errBody = (await createRes.json().catch(() => ({}))) as { message?: string };
+        res.status(createRes.status).json({
+          error: `Could not create repository ${owner}/${repo}: ${errBody.message || createRes.statusText}`,
+        });
+        return;
+      }
+      repoRes = await ghFetch(`https://api.github.com/repos/${owner}/${repo}`);
+    }
+
+    if (!repoRes.ok) {
+      const errBody = (await repoRes.json().catch(() => ({}))) as { message?: string };
+      res.status(repoRes.status).json({
+        error: `GitHub API error for ${owner}/${repo} (${repoRes.status}): ${errBody.message || repoRes.statusText}`,
+      });
+      return;
+    }
+
+    const repoMeta = (await repoRes.json()) as { default_branch?: string };
+    const defaultBranch = repoMeta.default_branch || 'main';
+
+    // 2. Resolve base commit SHA for target branch (or default branch if creating a new branch)
+    let parentCommitSha: string | null = null;
+    let targetBranchExists = false;
+
+    const refRes = await ghFetch(
+      `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`,
+    );
+    if (refRes.ok) {
+      const refData = (await refRes.json()) as { object?: { sha?: string } };
+      parentCommitSha = refData.object?.sha ?? null;
+      targetBranchExists = true;
+    } else if (branch !== defaultBranch) {
+      const defaultRefRes = await ghFetch(
+        `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(defaultBranch)}`,
+      );
+      if (defaultRefRes.ok) {
+        const defaultRefData = (await defaultRefRes.json()) as { object?: { sha?: string } };
+        parentCommitSha = defaultRefData.object?.sha ?? null;
+      }
+    }
+
+    // If repository is completely empty (0 commits), bootstrap initial file via Contents API
+    if (!parentCommitSha) {
+      const readmeFile =
+        bundle.files.find((f) => f.path === 'AETHERFLOW_WORKFLOW.md') ?? bundle.files[0];
+      const initRes = await ghFetch(
+        `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(readmeFile.path)}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            message: 'chore: initialize repository from AetherFlow Agent Studio',
+            content: Buffer.from(readmeFile.content, 'utf-8').toString('base64'),
+            branch,
+          }),
+        },
+      );
+      if (!initRes.ok) {
+        const errBody = (await initRes.json().catch(() => ({}))) as { message?: string };
+        res.status(initRes.status).json({
+          error: `Failed to initialize empty repository ${owner}/${repo}: ${errBody.message || initRes.statusText}`,
+        });
+        return;
+      }
+      const initData = (await initRes.json()) as { commit?: { sha?: string } };
+      parentCommitSha = initData.commit?.sha ?? null;
+      targetBranchExists = true;
+    }
+
+    // 3. Create Git Tree with all bundle files
+    const treeEntries = bundle.files.map((file) => ({
+      path: file.path,
+      mode: file.path.endsWith('.sh') ? '100755' : '100644',
+      type: 'blob',
+      content: file.content,
+    }));
+
+    const treeRes = await ghFetch(`https://api.github.com/repos/${owner}/${repo}/git/trees`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(parentCommitSha ? { base_tree: parentCommitSha } : {}),
+        tree: treeEntries,
+      }),
+    });
+
+    if (!treeRes.ok) {
+      const errBody = (await treeRes.json().catch(() => ({}))) as { message?: string };
+      res.status(treeRes.status).json({
+        error: `Failed to create Git tree on ${owner}/${repo}: ${errBody.message || treeRes.statusText}`,
+      });
+      return;
+    }
+
+    const treeData = (await treeRes.json()) as { sha: string };
+
+    // 4. Create Git Commit
+    const commitRes = await ghFetch(`https://api.github.com/repos/${owner}/${repo}/git/commits`, {
+      method: 'POST',
+      body: JSON.stringify({
+        message: commitMessage,
+        tree: treeData.sha,
+        parents: parentCommitSha ? [parentCommitSha] : [],
+      }),
+    });
+
+    if (!commitRes.ok) {
+      const errBody = (await commitRes.json().catch(() => ({}))) as { message?: string };
+      res.status(commitRes.status).json({
+        error: `Failed to create commit on ${owner}/${repo}: ${errBody.message || commitRes.statusText}`,
+      });
+      return;
+    }
+
+    const commitData = (await commitRes.json()) as { sha: string; html_url?: string };
+
+    // 5. Update or create branch reference
+    const updateRefUrl = targetBranchExists
+      ? `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`
+      : `https://api.github.com/repos/${owner}/${repo}/git/refs`;
+    const updateRefBody = targetBranchExists
+      ? { sha: commitData.sha, force: false }
+      : { ref: `refs/heads/${branch}`, sha: commitData.sha };
+
+    const updateRefRes = await ghFetch(updateRefUrl, {
+      method: targetBranchExists ? 'PATCH' : 'POST',
+      body: JSON.stringify(updateRefBody),
+    });
+
+    if (!updateRefRes.ok) {
+      const errBody = (await updateRefRes.json().catch(() => ({}))) as { message?: string };
+      res.status(updateRefRes.status).json({
+        error: `Failed to update branch ${branch} on ${owner}/${repo}: ${errBody.message || updateRefRes.statusText}`,
+      });
+      return;
+    }
+
+    const capabilities = buildCapabilitiesPayload();
+    res.json({
+      ok: true,
+      owner,
+      repo,
+      branch,
+      commitSha: commitData.sha,
+      commitUrl:
+        commitData.html_url || `https://github.com/${owner}/${repo}/commit/${commitData.sha}`,
+      repoUrl: `https://github.com/${owner}/${repo}/tree/${encodeURIComponent(branch)}`,
+      filesPushed: bundle.files.length,
+      totalBytes: bundle.totalBytes,
+      capabilities,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'GitHub push failed.';
+    res.status(500).json({ error: message });
+  }
 });
 
 async function startServer() {

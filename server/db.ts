@@ -10,8 +10,10 @@ import type {
   ExecutionEvent,
   ExecutionRunSummary,
   ImportedProjectAnalysis,
+  ProviderSecretStatus,
   WorkflowConfig,
 } from '../src/types/workflow.ts';
+import { maskApiKey, normalizeSecretName } from '../src/utils/secretUtils.ts';
 import { DEFAULT_APP_SETTINGS, normalizeAppSettings } from '../src/utils/workflowEngine.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -78,6 +80,12 @@ export function getDb(): DatabaseSync {
       branch TEXT,
       analysis_json TEXT NOT NULL,
       imported_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS provider_secrets (
+      secret_name TEXT PRIMARY KEY,
+      secret_value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
   `);
 
@@ -528,8 +536,151 @@ export function getImportedProjectById(id: string): ImportedProjectAnalysis | nu
   return row ? (JSON.parse(row.analysis_json) as ImportedProjectAnalysis) : null;
 }
 
+export function updateImportedProject(
+  id: string,
+  patch: Partial<
+    Pick<
+      ImportedProjectAnalysis,
+      'name' | 'sourceUrl' | 'branch' | 'managerSummary' | 'frameworks' | 'recommendations'
+    >
+  >,
+): ImportedProjectAnalysis | null {
+  const existing = getImportedProjectById(id);
+  if (!existing) return null;
+  const updated: ImportedProjectAnalysis = {
+    ...existing,
+    name: typeof patch.name === 'string' && patch.name.trim() ? patch.name.trim() : existing.name,
+    sourceUrl:
+      patch.sourceUrl !== undefined
+        ? patch.sourceUrl.trim() || undefined
+        : existing.sourceUrl,
+    branch:
+      patch.branch !== undefined
+        ? patch.branch.trim() || undefined
+        : existing.branch,
+    managerSummary:
+      typeof patch.managerSummary === 'string' && patch.managerSummary.trim()
+        ? patch.managerSummary.trim()
+        : existing.managerSummary,
+    frameworks: Array.isArray(patch.frameworks) ? patch.frameworks : existing.frameworks,
+    recommendations: Array.isArray(patch.recommendations)
+      ? patch.recommendations
+      : existing.recommendations,
+  };
+  return saveImportedProject(updated);
+}
+
 export function deleteImportedProject(id: string): boolean {
   const db = getDb();
   const res = db.prepare('DELETE FROM imported_projects WHERE id = ?').run(id);
   return Number(res.changes) > 0;
 }
+
+export function setProviderSecret(secretName: string, secretValue: string): ProviderSecretStatus {
+  const normalized = normalizeSecretName(secretName);
+  if (!normalized) {
+    throw new Error('Invalid secret identifier');
+  }
+  const db = getDb();
+  const now = new Date().toISOString();
+  const trimmed = secretValue.trim();
+  db.prepare(
+    `
+    INSERT INTO provider_secrets (secret_name, secret_value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(secret_name) DO UPDATE SET
+      secret_value = excluded.secret_value,
+      updated_at = excluded.updated_at
+  `,
+  ).run(normalized, trimmed, now);
+
+  return {
+    secretName: normalized,
+    configured: true,
+    source: 'vault',
+    maskedHint: maskApiKey(trimmed),
+    updatedAt: now,
+  };
+}
+
+export function deleteProviderSecret(secretName: string): boolean {
+  const normalized = normalizeSecretName(secretName);
+  if (!normalized) return false;
+  const db = getDb();
+  const res = db.prepare('DELETE FROM provider_secrets WHERE secret_name = ?').run(normalized);
+  return Number(res.changes) > 0;
+}
+
+export function getProviderSecret(secretName: string): { value: string; updatedAt: string } | null {
+  const normalized = normalizeSecretName(secretName);
+  if (!normalized) return null;
+  const db = getDb();
+  const row = db
+    .prepare('SELECT secret_value, updated_at FROM provider_secrets WHERE secret_name = ?')
+    .get(normalized) as { secret_value: string; updated_at: string } | undefined;
+  if (!row || !row.secret_value.trim()) return null;
+  return { value: row.secret_value.trim(), updatedAt: row.updated_at };
+}
+
+export function resolveServerSecret(secretName: string): {
+  value: string | null;
+  source: 'vault' | 'env' | 'none';
+  updatedAt?: string;
+} {
+  const normalized = normalizeSecretName(secretName);
+  if (!normalized) {
+    return { value: null, source: 'none' };
+  }
+  const vault = getProviderSecret(normalized);
+  if (vault) {
+    return { value: vault.value, source: 'vault', updatedAt: vault.updatedAt };
+  }
+  const envVal = process.env[normalized]?.trim();
+  if (envVal && envVal !== 'MY_GEMINI_API_KEY') {
+    return { value: envVal, source: 'env' };
+  }
+  return { value: null, source: 'none' };
+}
+
+export function listProviderSecretStatuses(
+  knownNames: string[] = [],
+): Record<string, ProviderSecretStatus> {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT secret_name, secret_value, updated_at FROM provider_secrets ORDER BY secret_name ASC')
+    .all() as Array<{ secret_name: string; secret_value: string; updated_at: string }>;
+
+  const allNames = new Set<string>([
+    'GEMINI_API_KEY',
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'OPENCODE_API_KEY',
+    'OLLAMA_API_KEY',
+  ]);
+  for (const name of knownNames) {
+    const n = normalizeSecretName(name);
+    if (n) allNames.add(n);
+  }
+  for (const r of rows) {
+    allNames.add(r.secret_name);
+  }
+
+  const out: Record<string, ProviderSecretStatus> = {};
+  for (const name of allNames) {
+    const resolved = resolveServerSecret(name);
+    out[name] = {
+      secretName: name,
+      configured: Boolean(resolved.value),
+      source: resolved.source,
+      maskedHint:
+        resolved.source === 'vault' && resolved.value
+          ? maskApiKey(resolved.value)
+          : resolved.source === 'env'
+            ? 'Server .env'
+            : '',
+      updatedAt: resolved.updatedAt,
+    };
+  }
+  return out;
+}
+

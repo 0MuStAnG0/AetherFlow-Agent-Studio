@@ -6,9 +6,6 @@ import {
   MarkerType,
   MiniMap,
   ReactFlow,
-  addEdge,
-  applyEdgeChanges,
-  applyNodeChanges,
   useReactFlow,
   type Connection,
   type Edge,
@@ -19,6 +16,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import type { AgentNodeData, AgentRole, WorkflowEdge, WorkflowNode } from '../types/workflow';
 import { AgentNode } from './AgentNode';
+import { CanvasActionsContext } from './CanvasActionsContext';
 
 const nodeTypes = {
   agentNode: AgentNode,
@@ -32,9 +30,13 @@ interface WorkflowCanvasProps {
   selectedNodeId: string | null;
   showMiniMap?: boolean;
   gridVariant?: 'dots' | 'lines' | 'cross';
-  onNodesChange: (nodes: WorkflowNode[]) => void;
-  onEdgesChange: (edges: WorkflowEdge[]) => void;
+  onNodesChange: (changes: NodeChange<Node<AgentNodeData>>[]) => void;
+  onEdgesChange: (changes: EdgeChange<Edge>[]) => void;
+  onConnect: (connection: Connection) => void;
   onSelectNode: (nodeId: string | null) => void;
+  onEditNode?: (nodeId: string) => void;
+  onDuplicateNode?: (nodeId: string) => void;
+  onDeleteNode?: (nodeId: string) => void;
   onDropTemplate: (role: AgentRole, position: { x: number; y: number }) => void;
 }
 
@@ -48,10 +50,18 @@ export function WorkflowCanvas({
   gridVariant = 'dots',
   onNodesChange,
   onEdgesChange,
+  onConnect,
   onSelectNode,
+  onEditNode,
+  onDuplicateNode,
+  onDeleteNode,
   onDropTemplate,
 }: WorkflowCanvasProps) {
   const { screenToFlowPosition } = useReactFlow();
+  const canvasActions = useMemo(
+    () => ({ onEditNode, onDuplicateNode, onDeleteNode }),
+    [onEditNode, onDuplicateNode, onDeleteNode],
+  );
 
   const rfNodes: Node<AgentNodeData>[] = useMemo(
     () =>
@@ -91,60 +101,23 @@ export function WorkflowCanvas({
 
   const handleNodesChange = useCallback(
     (changes: NodeChange<Node<AgentNodeData>>[]) => {
-      const next = applyNodeChanges(changes, rfNodes);
-      onNodesChange(
-        next.map((node) => ({
-          id: node.id,
-          type: 'agentNode',
-          position: node.position,
-          measured: node.measured,
-          data: {
-            ...node.data,
-            status: 'idle',
-          },
-        })),
-      );
+      onNodesChange(changes);
     },
-    [rfNodes, onNodesChange],
+    [onNodesChange],
   );
 
   const handleEdgesChange = useCallback(
     (changes: EdgeChange<Edge>[]) => {
-      const next = applyEdgeChanges(changes, rfEdges);
-      onEdgesChange(
-        next.map((e) => ({
-          id: e.id,
-          source: e.source,
-          target: e.target,
-          label: typeof e.label === 'string' ? e.label : undefined,
-          animated: Boolean(e.animated),
-        })),
-      );
+      onEdgesChange(changes);
     },
-    [rfEdges, onEdgesChange],
+    [onEdgesChange],
   );
 
   const handleConnect = useCallback(
     (connection: Connection) => {
-      const next = addEdge(
-        {
-          ...connection,
-          id: `edge-${connection.source}-${connection.target}-${Date.now()}`,
-          label: 'Handoff',
-        },
-        rfEdges,
-      );
-      onEdgesChange(
-        next.map((e) => ({
-          id: e.id,
-          source: e.source,
-          target: e.target,
-          label: typeof e.label === 'string' ? e.label : undefined,
-          animated: Boolean(e.animated),
-        })),
-      );
+      onConnect(connection);
     },
-    [rfEdges, onEdgesChange],
+    [onConnect],
   );
 
   const handleDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
@@ -187,42 +160,44 @@ export function WorkflowCanvas({
         </div>
       )}
 
-      <ReactFlow
-        nodes={rfNodes}
-        edges={rfEdges}
-        nodeTypes={nodeTypes}
-        onNodesChange={handleNodesChange}
-        onEdgesChange={handleEdgesChange}
-        onConnect={handleConnect}
-        onNodeClick={(_evt, node) => onSelectNode(node.id)}
-        onPaneClick={() => onSelectNode(null)}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        deleteKeyCode={['Backspace', 'Delete']}
-      >
-        <Background
-          variant={
-            gridVariant === 'lines'
-              ? BackgroundVariant.Lines
-              : gridVariant === 'cross'
-                ? BackgroundVariant.Cross
-                : BackgroundVariant.Dots
-          }
-          gap={20}
-          size={1}
-          color="#cbd5e1"
-          className="dark:opacity-30"
-        />
-        <Controls />
-        {showMiniMap && (
-          <MiniMap
-            pannable
-            zoomable
-            nodeColor={() => '#2563eb'}
-            maskColor="rgba(15, 23, 42, 0.08)"
+      <CanvasActionsContext.Provider value={canvasActions}>
+        <ReactFlow
+          nodes={rfNodes}
+          edges={rfEdges}
+          nodeTypes={nodeTypes}
+          onNodesChange={handleNodesChange}
+          onEdgesChange={handleEdgesChange}
+          onConnect={handleConnect}
+          onNodeClick={(_evt, node) => onSelectNode(node.id)}
+          onPaneClick={() => onSelectNode(null)}
+          fitView
+          fitViewOptions={{ padding: 0.2 }}
+          deleteKeyCode={['Backspace', 'Delete']}
+        >
+          <Background
+            variant={
+              gridVariant === 'lines'
+                ? BackgroundVariant.Lines
+                : gridVariant === 'cross'
+                  ? BackgroundVariant.Cross
+                  : BackgroundVariant.Dots
+            }
+            gap={20}
+            size={1}
+            color="#cbd5e1"
+            className="dark:opacity-30"
           />
-        )}
-      </ReactFlow>
+          <Controls />
+          {showMiniMap && (
+            <MiniMap
+              pannable
+              zoomable
+              nodeColor={() => '#2563eb'}
+              maskColor="rgba(15, 23, 42, 0.08)"
+            />
+          )}
+        </ReactFlow>
+      </CanvasActionsContext.Provider>
     </div>
   );
 }

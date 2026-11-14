@@ -73,6 +73,41 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   updatedAt: '2026-11-14T08:00:00.000Z',
 };
 
+function normalizeProviderConfig(
+  baseCfg: AppSettings['providers']['gemini'],
+  rawCfg?: Partial<AppSettings['providers']['gemini']>,
+  forceEnvVar?: string,
+) {
+  const disabledModels = Array.isArray(rawCfg?.disabledModels)
+    ? Array.from(new Set(rawCfg.disabledModels.map((m) => String(m).trim()).filter(Boolean)))
+    : [];
+  const rawMeta = rawCfg?.modelMeta && typeof rawCfg.modelMeta === 'object' ? rawCfg.modelMeta : {};
+  const modelMeta: NonNullable<AppSettings['providers']['gemini']['modelMeta']> = {};
+  for (const [k, v] of Object.entries(rawMeta)) {
+    if (v && typeof v === 'object') {
+      const power =
+        v.power === 'eco' || v.power === 'standard' || v.power === 'pro' || v.power === 'ultra'
+          ? v.power
+          : undefined;
+      const displayName =
+        typeof v.displayName === 'string' && v.displayName.trim() ? v.displayName.trim() : undefined;
+      if (power || displayName) {
+        modelMeta[k] = { ...(displayName ? { displayName } : {}), ...(power ? { power } : {}) };
+      }
+    }
+  }
+  return {
+    ...baseCfg,
+    ...(rawCfg ?? {}),
+    ...(forceEnvVar ? { envVarName: forceEnvVar } : {}),
+    customModels: Array.isArray(rawCfg?.customModels)
+      ? Array.from(new Set(rawCfg.customModels.map((m) => String(m).trim()).filter(Boolean)))
+      : [],
+    disabledModels,
+    modelMeta,
+  };
+}
+
 export function normalizeAppSettings(input: Partial<AppSettings> | null | undefined): AppSettings {
   const base = DEFAULT_APP_SETTINGS;
   const raw = input ?? {};
@@ -102,43 +137,16 @@ export function normalizeAppSettings(input: Partial<AppSettings> | null | undefi
         ? raw.canvasGridVariant
         : 'dots',
     providers: {
-      gemini: {
-        ...base.providers.gemini,
-        ...(raw.providers?.gemini ?? {}),
-        envVarName: 'GEMINI_API_KEY',
-        customModels: Array.isArray(raw.providers?.gemini?.customModels)
-          ? raw.providers.gemini.customModels.map((m) => String(m).trim()).filter(Boolean)
-          : [],
-      },
-      openai: {
-        ...base.providers.openai,
-        ...(raw.providers?.openai ?? {}),
-        customModels: Array.isArray(raw.providers?.openai?.customModels)
-          ? raw.providers.openai.customModels.map((m) => String(m).trim()).filter(Boolean)
-          : [],
-      },
-      anthropic: {
-        ...base.providers.anthropic,
-        ...(raw.providers?.anthropic ?? {}),
-        customModels: Array.isArray(raw.providers?.anthropic?.customModels)
-          ? raw.providers.anthropic.customModels.map((m) => String(m).trim()).filter(Boolean)
-          : [],
-      },
-      ollama: {
-        ...base.providers.ollama,
-        ...(raw.providers?.ollama ?? {}),
-        customModels: Array.isArray(raw.providers?.ollama?.customModels)
-          ? raw.providers.ollama.customModels.map((m) => String(m).trim()).filter(Boolean)
-          : [],
-      },
-      opencode: {
-        ...base.providers.opencode,
-        ...(raw.providers?.opencode ?? {}),
-        customModels: Array.isArray(raw.providers?.opencode?.customModels)
-          ? raw.providers.opencode.customModels.map((m) => String(m).trim()).filter(Boolean)
-          : [],
-      },
+      gemini: normalizeProviderConfig(base.providers.gemini, raw.providers?.gemini, 'GEMINI_API_KEY'),
+      openai: normalizeProviderConfig(base.providers.openai, raw.providers?.openai),
+      anthropic: normalizeProviderConfig(base.providers.anthropic, raw.providers?.anthropic),
+      ollama: normalizeProviderConfig(base.providers.ollama, raw.providers?.ollama),
+      opencode: normalizeProviderConfig(base.providers.opencode, raw.providers?.opencode),
     },
+    customTemplates: Array.isArray(raw.customTemplates) ? raw.customTemplates : [],
+    hiddenTemplateIds: Array.isArray(raw.hiddenTemplateIds)
+      ? Array.from(new Set(raw.hiddenTemplateIds.map((id) => String(id).trim()).filter(Boolean)))
+      : [],
     updatedAt: raw.updatedAt || new Date().toISOString(),
   };
 }

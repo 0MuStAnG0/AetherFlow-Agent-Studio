@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  Check,
   CheckSquare,
+  CopyPlus,
   FileArchive,
   FolderGit2,
   GitBranch,
   Loader2,
+  Pencil,
+  Plus,
   PlusCircle,
   ShieldCheck,
   Trash2,
@@ -12,17 +16,23 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
+import { AGENT_SECTIONS, POWER_LEVEL_META } from '../data/agentTemplates';
 import type {
+  AgentPowerLevel,
   AgentRole,
+  AppSettings,
   ImportedProjectAnalysis,
+  LLMProvider,
   RecommendedAgentSpec,
 } from '../types/workflow';
+import { getEffectiveProviderModels } from '../utils/catalogUtils';
 
 interface ProjectImportModalProps {
   isOpen: boolean;
   onClose: () => void;
   lang: 'en' | 'fa';
   executionMode: 'live' | 'dry_run';
+  appSettings?: AppSettings;
   projects: ImportedProjectAnalysis[];
   activeProjectId?: string;
   onProjectImported: (project: ImportedProjectAnalysis) => void;
@@ -166,6 +176,7 @@ export function ProjectImportModal({
   onClose,
   lang,
   executionMode,
+  appSettings,
   projects,
   activeProjectId,
   onProjectImported,
@@ -184,7 +195,15 @@ export function ProjectImportModal({
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
     activeProjectId ?? projects[0]?.id ?? null,
   );
+  const [editableSpecs, setEditableSpecs] = useState<RecommendedAgentSpec[]>([]);
+  const [editingSpecId, setEditingSpecId] = useState<string | null>(null);
   const [checkedIds, setCheckedIds] = useState<Record<string, boolean>>({});
+  const [isEditingProjectMeta, setIsEditingProjectMeta] = useState(false);
+  const [editProjectName, setEditProjectName] = useState('');
+  const [editProjectUrl, setEditProjectUrl] = useState('');
+  const [editProjectBranch, setEditProjectBranch] = useState('');
+  const [editProjectSummary, setEditProjectSummary] = useState('');
+  const [isSavingProjectMeta, setIsSavingProjectMeta] = useState(false);
   const zipInputRef = useRef<HTMLInputElement | null>(null);
 
   const t = COPY[lang];
@@ -209,7 +228,18 @@ export function ProjectImportModal({
   }, [activeProjectId, projects]);
 
   useEffect(() => {
-    if (!activeProject) return;
+    if (!activeProject) {
+      setEditableSpecs([]);
+      setIsEditingProjectMeta(false);
+      return;
+    }
+    setEditableSpecs(activeProject.recommendations.map((r) => ({ ...r })));
+    setEditingSpecId(null);
+    setIsEditingProjectMeta(false);
+    setEditProjectName(activeProject.name);
+    setEditProjectUrl(activeProject.sourceUrl ?? '');
+    setEditProjectBranch(activeProject.branch ?? '');
+    setEditProjectSummary(activeProject.managerSummary);
     const next: Record<string, boolean> = {};
     for (const rec of activeProject.recommendations) {
       next[rec.id] = rec.priority !== 'optional';
@@ -218,6 +248,39 @@ export function ProjectImportModal({
   }, [activeProject?.id]);
 
   if (!isOpen) return null;
+
+  const handleSaveProjectMeta = async () => {
+    if (!activeProject || !editProjectName.trim()) return;
+    setIsSavingProjectMeta(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`/api/projects/${activeProject.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: editProjectName.trim(),
+          sourceUrl: editProjectUrl.trim() || undefined,
+          branch: editProjectBranch.trim() || undefined,
+          managerSummary: editProjectSummary.trim() || activeProject.managerSummary,
+          recommendations: editableSpecs,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        project?: ImportedProjectAnalysis;
+        error?: string;
+      };
+      if (!res.ok || !data.project) {
+        setErrorMsg(data.error || 'Failed to update project.');
+        return;
+      }
+      onProjectImported(data.project);
+      setIsEditingProjectMeta(false);
+    } catch {
+      setErrorMsg('Network error while saving project changes.');
+    } finally {
+      setIsSavingProjectMeta(false);
+    }
+  };
 
   const handleGitHubImport = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -306,8 +369,74 @@ export function ProjectImportModal({
   };
 
   const selectedRecommendations = activeProject
-    ? activeProject.recommendations.filter((r) => checkedIds[r.id])
+    ? editableSpecs.filter((r) => checkedIds[r.id])
     : [];
+
+  const handleDuplicateSpec = (spec: RecommendedAgentSpec) => {
+    const newId = `${spec.id}-copy-${Date.now().toString(36).slice(-4)}`;
+    const baseTitle = spec.title.replace(/\s+#?\d+$/, '').trim();
+    const copyNum =
+      editableSpecs.filter((s) => s.title.toLowerCase().startsWith(baseTitle.toLowerCase())).length +
+      1;
+    const cloned: RecommendedAgentSpec = {
+      ...spec,
+      id: newId,
+      title: `${baseTitle} ${copyNum}`,
+    };
+    setEditableSpecs((prev) => {
+      const idx = prev.findIndex((s) => s.id === spec.id);
+      if (idx === -1) return [...prev, cloned];
+      const next = [...prev];
+      next.splice(idx + 1, 0, cloned);
+      return next;
+    });
+    setCheckedIds((prev) => ({ ...prev, [newId]: true }));
+  };
+
+  const handleDeleteSpec = (specId: string) => {
+    setEditableSpecs((prev) => prev.filter((s) => s.id !== specId));
+    setCheckedIds((prev) => {
+      const next = { ...prev };
+      delete next[specId];
+      return next;
+    });
+    if (editingSpecId === specId) setEditingSpecId(null);
+  };
+
+  const handleAddCustomSpec = () => {
+    const newId = `rec-custom-${Date.now().toString(36).slice(-4)}`;
+    const defModels = getEffectiveProviderModels('gemini', appSettings?.providers.gemini);
+    const created: RecommendedAgentSpec = {
+      id: newId,
+      title: lang === 'fa' ? 'متخصص جدید پروژه' : 'Custom Project Specialist',
+      role: 'custom',
+      section: 'Backend & API',
+      positionTitle: lang === 'fa' ? 'متخصص بخش دلخواه' : 'Domain Specialist',
+      powerLevel: 'pro',
+      specialty:
+        lang === 'fa'
+          ? 'مسئولیت اختصاصی قابل تنظیم برای پروژه'
+          : 'Configurable domain ownership for this project',
+      reason:
+        lang === 'fa'
+          ? 'افزوده‌شده به‌صورت دستی متناسب با نیاز پروژه.'
+          : 'Manually added to expand project capacity.',
+      recommendedProvider: 'gemini',
+      recommendedModel:
+        appSettings?.providers.gemini?.defaultModel || defModels[0]?.id || 'gemini-4-hydrogen',
+      systemPrompt: `You are a Custom Specialist working on "${activeProject?.name || 'Project'}".`,
+      tools: { readFile: true, writeFile: true, execBash: false },
+      priority: 'recommended',
+      matchedSignals: [],
+    };
+    setEditableSpecs((prev) => [...prev, created]);
+    setCheckedIds((prev) => ({ ...prev, [newId]: true }));
+    setEditingSpecId(newId);
+  };
+
+  const handleUpdateSpec = (specId: string, patch: Partial<RecommendedAgentSpec>) => {
+    setEditableSpecs((prev) => prev.map((s) => (s.id === specId ? { ...s, ...patch } : s)));
+  };
 
   const handleApply = async (mode: 'replace' | 'merge') => {
     if (!activeProject || selectedRecommendations.length === 0) return;
@@ -577,14 +706,34 @@ export function ProjectImportModal({
                             {lang === 'fa' ? 'ایجنت' : 'agents'}
                           </div>
                         </button>
-                        <button
-                          type="button"
-                          aria-label={`${t.deleteProj} ${proj.name}`}
-                          onClick={() => void onDeleteProject(proj.id)}
-                          className="rounded p-1 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/40"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                        <div className="flex shrink-0 items-center gap-1">
+                          <button
+                            type="button"
+                            data-testid={`edit-imported-project-${proj.id}`}
+                            aria-label={`Edit ${proj.name}`}
+                            title={lang === 'fa' ? 'ویرایش پروژه' : 'Edit project'}
+                            onClick={() => {
+                              setSelectedProjectId(proj.id);
+                              setEditProjectName(proj.name);
+                              setEditProjectUrl(proj.sourceUrl ?? '');
+                              setEditProjectBranch(proj.branch ?? '');
+                              setEditProjectSummary(proj.managerSummary);
+                              setIsEditingProjectMeta(true);
+                            }}
+                            className="rounded p-1 text-slate-400 transition-colors hover:bg-blue-50 hover:text-blue-600 dark:hover:bg-blue-950/40"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            data-testid={`delete-imported-project-${proj.id}`}
+                            aria-label={`${t.deleteProj} ${proj.name}`}
+                            onClick={() => void onDeleteProject(proj.id)}
+                            className="rounded p-1 text-slate-400 transition-colors hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/40"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
@@ -618,19 +767,138 @@ export function ProjectImportModal({
                         <ShieldCheck className="h-4 w-4 text-blue-600 dark:text-blue-400" />
                         {t.managerAssessment}
                       </span>
-                      <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                        {activeProject.name} · {activeProject.sourceType.toUpperCase()}
-                        {activeProject.branch ? ` (${activeProject.branch})` : ''} ·{' '}
-                        {activeProject.usedLiveAi ? t.liveAiTag : t.staticScanTag}
-                      </span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                          {activeProject.name} · {activeProject.sourceType.toUpperCase()}
+                          {activeProject.branch ? ` (${activeProject.branch})` : ''} ·{' '}
+                          {activeProject.usedLiveAi ? t.liveAiTag : t.staticScanTag}
+                        </span>
+                        <button
+                          type="button"
+                          data-testid="edit-active-imported-project-btn"
+                          onClick={() => {
+                            if (!isEditingProjectMeta) {
+                              setEditProjectName(activeProject.name);
+                              setEditProjectUrl(activeProject.sourceUrl ?? '');
+                              setEditProjectBranch(activeProject.branch ?? '');
+                              setEditProjectSummary(activeProject.managerSummary);
+                            }
+                            setIsEditingProjectMeta((prev) => !prev);
+                          }}
+                          className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:border-blue-500 hover:text-blue-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+                        >
+                          <Pencil className="h-3 w-3" />
+                          <span>{lang === 'fa' ? 'ویرایش پروژه' : 'Edit Project'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="delete-active-imported-project-btn"
+                          onClick={() => void onDeleteProject(activeProject.id)}
+                          className="inline-flex items-center gap-1 rounded border border-rose-200 bg-white px-2 py-0.5 text-[11px] font-medium text-rose-600 hover:bg-rose-50 dark:border-rose-900/60 dark:bg-slate-900 dark:text-rose-400"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                          <span>{lang === 'fa' ? 'حذف پروژه' : 'Delete'}</span>
+                        </button>
+                      </div>
                     </div>
 
-                    <p
-                      dir="auto"
-                      className="mt-2.5 text-xs leading-relaxed text-slate-700 dark:text-slate-300"
-                    >
-                      {activeProject.managerSummary}
-                    </p>
+                    {isEditingProjectMeta ? (
+                      <div
+                        data-testid="edit-imported-project-form"
+                        className="mt-3 space-y-2.5 rounded-lg border border-blue-200 bg-white p-3 dark:border-blue-900/60 dark:bg-slate-900"
+                      >
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                              {lang === 'fa' ? 'نام پروژه' : 'Project Name'}
+                            </label>
+                            <input
+                              type="text"
+                              data-testid="edit-project-name-input"
+                              value={editProjectName}
+                              onChange={(e) => setEditProjectName(e.target.value)}
+                              className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                              {lang === 'fa' ? 'آدرس مخزن (اختیاری)' : 'Repository URL (optional)'}
+                            </label>
+                            <input
+                              type="text"
+                              dir="ltr"
+                              data-testid="edit-project-url-input"
+                              value={editProjectUrl}
+                              onChange={(e) => setEditProjectUrl(e.target.value)}
+                              placeholder="https://github.com/owner/repo"
+                              className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                              {lang === 'fa' ? 'شاخه / Branch' : 'Branch'}
+                            </label>
+                            <input
+                              type="text"
+                              dir="ltr"
+                              data-testid="edit-project-branch-input"
+                              value={editProjectBranch}
+                              onChange={(e) => setEditProjectBranch(e.target.value)}
+                              placeholder="main"
+                              className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                            />
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                            {lang === 'fa'
+                              ? 'خلاصه تحلیل و یادداشت ایجنت مدیر'
+                              : 'Manager Assessment Summary'}
+                          </label>
+                          <textarea
+                            rows={2}
+                            data-testid="edit-project-summary-input"
+                            value={editProjectSummary}
+                            onChange={(e) => setEditProjectSummary(e.target.value)}
+                            className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                          />
+                        </div>
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setIsEditingProjectMeta(false)}
+                            className="rounded border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300"
+                          >
+                            {lang === 'fa' ? 'انصراف' : 'Cancel'}
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="save-imported-project-btn"
+                            disabled={isSavingProjectMeta || !editProjectName.trim()}
+                            onClick={() => void handleSaveProjectMeta()}
+                            className="inline-flex items-center gap-1 rounded bg-blue-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                          >
+                            <Check className="h-3 w-3" />
+                            <span>
+                              {isSavingProjectMeta
+                                ? lang === 'fa'
+                                  ? 'در حال ذخیره...'
+                                  : 'Saving...'
+                                : lang === 'fa'
+                                  ? 'ذخیره تغییرات پروژه'
+                                  : 'Save Project Changes'}
+                            </span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <p
+                        dir="auto"
+                        className="mt-2.5 text-xs leading-relaxed text-slate-700 dark:text-slate-300"
+                      >
+                        {activeProject.managerSummary}
+                      </p>
+                    )}
 
                     <div className="mt-3 grid grid-cols-1 gap-2 border-t border-slate-200 pt-3 text-[11px] dark:border-slate-800 sm:grid-cols-3">
                       <div>
@@ -677,41 +945,55 @@ export function ProjectImportModal({
                     </div>
                   </section>
 
-                  {/* Recommended Agents List */}
+                  {/* Recommended Agents List (Editable, Duplicable, Deletable) */}
                   <section>
-                    <div className="mb-2.5 flex items-center justify-between">
+                    <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                       <h3 className="text-xs font-bold text-slate-900 dark:text-slate-100">
-                        {t.recommendedTeam} ({selectedRecommendations.length}/
-                        {activeProject.recommendations.length})
+                        {t.recommendedTeam} ({selectedRecommendations.length}/{editableSpecs.length})
                       </h3>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const allChecked = activeProject.recommendations.every(
-                            (r) => checkedIds[r.id],
-                          );
-                          const next: Record<string, boolean> = {};
-                          for (const r of activeProject.recommendations) {
-                            next[r.id] = !allChecked;
-                          }
-                          setCheckedIds(next);
-                        }}
-                        className="inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:underline dark:text-blue-400"
-                      >
-                        <CheckSquare className="h-3.5 w-3.5" />
-                        {t.selectAll}
-                      </button>
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          data-testid="add-custom-project-agent-btn"
+                          onClick={handleAddCustomSpec}
+                          className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300"
+                        >
+                          <Plus className="h-3 w-3" />
+                          {lang === 'fa' ? 'افزودن ایجنت دلخواه' : 'Add Custom Agent'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const allChecked = editableSpecs.every((r) => checkedIds[r.id]);
+                            const next: Record<string, boolean> = {};
+                            for (const r of editableSpecs) {
+                              next[r.id] = !allChecked;
+                            }
+                            setCheckedIds(next);
+                          }}
+                          className="inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+                        >
+                          <CheckSquare className="h-3.5 w-3.5" />
+                          {t.selectAll}
+                        </button>
+                      </div>
                     </div>
 
                     <div className="space-y-2.5" data-testid="recommended-agents-list">
-                      {activeProject.recommendations.map((rec) => {
+                      {editableSpecs.map((rec) => {
                         const checked = Boolean(checkedIds[rec.id]);
+                        const isEditing = editingSpecId === rec.id;
                         const priorityText =
                           rec.priority === 'essential'
                             ? t.priorityEssential
                             : rec.priority === 'optional'
                               ? t.priorityOptional
                               : t.priorityRecommended;
+                        const providerModels = getEffectiveProviderModels(
+                          rec.recommendedProvider,
+                          appSettings?.providers[rec.recommendedProvider],
+                        );
+                        const powerKey: AgentPowerLevel = rec.powerLevel ?? 'pro';
 
                         return (
                           <article
@@ -743,45 +1025,202 @@ export function ProjectImportModal({
                                   >
                                     {rec.title}
                                   </label>
-                                  <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                                    {roleLabels[rec.role] ?? rec.role} · {priorityText} ·{' '}
-                                    <span className="font-mono">
-                                      {rec.recommendedProvider}/{rec.recommendedModel}
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                                      {rec.section || roleLabels[rec.role] || rec.role} ·{' '}
+                                      {POWER_LEVEL_META[powerKey].short}
                                     </span>
-                                  </span>
-                                </div>
-
-                                <div
-                                  dir="auto"
-                                  className="mt-1 text-xs font-semibold text-blue-700 dark:text-blue-400"
-                                >
-                                  {rec.specialty}
-                                </div>
-
-                                <p
-                                  dir="auto"
-                                  className="mt-1 text-[11px] leading-relaxed text-slate-600 dark:text-slate-400"
-                                >
-                                  {rec.reason}
-                                </p>
-
-                                {rec.matchedSignals.length > 0 && (
-                                  <div className="mt-1.5 text-[10px] text-slate-500 dark:text-slate-400">
-                                    <span className="font-semibold">{t.signalsLabel} </span>
-                                    <span className="font-mono">
-                                      {rec.matchedSignals.join(' · ')}
-                                    </span>
+                                    <button
+                                      type="button"
+                                      aria-label={`Edit ${rec.title}`}
+                                      onClick={() =>
+                                        setEditingSpecId(isEditing ? null : rec.id)
+                                      }
+                                      className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-blue-600 dark:text-slate-400 dark:hover:bg-slate-800"
+                                    >
+                                      {isEditing ? (
+                                        <Check className="h-3.5 w-3.5 text-emerald-600" />
+                                      ) : (
+                                        <Pencil className="h-3.5 w-3.5" />
+                                      )}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      aria-label={`Duplicate ${rec.title}`}
+                                      title="Add another (+1)"
+                                      onClick={() => handleDuplicateSpec(rec)}
+                                      className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-emerald-600 dark:text-slate-400 dark:hover:bg-slate-800"
+                                    >
+                                      <CopyPlus className="h-3.5 w-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      aria-label={`Remove ${rec.title}`}
+                                      onClick={() => handleDeleteSpec(rec.id)}
+                                      className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/40"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
                                   </div>
-                                )}
+                                </div>
 
-                                <details className="mt-2">
-                                  <summary className="cursor-pointer text-[11px] font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200">
-                                    {t.promptPreview}
-                                  </summary>
-                                  <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-slate-50 p-2 font-mono text-[10px] text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">
-                                    {rec.systemPrompt}
-                                  </pre>
-                                </details>
+                                {isEditing ? (
+                                  <div className="mt-2.5 grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-2.5 dark:border-slate-800 dark:bg-slate-950 sm:grid-cols-2">
+                                    <input
+                                      type="text"
+                                      aria-label="Edit agent title"
+                                      value={rec.title}
+                                      onChange={(e) =>
+                                        handleUpdateSpec(rec.id, { title: e.target.value })
+                                      }
+                                      placeholder="Agent Title"
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                    />
+                                    <input
+                                      type="text"
+                                      aria-label="Edit agent position"
+                                      value={rec.positionTitle ?? ''}
+                                      onChange={(e) =>
+                                        handleUpdateSpec(rec.id, { positionTitle: e.target.value })
+                                      }
+                                      placeholder={lang === 'fa' ? 'پست و سمت' : 'Position / Post'}
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                    />
+                                    <select
+                                      aria-label="Edit agent section"
+                                      value={rec.section ?? 'Backend & API'}
+                                      onChange={(e) =>
+                                        handleUpdateSpec(rec.id, { section: e.target.value })
+                                      }
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                    >
+                                      {AGENT_SECTIONS.map((s) => (
+                                        <option key={s.id} value={s.id}>
+                                          {lang === 'fa' ? s.fa : s.en}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <select
+                                      aria-label="Edit agent power tier"
+                                      value={powerKey}
+                                      onChange={(e) =>
+                                        handleUpdateSpec(rec.id, {
+                                          powerLevel: e.target.value as AgentPowerLevel,
+                                        })
+                                      }
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                    >
+                                      <option value="eco">Eco (Fast)</option>
+                                      <option value="standard">Standard (Balanced)</option>
+                                      <option value="pro">Pro (High Power)</option>
+                                      <option value="ultra">Ultra (Deep Reasoning)</option>
+                                    </select>
+                                    <select
+                                      aria-label="Edit agent provider"
+                                      dir="ltr"
+                                      value={rec.recommendedProvider}
+                                      onChange={(e) => {
+                                        const prov = e.target.value as LLMProvider;
+                                        const list = getEffectiveProviderModels(
+                                          prov,
+                                          appSettings?.providers[prov],
+                                        );
+                                        handleUpdateSpec(rec.id, {
+                                          recommendedProvider: prov,
+                                          recommendedModel:
+                                            appSettings?.providers[prov]?.defaultModel ||
+                                            list[0]?.id ||
+                                            '',
+                                        });
+                                      }}
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                    >
+                                      <option value="gemini">Google Gemini</option>
+                                      <option value="opencode">OpenCode Zen</option>
+                                      <option value="openai">OpenAI ChatGPT</option>
+                                      <option value="anthropic">Anthropic Claude</option>
+                                      <option value="ollama">Local Ollama</option>
+                                    </select>
+                                    <select
+                                      aria-label="Edit agent model"
+                                      dir="ltr"
+                                      value={rec.recommendedModel}
+                                      onChange={(e) =>
+                                        handleUpdateSpec(rec.id, {
+                                          recommendedModel: e.target.value,
+                                        })
+                                      }
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                    >
+                                      {providerModels.map((m) => (
+                                        <option key={m.id} value={m.id}>
+                                          {m.id} ({POWER_LEVEL_META[m.power].short})
+                                        </option>
+                                      ))}
+                                      {!providerModels.some((m) => m.id === rec.recommendedModel) && (
+                                        <option value={rec.recommendedModel}>
+                                          {rec.recommendedModel}
+                                        </option>
+                                      )}
+                                    </select>
+                                    <input
+                                      type="text"
+                                      aria-label="Edit agent responsibility"
+                                      value={rec.specialty}
+                                      onChange={(e) =>
+                                        handleUpdateSpec(rec.id, { specialty: e.target.value })
+                                      }
+                                      placeholder={lang === 'fa' ? 'مسئولیت و تخصص' : 'Specialty / Responsibility'}
+                                      className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 sm:col-span-2"
+                                    />
+                                  </div>
+                                ) : (
+                                  <>
+                                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+                                      {rec.positionTitle && (
+                                        <span className="font-medium text-slate-700 dark:text-slate-300">
+                                          {rec.positionTitle}
+                                        </span>
+                                      )}
+                                      <span>· {priorityText} ·</span>
+                                      <span className="font-mono">
+                                        {rec.recommendedProvider}/{rec.recommendedModel}
+                                      </span>
+                                    </div>
+
+                                    <div
+                                      dir="auto"
+                                      className="mt-1 text-xs font-semibold text-blue-700 dark:text-blue-400"
+                                    >
+                                      {rec.specialty}
+                                    </div>
+
+                                    <p
+                                      dir="auto"
+                                      className="mt-1 text-[11px] leading-relaxed text-slate-600 dark:text-slate-400"
+                                    >
+                                      {rec.reason}
+                                    </p>
+
+                                    {rec.matchedSignals.length > 0 && (
+                                      <div className="mt-1.5 text-[10px] text-slate-500 dark:text-slate-400">
+                                        <span className="font-semibold">{t.signalsLabel} </span>
+                                        <span className="font-mono">
+                                          {rec.matchedSignals.join(' · ')}
+                                        </span>
+                                      </div>
+                                    )}
+
+                                    <details className="mt-2">
+                                      <summary className="cursor-pointer text-[11px] font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200">
+                                        {t.promptPreview}
+                                      </summary>
+                                      <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-slate-50 p-2 font-mono text-[10px] text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-300">
+                                        {rec.systemPrompt}
+                                      </pre>
+                                    </details>
+                                  </>
+                                )}
                               </div>
                             </div>
                           </article>

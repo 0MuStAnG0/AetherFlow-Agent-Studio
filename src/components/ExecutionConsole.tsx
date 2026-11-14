@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Archive,
   ArrowRight,
   Bug,
   CheckCircle2,
@@ -14,6 +15,7 @@ import {
   ShieldCheck,
   Terminal,
   Trash2,
+  UploadCloud,
   Wand2,
   Wrench,
 } from 'lucide-react';
@@ -60,6 +62,8 @@ interface ExecutionConsoleProps {
   executionMode: 'live' | 'dry_run';
   onExecutionModeChange: (mode: 'live' | 'dry_run') => void;
   geminiConfigured: boolean;
+  onDownloadZip?: () => void;
+  onOpenGitHubPush?: () => void;
 }
 
 const ROLE_LABELS: Record<'en' | 'fa', Record<AgentRole, string>> = {
@@ -215,6 +219,8 @@ export function ExecutionConsole({
   executionMode,
   onExecutionModeChange,
   geminiConfigured,
+  onDownloadZip,
+  onOpenGitHubPush,
 }: ExecutionConsoleProps) {
   const [subTab, setSubTab] = useState<'stream' | 'sandbox' | 'bugs'>('stream');
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -366,7 +372,9 @@ export function ExecutionConsole({
 
         {!geminiConfigured && executionMode === 'live' && (
           <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-300">
-            GEMINI_API_KEY is not set in Secrets. OpenCode free models or Sandbox Dry-Run remain available.
+            {lang === 'fa'
+              ? 'کلید API در Settings تنظیم نشده است. مدل‌های رایگان OpenCode یا حالت Sandbox Dry-Run فعال هستند.'
+              : 'No live LLM API key configured in Settings yet. OpenCode free models or Sandbox Dry-Run remain available.'}
           </p>
         )}
       </div>
@@ -586,46 +594,85 @@ export function ExecutionConsole({
             </div>
           )
         ) : subTab === 'sandbox' ? (
-          sandboxFiles.length === 0 ? (
-            <div className="flex h-full flex-col items-center justify-center py-10 text-center">
-              <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                {t.sandboxEmptyTitle}
-              </p>
-              <p className="mt-1.5 max-w-xs text-xs text-slate-500 dark:text-slate-400">
-                {t.sandboxEmptyHint}
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <div className="flex flex-wrap gap-1.5">
-                {sandboxFiles.map((file) => (
-                  <button
-                    key={file.path}
-                    type="button"
-                    onClick={() => setSelectedFilePath(file.path)}
-                    className={`rounded-md border px-2.5 py-1 font-mono text-[11px] transition-colors ${
-                      selectedFile?.path === file.path
-                        ? 'border-blue-600 bg-blue-50 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300'
-                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300'
-                    }`}
-                  >
-                    {file.path}
-                  </button>
-                ))}
-              </div>
-              {selectedFile && (
-                <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800">
-                  <div className="flex items-center justify-between bg-slate-100 px-3 py-1.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                    <span>{selectedFile.path}</span>
-                    <span className="tabular-nums">{selectedFile.size} bytes</span>
-                  </div>
-                  <pre className="max-h-[340px] overflow-auto bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-100">
-                    {selectedFile.content}
-                  </pre>
+          <div className="space-y-3">
+            {(onDownloadZip || onOpenGitHubPush) && (
+              <div
+                dir={lang === 'fa' ? 'rtl' : 'ltr'}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 p-2 dark:border-slate-800 dark:bg-slate-900/60"
+              >
+                <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300">
+                  {lang === 'fa'
+                    ? 'خروجی فایل‌های سندباکس و پروژه:'
+                    : 'Export sandbox & project bundle:'}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  {onDownloadZip && (
+                    <button
+                      type="button"
+                      data-testid="sandbox-download-zip-btn"
+                      onClick={onDownloadZip}
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                    >
+                      <Archive className="h-3 w-3 text-blue-600" />
+                      {lang === 'fa' ? 'دانلود ZIP' : 'Save ZIP'}
+                    </button>
+                  )}
+                  {onOpenGitHubPush && (
+                    <button
+                      type="button"
+                      data-testid="sandbox-github-push-btn"
+                      onClick={onOpenGitHubPush}
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-700 px-2.5 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-emerald-800"
+                    >
+                      <UploadCloud className="h-3 w-3" />
+                      {lang === 'fa' ? 'Push در گیت‌هاب' : 'Push to GitHub'}
+                    </button>
+                  )}
                 </div>
-              )}
-            </div>
-          )
+              </div>
+            )}
+
+            {sandboxFiles.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-8 text-center">
+                <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                  {t.sandboxEmptyTitle}
+                </p>
+                <p className="mt-1.5 max-w-xs text-xs text-slate-500 dark:text-slate-400">
+                  {t.sandboxEmptyHint}
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap gap-1.5">
+                  {sandboxFiles.map((file) => (
+                    <button
+                      key={file.path}
+                      type="button"
+                      onClick={() => setSelectedFilePath(file.path)}
+                      className={`rounded-md border px-2.5 py-1 font-mono text-[11px] transition-colors ${
+                        selectedFile?.path === file.path
+                          ? 'border-blue-600 bg-blue-50 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300'
+                          : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300'
+                      }`}
+                    >
+                      {file.path}
+                    </button>
+                  ))}
+                </div>
+                {selectedFile && (
+                  <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800">
+                    <div className="flex items-center justify-between bg-slate-100 px-3 py-1.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                      <span>{selectedFile.path}</span>
+                      <span className="tabular-nums">{selectedFile.size} bytes</span>
+                    </div>
+                    <pre className="max-h-[340px] overflow-auto bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-100">
+                      {selectedFile.content}
+                    </pre>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         ) : (
           <div className="space-y-3" data-testid="bug-report-panel">
             {/* Category & Agent Role Filters */}

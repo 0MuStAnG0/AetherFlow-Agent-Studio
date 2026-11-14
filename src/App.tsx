@@ -1,24 +1,44 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ReactFlowProvider } from '@xyflow/react';
 import {
+  ReactFlowProvider,
+  addEdge,
+  applyEdgeChanges,
+  applyNodeChanges,
+  type Connection,
+  type Edge,
+  type EdgeChange,
+  type Node,
+  type NodeChange,
+} from '@xyflow/react';
+import {
+  Archive,
   Check,
   Download,
   FolderGit2,
   Languages,
   Link2,
   Moon,
+  Pencil,
   Plus,
+  RotateCcw,
   Save,
   Sun,
+  Trash2,
   Upload,
+  UploadCloud,
 } from 'lucide-react';
-import { AGENT_ROLE_TEMPLATES, DEFAULT_SEED_WORKFLOWS } from './data/agentTemplates';
+import {
+  DEFAULT_SEED_WORKFLOWS,
+  POWER_LEVEL_META,
+  type AgentRoleTemplate,
+} from './data/agentTemplates';
 import type {
   AgentNodeData,
   AgentRole,
   AppSettings,
   BugReportItem,
   BugReportStatus,
+  CapabilitiesState,
   ExecutionEvent,
   ExecutionRunSummary,
   ImportedProjectAnalysis,
@@ -28,6 +48,15 @@ import type {
   WorkflowEdge,
   WorkflowNode,
 } from './types/workflow';
+import {
+  createAgentNodesBatch,
+  deleteAgentTemplate,
+  duplicateWorkflowNode,
+  getEffectiveAgentTemplates,
+  getEffectiveProviderModels,
+  restoreDefaultAgentTemplates,
+  upsertCustomAgentTemplate,
+} from './utils/catalogUtils';
 import { buildWorkflowFromRecommendations } from './utils/projectAnalyzer';
 import {
   DEFAULT_APP_SETTINGS,
@@ -37,10 +66,18 @@ import {
   parseImportedWorkflowJson,
   serializeWorkflowForExport,
 } from './utils/workflowEngine';
+import type { ExportBundleScope } from './utils/exportBundle';
+import {
+  AgentBuilderModal,
+  payloadToCustomTemplate,
+  type AgentBuilderSubmitPayload,
+} from './components/AgentBuilderModal';
 import { AgentInspector } from './components/AgentInspector';
 import { BlueprintView } from './components/BlueprintView';
 import { ExecutionConsole } from './components/ExecutionConsole';
+import { GitHubPushModal } from './components/GitHubPushModal';
 import { ProjectImportModal } from './components/ProjectImportModal';
+import { ProjectManagerModal } from './components/ProjectManagerModal';
 import { RunHistoryView } from './components/RunHistoryView';
 import { SettingsView } from './components/SettingsView';
 import { WorkflowCanvas } from './components/WorkflowCanvas';
@@ -58,8 +95,13 @@ const COPY = {
     saveBtn: 'Save Workflow',
     savedBtn: 'Saved',
     newBtn: 'New Workflow',
+    manageProjects: 'Manage Projects',
+    editProject: 'Edit Project',
+    deleteProject: 'Delete Project',
     exportJson: 'Export JSON',
     importJson: 'Import JSON',
+    saveZip: 'Save ZIP',
+    pushGitHub: 'Push to GitHub',
     importProject: 'Import Project',
     shareLink: 'Share Link',
     linkCopied: 'Link Copied',
@@ -82,8 +124,13 @@ const COPY = {
     saveBtn: 'ذخیره ورکفلو',
     savedBtn: 'ذخیره شد',
     newBtn: 'ورکفلو جدید',
+    manageProjects: 'مدیریت پروژه‌ها',
+    editProject: 'ویرایش پروژه',
+    deleteProject: 'حذف پروژه',
     exportJson: 'خروجی JSON',
     importJson: 'ورود JSON',
+    saveZip: 'ذخیره ZIP',
+    pushGitHub: 'Push در گیت‌هاب',
     importProject: 'اتصال گیت‌هاب / ZIP',
     shareLink: 'لینک اشتراک',
     linkCopied: 'لینک کپی شد',
@@ -112,11 +159,12 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>('node-manager');
   const [saveSuccess, setSaveSuccess] = useState(false);
 
-  const [capabilities, setCapabilities] = useState({
+  const [capabilities, setCapabilities] = useState<CapabilitiesState>({
     geminiConfigured: false,
     openaiConfigured: false,
     anthropicConfigured: false,
     opencodeConfigured: false,
+    secrets: {},
   });
   const [executionMode, setExecutionMode] = useState<'live' | 'dry_run'>('dry_run');
   const [taskPrompt, setTaskPrompt] = useState(
@@ -146,6 +194,16 @@ export default function App() {
   const [bugReports, setBugReports] = useState<BugReportItem[]>([]);
   const [importedProjects, setImportedProjects] = useState<ImportedProjectAnalysis[]>([]);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+  const [isProjectManagerOpen, setIsProjectManagerOpen] = useState(false);
+  const [builderModal, setBuilderModal] = useState<{
+    open: boolean;
+    mode: 'add_agents' | 'edit_template';
+    template: AgentRoleTemplate | null;
+  }>({ open: false, mode: 'add_agents', template: null });
+  const [gitHubPushModal, setGitHubPushModal] = useState<{
+    open: boolean;
+    initialScope: ExportBundleScope;
+  }>({ open: false, initialScope: 'project_bundle' });
   const [shareCopied, setShareCopied] = useState(false);
   const [workflowNotice, setWorkflowNotice] = useState<{
     type: 'success' | 'error';
@@ -240,18 +298,17 @@ export default function App() {
       fetch('/api/settings').then((r) => r.json()),
     ])
       .then(([capData, settingsData]) => {
-        const cap = capData as {
-          geminiConfigured?: boolean;
-          openaiConfigured?: boolean;
-          anthropicConfigured?: boolean;
-          opencodeConfigured?: boolean;
-        };
-        const configured = Boolean(cap.geminiConfigured);
+        const cap = capData as Partial<CapabilitiesState>;
+        const anyConfigured = Boolean(
+          cap.geminiConfigured || cap.openaiConfigured || cap.anthropicConfigured,
+        );
         setCapabilities({
-          geminiConfigured: configured,
+          geminiConfigured: Boolean(cap.geminiConfigured),
           openaiConfigured: Boolean(cap.openaiConfigured),
           anthropicConfigured: Boolean(cap.anthropicConfigured),
           opencodeConfigured: Boolean(cap.opencodeConfigured),
+          ollamaBaseUrl: cap.ollamaBaseUrl,
+          secrets: cap.secrets ?? {},
         });
         if (settingsData && settingsData.providers) {
           const loaded = settingsData as AppSettings;
@@ -259,10 +316,10 @@ export default function App() {
           setLang(loaded.language);
           setDarkMode(loaded.darkMode);
           setExecutionMode(
-            loaded.defaultExecutionMode === 'dry_run' || !configured ? 'dry_run' : 'live',
+            loaded.defaultExecutionMode === 'dry_run' || !anyConfigured ? 'dry_run' : 'live',
           );
         } else {
-          setExecutionMode(configured ? 'live' : 'dry_run');
+          setExecutionMode(anyConfigured ? 'live' : 'dry_run');
         }
       })
       .catch(() => {});
@@ -438,6 +495,55 @@ export default function App() {
     );
   };
 
+  const handleDownloadZip = useCallback(
+    async (scope: ExportBundleScope = 'project_bundle') => {
+      try {
+        const res = await fetch('/api/export/zip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scope,
+            workflow,
+            runId: activeRunId ?? undefined,
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          filename?: string;
+          zipBase64?: string;
+          fileCount?: number;
+          error?: string;
+        };
+        if (!res.ok || !data.zipBase64) {
+          showNotice('error', data.error || 'Failed to build ZIP archive.');
+          return;
+        }
+        const binaryStr = window.atob(data.zipBase64);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i += 1) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: 'application/zip' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = data.filename || 'aetherflow-bundle.zip';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        showNotice(
+          'success',
+          lang === 'fa'
+            ? `فایل فشرده «${data.filename}» (${data.fileCount ?? 0} فایل) با موفقیت دانلود شد.`
+            : `Downloaded "${data.filename}" (${data.fileCount ?? 0} files).`,
+        );
+      } catch {
+        showNotice('error', 'Network error while generating ZIP archive.');
+      }
+    },
+    [activeRunId, lang, showNotice, workflow],
+  );
+
   const handleImportJsonFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
@@ -472,10 +578,115 @@ export default function App() {
     }
   };
 
+  const handleSaveSpecificWorkflow = async (wfToSave: WorkflowConfig) => {
+    const res = await fetch('/api/workflows', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(wfToSave),
+    });
+    if (res.ok) {
+      const saved = (await res.json()) as WorkflowConfig;
+      setWorkflow((prev) => (prev.id === saved.id ? saved : prev));
+      setWorkflows((prev) => {
+        const exists = prev.some((w) => w.id === saved.id);
+        return exists ? prev.map((w) => (w.id === saved.id ? saved : w)) : [saved, ...prev];
+      });
+      showNotice(
+        'success',
+        lang === 'fa'
+          ? `تغییرات پروژه «${saved.name}» با موفقیت ذخیره شد.`
+          : `Saved project "${saved.name}".`,
+      );
+    }
+  };
+
+  const handleDuplicateWorkflow = async (sourceWf: WorkflowConfig) => {
+    const cloned: WorkflowConfig = {
+      ...sourceWf,
+      id: `wf-${Date.now().toString(36)}`,
+      name: `${sourceWf.name} (Copy)`,
+      updatedAt: new Date().toISOString(),
+    };
+    const res = await fetch('/api/workflows', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cloned),
+    }).catch(() => null);
+    const saved = res?.ok ? ((await res.json()) as WorkflowConfig) : cloned;
+    setWorkflows((prev) => [saved, ...prev]);
+    setWorkflow(saved);
+    setSelectedNodeId(saved.nodes[0]?.id ?? null);
+    showNotice(
+      'success',
+      lang === 'fa'
+        ? `کپی از پروژه «${sourceWf.name}» ساخته شد.`
+        : `Duplicated project "${sourceWf.name}".`,
+    );
+  };
+
+  const handleDeleteWorkflow = async (workflowId: string) => {
+    await fetch(`/api/workflows/${workflowId}`, { method: 'DELETE' }).catch(() => {});
+    const remaining = workflows.filter((w) => w.id !== workflowId);
+    if (remaining.length > 0) {
+      setWorkflows(remaining);
+      if (workflow.id === workflowId) {
+        setWorkflow(remaining[0]);
+        setSelectedNodeId(remaining[0].nodes[0]?.id ?? null);
+      }
+    } else {
+      const fallback: WorkflowConfig = {
+        id: `wf-${Date.now().toString(36)}`,
+        name: 'Custom Pipeline 1',
+        description: 'Custom multi-agent workflow',
+        maxRounds: appSettings.defaultMaxRounds,
+        humanInTheLoop: appSettings.globalHumanInTheLoop,
+        nodes: [],
+        edges: [],
+        updatedAt: new Date().toISOString(),
+      };
+      setWorkflows([fallback]);
+      setWorkflow(fallback);
+      setSelectedNodeId(null);
+    }
+    showNotice(
+      'success',
+      lang === 'fa' ? 'پروژه با موفقیت حذف شد.' : 'Project deleted.',
+    );
+  };
+
+  const handleUpdateImportedProject = async (
+    projectId: string,
+    patch: Partial<ImportedProjectAnalysis>,
+  ) => {
+    const res = await fetch(`/api/projects/${projectId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { project?: ImportedProjectAnalysis };
+      if (data.project) {
+        setImportedProjects((prev) =>
+          prev.map((p) => (p.id === projectId ? data.project! : p)),
+        );
+        showNotice(
+          'success',
+          lang === 'fa'
+            ? `مشخصات پروژه «${data.project.name}» ویرایش شد.`
+            : `Updated project "${data.project.name}".`,
+        );
+      }
+    }
+  };
+
   const handleDeleteImportedProject = async (projectId: string) => {
     const res = await fetch(`/api/projects/${projectId}`, { method: 'DELETE' });
     if (res.ok) {
       setImportedProjects((prev) => prev.filter((p) => p.id !== projectId));
+      showNotice(
+        'success',
+        lang === 'fa' ? 'پروژه واردشده حذف شد.' : 'Imported project deleted.',
+      );
     }
   };
 
@@ -518,10 +729,26 @@ export default function App() {
     );
   };
 
-  const handleAddTemplateNode = (role: AgentRole, customPosition?: { x: number; y: number }) => {
+  const effectiveTemplates = getEffectiveAgentTemplates(appSettings);
+
+  const handleAddTemplateNode = (
+    roleOrTemplateId: AgentRole | string,
+    customPosition?: { x: number; y: number },
+  ) => {
     const tpl =
-      AGENT_ROLE_TEMPLATES.find((t) => t.role === role) ?? AGENT_ROLE_TEMPLATES[1];
+      effectiveTemplates.find((t) => t.id === roleOrTemplateId || t.role === roleOrTemplateId) ??
+      effectiveTemplates[0];
+    const role: AgentRole =
+      roleOrTemplateId === 'custom' ? 'custom' : tpl?.role ?? 'custom';
     const index = workflow.nodes.length;
+    const provider = tpl?.defaultProvider ?? 'gemini';
+    const providerModels = getEffectiveProviderModels(provider, appSettings.providers[provider]);
+    const resolvedModel =
+      appSettings.providers[provider]?.defaultModel ||
+      tpl?.defaultModel ||
+      providerModels[0]?.id ||
+      'gemini-4-hydrogen';
+
     const newNode: WorkflowNode = {
       id: `node-${role}-${Date.now().toString().slice(-5)}`,
       type: 'agentNode',
@@ -531,29 +758,33 @@ export default function App() {
       },
       data: {
         label:
-          role === 'custom'
+          roleOrTemplateId === 'custom'
             ? `Custom Agent ${index + 1}`
             : `${tpl.title}${workflow.nodes.some((n) => n.data.role === role) ? ` ${index + 1}` : ''}`,
         role,
-        provider: tpl.defaultProvider,
-        model: appSettings.providers[tpl.defaultProvider]?.defaultModel || tpl.defaultModel,
+        section: tpl?.section ?? 'General',
+        positionTitle: tpl?.positionTitle ?? (role === 'custom' ? 'Specialist' : tpl?.title),
+        responsibility: tpl?.responsibility ?? tpl?.subtitle,
+        powerLevel: tpl?.powerLevel ?? 'standard',
+        provider,
+        model: resolvedModel,
         envSecretRef:
-          appSettings.providers[tpl.defaultProvider]?.envVarName ||
-          (tpl.defaultProvider === 'gemini'
+          appSettings.providers[provider]?.envVarName ||
+          (provider === 'gemini'
             ? 'GEMINI_API_KEY'
-            : tpl.defaultProvider === 'opencode'
+            : provider === 'opencode'
               ? 'OPENCODE_API_KEY'
-              : tpl.defaultProvider === 'openai'
+              : provider === 'openai'
                 ? 'OPENAI_API_KEY'
-                : tpl.defaultProvider === 'anthropic'
+                : provider === 'anthropic'
                   ? 'ANTHROPIC_API_KEY'
                   : 'OLLAMA_BASE_URL'),
-        temperature: tpl.defaultTemperature,
-        systemPrompt: tpl.systemPrompt,
+        temperature: tpl?.defaultTemperature ?? 0.25,
+        systemPrompt: tpl?.systemPrompt ?? 'You are a helpful specialized software engineering agent.',
         tools: {
-          readFile: tpl.defaultTools.readFile && appSettings.allowReadFile,
-          writeFile: tpl.defaultTools.writeFile && appSettings.allowWriteFile,
-          execBash: tpl.defaultTools.execBash && appSettings.allowExecBash,
+          readFile: (tpl?.defaultTools.readFile ?? true) && appSettings.allowReadFile,
+          writeFile: (tpl?.defaultTools.writeFile ?? true) && appSettings.allowWriteFile,
+          execBash: (tpl?.defaultTools.execBash ?? false) && appSettings.allowExecBash,
         },
         status: 'idle',
       },
@@ -573,6 +804,18 @@ export default function App() {
     }));
   };
 
+  const handleDuplicateNode = (nodeId: string) => {
+    const source = workflow.nodes.find((n) => n.id === nodeId);
+    if (!source) return;
+    const cloned = duplicateWorkflowNode(source, workflow.nodes);
+    setWorkflow((prev) => ({
+      ...prev,
+      nodes: [...prev.nodes, cloned],
+    }));
+    setSelectedNodeId(cloned.id);
+    setRightTab('inspector');
+  };
+
   const handleDeleteNode = (nodeId: string) => {
     setWorkflow((prev) => ({
       ...prev,
@@ -585,6 +828,76 @@ export default function App() {
     if (targetAgentId === nodeId) {
       setTargetAgentId('all');
     }
+  };
+
+  const handleDeleteTemplate = async (templateId: string) => {
+    const nextSettings = deleteAgentTemplate(appSettings, templateId);
+    setAppSettings(nextSettings);
+    await handleSaveSettings(nextSettings);
+  };
+
+  const handleRestoreTemplates = async () => {
+    const nextSettings = restoreDefaultAgentTemplates(appSettings);
+    setAppSettings(nextSettings);
+    await handleSaveSettings(nextSettings);
+  };
+
+  const handleBuilderSubmit = async (payload: AgentBuilderSubmitPayload) => {
+    if (payload.mode === 'save_template') {
+      const tpl = payloadToCustomTemplate(payload, payload.templateId);
+      const nextSettings = upsertCustomAgentTemplate(appSettings, tpl);
+      setAppSettings(nextSettings);
+      await handleSaveSettings(nextSettings);
+      showNotice(
+        'success',
+        lang === 'fa' ? `قالب «${tpl.title}» ذخیره شد.` : `Saved template "${tpl.title}".`,
+      );
+      return;
+    }
+
+    const { nodesToAdd, edgesToAdd } = createAgentNodesBatch({
+      count: payload.count,
+      baseLabel: payload.label,
+      role: payload.role,
+      section: payload.section,
+      positionTitle: payload.positionTitle,
+      responsibility: payload.responsibility,
+      powerLevel: payload.powerLevel,
+      provider: payload.provider,
+      model: payload.model,
+      temperature: payload.temperature,
+      systemPrompt: payload.systemPrompt,
+      tools: payload.tools,
+      existingNodes: workflow.nodes,
+      existingEdges: workflow.edges,
+      appSettings,
+      autoConnect: payload.autoConnect,
+    });
+
+    setWorkflow((prev) => ({
+      ...prev,
+      nodes: [...prev.nodes, ...nodesToAdd],
+      edges: [...prev.edges, ...edgesToAdd],
+    }));
+
+    if (nodesToAdd[0]) {
+      setSelectedNodeId(nodesToAdd[0].id);
+      setRightTab('inspector');
+    }
+
+    if (payload.saveAsTemplate) {
+      const tpl = payloadToCustomTemplate(payload);
+      const nextSettings = upsertCustomAgentTemplate(appSettings, tpl);
+      setAppSettings(nextSettings);
+      await handleSaveSettings(nextSettings);
+    }
+
+    showNotice(
+      'success',
+      lang === 'fa'
+        ? `${nodesToAdd.length} ایجنت جدید در بخش «${payload.section}» به پروژه اضافه شد.`
+        : `Added ${nodesToAdd.length} agent(s) to "${payload.section}".`,
+    );
   };
 
   const handleClearFeed = () => {
@@ -1001,11 +1314,34 @@ export default function App() {
 
                 <button
                   type="button"
+                  data-testid="toolbar-create-workflow-btn"
                   onClick={handleCreateWorkflow}
                   className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                 >
                   <Plus className="h-3.5 w-3.5" />
                   {t.newBtn}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="toolbar-edit-workflow-btn"
+                  onClick={() => setIsProjectManagerOpen(true)}
+                  title={lang === 'fa' ? 'مدیریت، ویرایش و حذف پروژه‌ها' : 'Manage, Edit & Delete Projects'}
+                  className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                >
+                  <Pencil className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                  {t.manageProjects}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="toolbar-delete-workflow-btn"
+                  onClick={() => void handleDeleteWorkflow(workflow.id)}
+                  title={lang === 'fa' ? 'حذف پروژه فعلی' : 'Delete Active Project'}
+                  className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-rose-200 px-2 py-1.5 text-xs font-medium text-rose-700 transition-colors hover:bg-rose-50 dark:border-rose-900/60 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  {t.deleteProject}
                 </button>
 
                 <button
@@ -1059,6 +1395,28 @@ export default function App() {
                 >
                   <FolderGit2 className="h-3.5 w-3.5" />
                   {t.importProject}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="toolbar-download-zip-btn"
+                  onClick={() => void handleDownloadZip('project_bundle')}
+                  className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  <Archive className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                  {t.saveZip}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="toolbar-github-push-btn"
+                  onClick={() =>
+                    setGitHubPushModal({ open: true, initialScope: 'project_bundle' })
+                  }
+                  className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-emerald-700 px-2.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-800"
+                >
+                  <UploadCloud className="h-3.5 w-3.5" />
+                  {t.pushGitHub}
                 </button>
               </div>
 
@@ -1145,51 +1503,117 @@ export default function App() {
                 dir={lang === 'fa' ? 'rtl' : 'ltr'}
                 className="hidden w-[264px] shrink-0 flex-col border-r border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 md:flex"
               >
-                <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-                  <h2 className="font-display text-xs font-semibold text-slate-900 dark:text-slate-100">
-                    {t.templatesTitle}
-                  </h2>
-                  <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                    {t.templatesHint}
-                  </p>
+                <div className="flex items-start justify-between gap-2 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <div>
+                    <h2 className="font-display text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {t.templatesTitle}
+                    </h2>
+                    <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                      {t.templatesHint}
+                    </p>
+                  </div>
+                  {(appSettings.hiddenTemplateIds?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => void handleRestoreTemplates()}
+                      title={lang === 'fa' ? 'بازیابی قالب‌های پیش‌فرض' : 'Restore default templates'}
+                      className="inline-flex shrink-0 items-center gap-1 rounded border border-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300"
+                    >
+                      <RotateCcw className="h-2.5 w-2.5" />
+                      {lang === 'fa' ? 'بازیابی' : 'Reset'}
+                    </button>
+                  )}
                 </div>
 
                 <div className="flex-1 space-y-2 overflow-y-auto p-3">
-                  {AGENT_ROLE_TEMPLATES.map((tpl) => (
-                    <button
-                      key={tpl.role}
-                      type="button"
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.setData('application/aetherflow-role', tpl.role);
-                        e.dataTransfer.effectAllowed = 'move';
-                      }}
-                      onClick={() => handleAddTemplateNode(tpl.role)}
-                      className="w-full rounded-lg border border-slate-200 bg-slate-50/70 p-3 text-left transition-colors hover:border-blue-500 hover:bg-blue-50/40 dark:border-slate-800 dark:bg-slate-950/60 dark:hover:border-blue-500 dark:hover:bg-slate-800/80"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="font-display text-xs font-semibold text-slate-900 dark:text-slate-100">
-                          {tpl.title}
-                        </span>
-                        <Plus className="h-3.5 w-3.5 text-slate-400" />
-                      </div>
-                      <p className="mt-1 text-[11px] leading-snug text-slate-600 dark:text-slate-400">
-                        {tpl.subtitle}
-                      </p>
-                      <div className="mt-2 font-mono text-[10px] text-slate-500 dark:text-slate-400">
-                        {tpl.defaultProvider} · {tpl.defaultModel}
-                      </div>
-                    </button>
-                  ))}
-
                   <button
                     type="button"
-                    onClick={() => handleAddTemplateNode('custom')}
-                    className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-300 py-2.5 text-xs font-medium text-slate-600 transition-colors hover:border-blue-500 hover:text-blue-700 dark:border-slate-700 dark:text-slate-400 dark:hover:text-blue-400"
+                    data-testid="open-agent-builder-btn"
+                    onClick={() =>
+                      setBuilderModal({ open: true, mode: 'add_agents', template: null })
+                    }
+                    className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700"
                   >
                     <Plus className="h-3.5 w-3.5" />
-                    Add Custom Agent Node
+                    <span>
+                      {lang === 'fa'
+                        ? 'افزودن / ساخت ایجنت دلخواه'
+                        : 'Build / Add Custom Agents'}
+                    </span>
                   </button>
+
+                  {effectiveTemplates.map((tpl) => (
+                    <div
+                      key={tpl.id}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData('application/aetherflow-role', tpl.id);
+                        e.dataTransfer.effectAllowed = 'move';
+                      }}
+                      className="group rounded-lg border border-slate-200 bg-slate-50/70 p-2.5 text-left transition-colors hover:border-blue-500 hover:bg-blue-50/40 dark:border-slate-800 dark:bg-slate-950/60 dark:hover:border-blue-500 dark:hover:bg-slate-800/80"
+                    >
+                      <div className="flex items-start justify-between gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleAddTemplateNode(tpl.id)}
+                          className="min-w-0 flex-1 text-start"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className="truncate font-display text-xs font-semibold text-slate-900 dark:text-slate-100">
+                              {tpl.title}
+                            </span>
+                            <span className="shrink-0 rounded bg-slate-200/80 px-1 py-0.2 text-[9px] font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                              {POWER_LEVEL_META[tpl.powerLevel].short}
+                            </span>
+                          </div>
+                          <div className="mt-0.5 truncate text-[10px] font-medium text-blue-700 dark:text-blue-400">
+                            {tpl.section} · {tpl.positionTitle}
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-[11px] leading-snug text-slate-600 dark:text-slate-400">
+                            {tpl.subtitle}
+                          </p>
+                          <div className="mt-1.5 truncate font-mono text-[10px] text-slate-500 dark:text-slate-400">
+                            {tpl.defaultProvider} · {tpl.defaultModel}
+                          </div>
+                        </button>
+                        <div className="flex shrink-0 flex-col gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleAddTemplateNode(tpl.id)}
+                            aria-label={`Add ${tpl.title}`}
+                            title="Add to canvas"
+                            className="rounded p-1 text-slate-500 hover:bg-white hover:text-blue-600 dark:hover:bg-slate-900"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setBuilderModal({
+                                open: true,
+                                mode: 'edit_template',
+                                template: tpl,
+                              })
+                            }
+                            aria-label={`Edit template ${tpl.title}`}
+                            title="Edit template"
+                            className="rounded p-1 text-slate-400 hover:bg-white hover:text-blue-600 dark:hover:bg-slate-900"
+                          >
+                            <Pencil className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteTemplate(tpl.id)}
+                            aria-label={`Delete template ${tpl.title}`}
+                            title="Delete template"
+                            className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/40"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
 
                 <div className="border-t border-slate-200 px-4 py-3 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
@@ -1234,17 +1658,93 @@ export default function App() {
                     selectedNodeId={selectedNodeId}
                     showMiniMap={appSettings.showMiniMap}
                     gridVariant={appSettings.canvasGridVariant}
-                    onNodesChange={(nodes: WorkflowNode[]) =>
-                      setWorkflow((prev) => ({ ...prev, nodes }))
+                    onNodesChange={(changes: NodeChange<Node<AgentNodeData>>[]) => {
+                      const removedIds = new Set(
+                        changes.filter((c) => c.type === 'remove').map((c) => c.id),
+                      );
+                      setWorkflow((prev) => {
+                        const updated = applyNodeChanges(
+                          changes,
+                          prev.nodes as unknown as Node<AgentNodeData>[],
+                        );
+                        const validIds = new Set(updated.map((n) => n.id));
+                        return {
+                          ...prev,
+                          nodes: updated.map((node) => ({
+                            id: node.id,
+                            type: 'agentNode',
+                            position: node.position,
+                            measured: node.measured,
+                            data: {
+                              ...node.data,
+                              status: 'idle',
+                            },
+                          })),
+                          edges:
+                            removedIds.size > 0
+                              ? prev.edges.filter(
+                                  (e) => validIds.has(e.source) && validIds.has(e.target),
+                                )
+                              : prev.edges,
+                        };
+                      });
+                      if (selectedNodeId && removedIds.has(selectedNodeId)) {
+                        setSelectedNodeId(null);
+                      }
+                    }}
+                    onEdgesChange={(changes: EdgeChange<Edge>[]) =>
+                      setWorkflow((prev) => {
+                        const updated = applyEdgeChanges(
+                          changes,
+                          prev.edges as unknown as Edge[],
+                        );
+                        return {
+                          ...prev,
+                          edges: updated.map((e) => ({
+                            id: e.id,
+                            source: e.source,
+                            target: e.target,
+                            label: typeof e.label === 'string' ? e.label : undefined,
+                            animated: Boolean(e.animated),
+                          })),
+                        };
+                      })
                     }
-                    onEdgesChange={(edges: WorkflowEdge[]) =>
-                      setWorkflow((prev) => ({ ...prev, edges }))
+                    onConnect={(connection: Connection) =>
+                      setWorkflow((prev) => {
+                        const updated = addEdge(
+                          {
+                            ...connection,
+                            id: `edge-${connection.source}-${connection.target}-${Date.now()}`,
+                            label: 'Handoff',
+                          },
+                          prev.edges as unknown as Edge[],
+                        );
+                        return {
+                          ...prev,
+                          edges: updated.map((e) => ({
+                            id: e.id,
+                            source: e.source,
+                            target: e.target,
+                            label: typeof e.label === 'string' ? e.label : undefined,
+                            animated: Boolean(e.animated),
+                          })),
+                        };
+                      })
                     }
                     onSelectNode={(id) => {
                       setSelectedNodeId(id);
                       if (id) setRightTab('inspector');
                     }}
-                    onDropTemplate={(role, position) => handleAddTemplateNode(role, position)}
+                    onEditNode={(id) => {
+                      setSelectedNodeId(id);
+                      setRightTab('inspector');
+                    }}
+                    onDuplicateNode={handleDuplicateNode}
+                    onDeleteNode={handleDeleteNode}
+                    onDropTemplate={(roleOrTpl, position) =>
+                      handleAddTemplateNode(roleOrTpl, position)
+                    }
                   />
                 </ReactFlowProvider>
               </div>
@@ -1280,8 +1780,13 @@ export default function App() {
                   {rightTab === 'inspector' ? (
                     <AgentInspector
                       node={selectedNode}
+                      lang={lang}
                       appSettings={appSettings}
+                      capabilities={capabilities}
+                      onCapabilitiesUpdated={setCapabilities}
+                      onOpenSettings={() => setTopView('settings')}
                       onUpdateNode={handleUpdateNode}
+                      onDuplicateNode={handleDuplicateNode}
                       onDeleteNode={handleDeleteNode}
                     />
                   ) : (
@@ -1312,7 +1817,15 @@ export default function App() {
                       onResolveApproval={handleResolveApproval}
                       executionMode={executionMode}
                       onExecutionModeChange={setExecutionMode}
-                      geminiConfigured={capabilities.geminiConfigured}
+                      geminiConfigured={Boolean(
+                        capabilities.geminiConfigured ||
+                          capabilities.openaiConfigured ||
+                          capabilities.anthropicConfigured,
+                      )}
+                      onDownloadZip={() => void handleDownloadZip('project_bundle')}
+                      onOpenGitHubPush={() =>
+                        setGitHubPushModal({ open: true, initialScope: 'project_bundle' })
+                      }
                     />
                   )}
                 </div>
@@ -1331,13 +1844,31 @@ export default function App() {
         )}
 
         {topView === 'blueprint' && (
-          <BlueprintView lang={lang} onRunDeployAudit={() => void handleRunTestAndDeploy()} />
+          <BlueprintView
+            lang={lang}
+            defaultRepoUrl={
+              workflow.projectContext?.sourceType === 'github'
+                ? workflow.projectContext.sourceUrl
+                : undefined
+            }
+            defaultBranch={
+              workflow.projectContext?.sourceType === 'github'
+                ? workflow.projectContext.branch
+                : undefined
+            }
+            onRunDeployAudit={() => void handleRunTestAndDeploy()}
+            onDownloadZip={() => void handleDownloadZip('full_studio')}
+            onOpenGitHubPush={() =>
+              setGitHubPushModal({ open: true, initialScope: 'full_studio' })
+            }
+          />
         )}
 
         {topView === 'settings' && (
           <SettingsView
             settings={appSettings}
             capabilities={capabilities}
+            onCapabilitiesUpdated={setCapabilities}
             onSaveSettings={handleSaveSettings}
           />
         )}
@@ -1348,6 +1879,7 @@ export default function App() {
         onClose={() => setIsProjectModalOpen(false)}
         lang={lang}
         executionMode={executionMode}
+        appSettings={appSettings}
         projects={importedProjects}
         activeProjectId={workflow.projectContext?.projectId}
         onProjectImported={(proj) => {
@@ -1355,6 +1887,49 @@ export default function App() {
         }}
         onDeleteProject={handleDeleteImportedProject}
         onApplyRecommendations={handleApplyProjectRecommendations}
+      />
+
+      <AgentBuilderModal
+        isOpen={builderModal.open}
+        mode={builderModal.mode}
+        initialTemplate={builderModal.template}
+        lang={lang}
+        appSettings={appSettings}
+        onClose={() => setBuilderModal({ open: false, mode: 'add_agents', template: null })}
+        onSubmit={handleBuilderSubmit}
+      />
+
+      <GitHubPushModal
+        isOpen={gitHubPushModal.open}
+        initialScope={gitHubPushModal.initialScope}
+        lang={lang}
+        workflow={workflow}
+        activeRunId={activeRunId}
+        capabilities={capabilities}
+        onCapabilitiesUpdated={setCapabilities}
+        onClose={() => setGitHubPushModal((prev) => ({ ...prev, open: false }))}
+        onDownloadZip={handleDownloadZip}
+      />
+
+      <ProjectManagerModal
+        isOpen={isProjectManagerOpen}
+        lang={lang}
+        workflows={workflows}
+        activeWorkflow={workflow}
+        importedProjects={importedProjects}
+        onClose={() => setIsProjectManagerOpen(false)}
+        onSelectWorkflow={(wf) => {
+          hasSharedWorkflowRef.current = false;
+          setWorkflow(wf);
+          setSelectedNodeId(wf.nodes[0]?.id ?? null);
+        }}
+        onSaveWorkflow={handleSaveSpecificWorkflow}
+        onDuplicateWorkflow={handleDuplicateWorkflow}
+        onDeleteWorkflow={handleDeleteWorkflow}
+        onCreateNewWorkflow={handleCreateWorkflow}
+        onUpdateImportedProject={handleUpdateImportedProject}
+        onDeleteImportedProject={handleDeleteImportedProject}
+        onOpenImportModal={() => setIsProjectModalOpen(true)}
       />
     </div>
   );
