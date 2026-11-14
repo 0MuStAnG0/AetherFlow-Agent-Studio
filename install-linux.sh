@@ -446,10 +446,13 @@ fi
 install_node_22
 
 log "Installing Node.js dependencies..."
+if ! grep -q "legacy-peer-deps=true" "$APP_DIR/.npmrc" 2>/dev/null; then
+  echo "legacy-peer-deps=true" >> "$APP_DIR/.npmrc"
+fi
 if [[ -f "$APP_DIR/package-lock.json" ]]; then
-  npm ci
+  npm ci --legacy-peer-deps || npm install --legacy-peer-deps
 else
-  npm install
+  npm install --legacy-peer-deps
 fi
 
 log "Building production frontend bundle..."

@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY package.json package-lock.json* bun.lock* ./
-RUN npm ci || npm install
+COPY package.json package-lock.json* .npmrc* bun.lock* ./
+RUN npm ci --legacy-peer-deps || npm install --legacy-peer-deps
 
 COPY . .
 

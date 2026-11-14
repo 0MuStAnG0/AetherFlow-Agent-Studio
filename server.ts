@@ -3096,6 +3096,7 @@ function listStudioSourceFilesFromDisk(): Array<{ path: string; content: string 
   const rootDir = process.cwd();
   const topLevelFiles = [
     'package.json',
+    '.npmrc',
     'tsconfig.json',
     'vite.config.ts',
     'index.html',
