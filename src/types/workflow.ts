@@ -16,6 +16,8 @@ export interface AgentToolsConfig {
 
 export type AgentPowerLevel = 'eco' | 'standard' | 'pro' | 'ultra';
 
+export type TokenOptimizationMode = 'ultra_compact' | 'balanced' | 'off';
+
 export interface AgentNodeData extends Record<string, unknown> {
   label: string;
   role: AgentRole;
@@ -40,12 +42,16 @@ export interface WorkflowNode {
   data: AgentNodeData;
 }
 
+export type EdgeConditionType = 'always' | 'on_success' | 'on_failure' | 'when_contains';
+
 export interface WorkflowEdge {
   id: string;
   source: string;
   target: string;
   label?: string;
   animated?: boolean;
+  conditionType?: EdgeConditionType;
+  conditionValue?: string;
 }
 
 export interface WorkflowProjectContext {
@@ -67,6 +73,9 @@ export interface WorkflowConfig {
   continuousAgentWork?: boolean;
   continuousIntervalSec?: number;
   strictPrelaunchGate?: boolean;
+  memoryEnabled?: boolean;
+  webhookEnabled?: boolean;
+  webhookSecret?: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   projectContext?: WorkflowProjectContext;
@@ -169,12 +178,21 @@ export interface ManagerDelegation {
   timestamp: string;
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  savedTokens?: number;
+  estimated?: boolean;
+}
+
 export interface ExecutionEvent {
   id: string;
   runId: string;
   type:
     | 'run_started'
     | 'user_message'
+    | 'agent_chunk'
     | 'agent_message'
     | 'tool_executed'
     | 'bug_reported'
@@ -182,6 +200,7 @@ export interface ExecutionEvent {
     | 'approval_required'
     | 'approval_resolved'
     | 'run_completed'
+    | 'run_cancelled'
     | 'run_error';
   round: number;
   agentId?: string;
@@ -190,6 +209,9 @@ export interface ExecutionEvent {
   provider?: LLMProvider;
   model?: string;
   content: string;
+  streamDone?: boolean;
+  durationMs?: number;
+  tokenUsage?: TokenUsage;
   toolCalls?: ToolCallLog[];
   bugReport?: BugReportItem;
   delegation?: ManagerDelegation;
@@ -199,6 +221,22 @@ export interface ExecutionEvent {
     reason: string;
   };
   timestamp: string;
+}
+
+export interface DiffLine {
+  type: 'context' | 'added' | 'removed';
+  oldLine?: number;
+  newLine?: number;
+  text: string;
+}
+
+export interface FileDiffEntry {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  additions: number;
+  deletions: number;
+  lines: DiffLine[];
+  truncated?: boolean;
 }
 
 export interface SandboxFile {
@@ -214,9 +252,10 @@ export interface ExecutionRunSummary {
   workflowName: string;
   taskPrompt: string;
   mode: 'live' | 'dry_run';
-  status: 'running' | 'awaiting_approval' | 'completed' | 'failed';
+  status: 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
   roundsExecuted: number;
   maxRounds: number;
+  durationMs?: number;
   createdAt: string;
   completedAt?: string;
 }
@@ -269,6 +308,7 @@ export interface AppSettings {
   allowExecBash: boolean;
   sandboxTimeoutSec: number;
   sandboxMemoryMb: 256 | 512 | 1024;
+  tokenOptimizationMode?: TokenOptimizationMode;
   language: 'en' | 'fa';
   darkMode: boolean;
   showMiniMap: boolean;
@@ -350,4 +390,7 @@ export interface CapabilitiesState {
   opencodeConfigured: boolean;
   ollamaBaseUrl?: string;
   secrets?: Record<string, ProviderSecretStatus>;
+  authEnabled?: boolean;
+  vaultEncrypted?: boolean;
+  dockerSandbox?: boolean;
 }

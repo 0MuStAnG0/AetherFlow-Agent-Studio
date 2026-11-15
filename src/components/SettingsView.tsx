@@ -5,10 +5,12 @@ import {
   Eye,
   EyeOff,
   KeyRound,
+  Lock,
   Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
+  ShieldCheck,
   Trash2,
   X,
   Zap,
@@ -1188,6 +1190,49 @@ export function SettingsView({
             {t.sectionCapabilitiesDesc}
           </p>
 
+          <div
+            data-testid="security-isolation-strip"
+            className="mt-4 grid grid-cols-1 gap-2.5 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950 sm:grid-cols-3"
+          >
+            <div className="flex items-center gap-2.5 text-xs">
+              <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+              <div>
+                <div className="font-semibold text-slate-800 dark:text-slate-200">
+                  {draft.language === 'fa' ? 'رمزنگاری مخزن کلیدها' : 'Secret Vault Storage'}
+                </div>
+                <div className="font-mono text-[11px] text-emerald-700 dark:text-emerald-400">
+                  {capabilities.vaultEncrypted !== false ? 'AES-256-GCM Active' : 'SQLite Vault'}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2.5 text-xs">
+              <Lock className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+              <div>
+                <div className="font-semibold text-slate-800 dark:text-slate-200">
+                  {draft.language === 'fa' ? 'احراز هویت پنل اپراتور' : 'Operator Panel Auth'}
+                </div>
+                <div className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
+                  {capabilities.authEnabled ? 'AETHERFLOW_AUTH_TOKEN Enforced' : 'Optional (Unlocked)'}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2.5 text-xs">
+              <KeyRound className="h-4 w-4 shrink-0 text-indigo-600 dark:text-indigo-400" />
+              <div>
+                <div className="font-semibold text-slate-800 dark:text-slate-200">
+                  {draft.language === 'fa' ? 'ایزوله‌سازی سندباکس' : 'Sandbox Isolation'}
+                </div>
+                <div className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
+                  {capabilities.dockerSandbox
+                    ? 'Docker Container (--network none)'
+                    : 'Sanitized Env & Realpath Guard'}
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div className="mt-5 grid grid-cols-1 gap-6 md:grid-cols-2">
             <div className="space-y-3">
               <h3 className="text-xs font-semibold text-slate-800 dark:text-slate-200">
@@ -1273,6 +1318,53 @@ export function SettingsView({
                     <option value={1024}>1024 MB</option>
                   </select>
                 </div>
+              </div>
+
+              <div className="pt-2">
+                <label
+                  htmlFor="token-optimization-select"
+                  className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  {draft.language === 'fa'
+                    ? 'بهینه‌سازی پرامپت و مصرف توکن هوش مصنوعی'
+                    : 'Prompt & AI Token Optimization Mode'}
+                </label>
+                <select
+                  id="token-optimization-select"
+                  data-testid="token-optimization-select"
+                  value={draft.tokenOptimizationMode ?? 'ultra_compact'}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      tokenOptimizationMode: e.target.value as
+                        | 'ultra_compact'
+                        | 'balanced'
+                        | 'off',
+                    })
+                  }
+                  className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                >
+                  <option value="ultra_compact">
+                    {draft.language === 'fa'
+                      ? 'فوق‌فشرده — کمترین مصرف توکن (پیشنهادی)'
+                      : 'Ultra Compact — Minimum Tokens (Recommended)'}
+                  </option>
+                  <option value="balanced">
+                    {draft.language === 'fa'
+                      ? 'متعادل — تعادل زمینه و صرفه‌جویی'
+                      : 'Balanced — Context + Savings'}
+                  </option>
+                  <option value="off">
+                    {draft.language === 'fa'
+                      ? 'خاموش — ارسال متن کامل بدون فشرده‌سازی'
+                      : 'Off — Full Uncompressed Context'}
+                  </option>
+                </select>
+                <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                  {draft.language === 'fa'
+                    ? 'تاریخچه گفتگو، بلوک‌های کد تکراری، پرامپت سیستم و سطح تفکر مدل را به صورت خودکار فشرده می‌کند.'
+                    : 'Automatically trims repetitive code blocks, conversation turns, tool descriptions, and reasoning overhead.'}
+                </p>
               </div>
             </div>
 

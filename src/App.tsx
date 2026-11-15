@@ -17,6 +17,8 @@ import {
   FolderGit2,
   Languages,
   Link2,
+  Menu,
+  MessageSquare,
   Moon,
   Pencil,
   Plus,
@@ -27,6 +29,8 @@ import {
   Trash2,
   Upload,
   UploadCloud,
+  Workflow,
+  X,
 } from 'lucide-react';
 import {
   DEFAULT_SEED_WORKFLOWS,
@@ -43,6 +47,7 @@ import type {
   ContinuousWorkSession,
   ExecutionEvent,
   ExecutionRunSummary,
+  FileDiffEntry,
   ImportedProjectAnalysis,
   PrelaunchTestReport,
   RecommendedAgentSpec,
@@ -78,6 +83,7 @@ import {
   type AgentBuilderSubmitPayload,
 } from './components/AgentBuilderModal';
 import { AgentInspector } from './components/AgentInspector';
+import { AuthLockScreen } from './components/AuthLockScreen';
 import { BlueprintView } from './components/BlueprintView';
 import { ExecutionConsole } from './components/ExecutionConsole';
 import { GitHubPushModal } from './components/GitHubPushModal';
@@ -162,6 +168,7 @@ export default function App() {
   const [workflows, setWorkflows] = useState<WorkflowConfig[]>(DEFAULT_SEED_WORKFLOWS);
   const [workflow, setWorkflow] = useState<WorkflowConfig>(DEFAULT_SEED_WORKFLOWS[0]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>('node-manager');
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   const [capabilities, setCapabilities] = useState<CapabilitiesState>({
@@ -180,12 +187,19 @@ export default function App() {
   const [promptEnhancedNotice, setPromptEnhancedNotice] = useState<string | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
 
+  const [authState, setAuthState] = useState<'checking' | 'locked' | 'ready'>('checking');
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [events, setEvents] = useState<ExecutionEvent[]>([]);
+  const [streamingEvents, setStreamingEvents] = useState<Record<string, ExecutionEvent>>({});
   const [sandboxFiles, setSandboxFiles] = useState<SandboxFile[]>([]);
+  const [sandboxDiffs, setSandboxDiffs] = useState<FileDiffEntry[]>([]);
+  const [isMobileTemplatesOpen, setIsMobileTemplatesOpen] = useState(false);
+  const [mobileWorkspacePane, setMobileWorkspacePane] = useState<'canvas' | 'panel'>('canvas');
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
   const [waitingNodeId, setWaitingNodeId] = useState<string | null>(null);
+  const [completedNodeIds, setCompletedNodeIds] = useState<Set<string>>(() => new Set());
+  const [errorNodeIds, setErrorNodeIds] = useState<Set<string>>(() => new Set());
   const [pendingApproval, setPendingApproval] = useState<{
     approvalId: string;
     agentName: string;
@@ -303,23 +317,7 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const sharedToken = params.get('wf');
-    if (sharedToken) {
-      const decoded = decodeWorkflowFromShareParam(sharedToken);
-      if (decoded) {
-        hasSharedWorkflowRef.current = true;
-        setWorkflow(decoded);
-        setSelectedNodeId(decoded.nodes[0]?.id ?? null);
-        setWorkflows((prev) =>
-          prev.some((w) => w.id === decoded.id) ? prev : [decoded, ...prev],
-        );
-        setWorkflowNotice({ type: 'success', text: COPY.en.sharedLoadedNotice });
-      } else {
-        setWorkflowNotice({ type: 'error', text: COPY.en.importError });
-      }
-    }
+  const bootstrapStudioData = useCallback(() => {
     void loadWorkflows();
     void loadRunsHistory();
     void loadBugReports();
@@ -339,6 +337,9 @@ export default function App() {
           anthropicConfigured: Boolean(cap.anthropicConfigured),
           opencodeConfigured: Boolean(cap.opencodeConfigured),
           ollamaBaseUrl: cap.ollamaBaseUrl,
+          authEnabled: Boolean(cap.authEnabled),
+          vaultEncrypted: cap.vaultEncrypted !== false,
+          dockerSandbox: Boolean(cap.dockerSandbox),
           secrets: cap.secrets ?? {},
         });
         if (settingsData && settingsData.providers) {
@@ -356,12 +357,60 @@ export default function App() {
       .catch(() => {});
   }, [loadBugReports, loadImportedProjects, loadRunsHistory, loadWorkflows]);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sharedToken = params.get('wf');
+    if (sharedToken) {
+      const decoded = decodeWorkflowFromShareParam(sharedToken);
+      if (decoded) {
+        hasSharedWorkflowRef.current = true;
+        setWorkflow(decoded);
+        setSelectedNodeId(decoded.nodes[0]?.id ?? null);
+        setWorkflows((prev) =>
+          prev.some((w) => w.id === decoded.id) ? prev : [decoded, ...prev],
+        );
+        setWorkflowNotice({ type: 'success', text: COPY.en.sharedLoadedNotice });
+      } else {
+        setWorkflowNotice({ type: 'error', text: COPY.en.importError });
+      }
+    }
+
+    fetch('/api/auth/status')
+      .then(async (res) => {
+        if (res.status === 401) {
+          setAuthState('locked');
+          return;
+        }
+        const statusData = (await res.json().catch(() => ({}))) as {
+          authEnabled?: boolean;
+          authenticated?: boolean;
+        };
+        if (statusData.authEnabled && !statusData.authenticated) {
+          setAuthState('locked');
+          return;
+        }
+        setAuthState('ready');
+        bootstrapStudioData();
+      })
+      .catch(() => {
+        setAuthState('ready');
+        bootstrapStudioData();
+      });
+  }, [bootstrapStudioData]);
+
   const refreshSandboxFiles = useCallback(async (runId: string) => {
     try {
-      const res = await fetch(`/api/runs/${runId}/files`);
-      if (res.ok) {
-        const files = (await res.json()) as SandboxFile[];
+      const [filesRes, diffRes] = await Promise.all([
+        fetch(`/api/runs/${runId}/files`),
+        fetch(`/api/runs/${runId}/diff`),
+      ]);
+      if (filesRes.ok) {
+        const files = (await filesRes.json()) as SandboxFile[];
         setSandboxFiles(files);
+      }
+      if (diffRes.ok) {
+        const diffData = (await diffRes.json()) as { diffs?: FileDiffEntry[] };
+        setSandboxDiffs(Array.isArray(diffData.diffs) ? diffData.diffs : []);
       }
     } catch {
       // ignore
@@ -380,6 +429,12 @@ export default function App() {
       ws.onmessage = (messageEvent) => {
         try {
           const evt = JSON.parse(messageEvent.data as string) as ExecutionEvent;
+          if (evt.type === 'agent_chunk') {
+            const key = evt.agentId || evt.id;
+            setStreamingEvents((prev) => ({ ...prev, [key]: evt }));
+            return;
+          }
+
           setEvents((prev) => (prev.some((e) => e.id === evt.id) ? prev : [...prev, evt]));
 
           if (evt.type === 'bug_reported' && evt.bugReport) {
@@ -390,9 +445,33 @@ export default function App() {
             setActiveNodeId(evt.delegation.targetAgentId);
             setWaitingNodeId(null);
           } else if (evt.type === 'agent_message') {
+            if (evt.agentId) {
+              setStreamingEvents((prev) => {
+                if (!prev[evt.agentId!]) return prev;
+                const next = { ...prev };
+                delete next[evt.agentId!];
+                return next;
+              });
+            }
             setActiveNodeId(evt.agentId ?? null);
             setWaitingNodeId(null);
             setIsSendingChat(false);
+            if (evt.agentId) {
+              const hadToolErr = Boolean(
+                evt.toolCalls?.some((tc) => (tc.exitCode ?? 0) !== 0),
+              );
+              if (hadToolErr) {
+                setErrorNodeIds((prev) => new Set(prev).add(evt.agentId!));
+              } else {
+                setCompletedNodeIds((prev) => new Set(prev).add(evt.agentId!));
+                setErrorNodeIds((prev) => {
+                  if (!prev.has(evt.agentId!)) return prev;
+                  const next = new Set(prev);
+                  next.delete(evt.agentId!);
+                  return next;
+                });
+              }
+            }
             void refreshSandboxFiles(runId);
           } else if (evt.type === 'approval_required' && evt.pendingCommand) {
             setWaitingNodeId(evt.agentId ?? null);
@@ -405,7 +484,15 @@ export default function App() {
           } else if (evt.type === 'approval_resolved') {
             setPendingApproval(null);
             setWaitingNodeId(null);
-          } else if (evt.type === 'run_completed' || evt.type === 'run_error') {
+          } else if (
+            evt.type === 'run_completed' ||
+            evt.type === 'run_error' ||
+            evt.type === 'run_cancelled'
+          ) {
+            setStreamingEvents({});
+            if (evt.type === 'run_error' && evt.agentId) {
+              setErrorNodeIds((prev) => new Set(prev).add(evt.agentId!));
+            }
             setIsRunning(false);
             setIsSendingChat(false);
             setActiveNodeId(null);
@@ -1175,10 +1262,14 @@ export default function App() {
     wsRef.current?.close();
     setActiveRunId(null);
     setEvents([]);
+    setStreamingEvents({});
     setSandboxFiles([]);
+    setSandboxDiffs([]);
     setPendingApproval(null);
     setActiveNodeId(null);
     setWaitingNodeId(null);
+    setCompletedNodeIds(new Set());
+    setErrorNodeIds(new Set());
     setValidationError(null);
     setPromptEnhancedNotice(null);
   };
@@ -1356,8 +1447,12 @@ export default function App() {
     }
 
     setEvents([]);
+    setStreamingEvents({});
     setSandboxFiles([]);
+    setSandboxDiffs([]);
     setPendingApproval(null);
+    setCompletedNodeIds(new Set());
+    setErrorNodeIds(new Set());
     setIsRunning(true);
     setRightTab('execution');
 
@@ -1402,8 +1497,12 @@ export default function App() {
     }
 
     setEvents([]);
+    setStreamingEvents({});
     setSandboxFiles([]);
+    setSandboxDiffs([]);
     setPendingApproval(null);
+    setCompletedNodeIds(new Set());
+    setErrorNodeIds(new Set());
     setIsRunning(true);
     setTopView('canvas');
     setRightTab('execution');
@@ -1467,33 +1566,213 @@ export default function App() {
     setActiveRunId(runId);
     setTopView('canvas');
     setRightTab('execution');
+    setCompletedNodeIds(new Set());
+    setErrorNodeIds(new Set());
     const res = await fetch(`/api/runs/${runId}`);
     if (res.ok) {
       const data = (await res.json()) as { events?: ExecutionEvent[] };
-      setEvents(data.events ?? []);
+      const loadedEvents = data.events ?? [];
+      setEvents(loadedEvents);
+      const doneIds = new Set<string>();
+      const errIds = new Set<string>();
+      for (const evt of loadedEvents) {
+        if (evt.type === 'agent_message' && evt.agentId) {
+          if (evt.toolCalls?.some((tc) => (tc.exitCode ?? 0) !== 0)) {
+            errIds.add(evt.agentId);
+          } else {
+            doneIds.add(evt.agentId);
+          }
+        } else if (evt.type === 'run_error' && evt.agentId) {
+          errIds.add(evt.agentId);
+        }
+      }
+      setCompletedNodeIds(doneIds);
+      setErrorNodeIds(errIds);
     }
     await refreshSandboxFiles(runId);
+  };
+
+  const handleStopRun = async (runIdOverride?: string) => {
+    const targetId = runIdOverride ?? activeRunId;
+    if (!targetId) return;
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(targetId)}/stop`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        if (targetId === activeRunId) {
+          setIsRunning(false);
+          setActiveNodeId(null);
+          setWaitingNodeId(null);
+          setPendingApproval(null);
+        }
+        await loadRunsHistory();
+        showNotice(
+          'success',
+          lang === 'fa' ? 'اجرا با موفقیت متوقف شد.' : 'Execution run stopped.',
+        );
+      }
+    } catch {
+      // ignore network error
+    }
+  };
+
+  const handleDeleteRun = async (runId: string) => {
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        setRunsHistory((prev) => prev.filter((r) => r.id !== runId));
+        if (activeRunId === runId) {
+          handleClearFeed();
+        }
+        showNotice(
+          'success',
+          lang === 'fa' ? 'سابقه اجرا حذف شد.' : 'Execution run deleted.',
+        );
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleRerun = async (run: ExecutionRunSummary) => {
+    const targetWf = workflows.find((w) => w.id === run.workflowId) ?? workflow;
+    if (targetWf.nodes.length === 0) {
+      setValidationError('Target workflow has no agent nodes.');
+      return;
+    }
+    if (targetWf.id !== workflow.id) {
+      setWorkflow(targetWf);
+      setSelectedNodeId(targetWf.nodes[0]?.id ?? null);
+    }
+    setTaskPrompt(run.taskPrompt);
+    setExecutionMode(run.mode);
+    setEvents([]);
+    setStreamingEvents({});
+    setSandboxFiles([]);
+    setSandboxDiffs([]);
+    setPendingApproval(null);
+    setCompletedNodeIds(new Set());
+    setErrorNodeIds(new Set());
+    setIsRunning(true);
+    setTopView('canvas');
+    setRightTab('execution');
+
+    const res = await fetch('/api/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workflowId: targetWf.id,
+        workflow: targetWf,
+        taskPrompt: run.taskPrompt,
+        mode: run.mode,
+      }),
+    });
+    if (!res.ok) {
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      setValidationError(errData.error ?? 'Failed to re-run workflow');
+      setIsRunning(false);
+      return;
+    }
+    const data = (await res.json()) as { runId: string };
+    setActiveRunId(data.runId);
+    connectRunStream(data.runId);
+  };
+
+  const handleUpdateEdge = (edgeId: string, patch: Partial<WorkflowEdge>) => {
+    setWorkflow((prev) => ({
+      ...prev,
+      edges: prev.edges.map((e) => (e.id === edgeId ? { ...e, ...patch } : e)),
+    }));
+    markWorkflowDirty();
+  };
+
+  const handleDeleteEdge = (edgeId: string) => {
+    setWorkflow((prev) => ({
+      ...prev,
+      edges: prev.edges.filter((e) => e.id !== edgeId),
+    }));
+    if (selectedEdgeId === edgeId) {
+      setSelectedEdgeId(null);
+    }
+    markWorkflowDirty();
+  };
+
+  const handleToggleMemory = (enabled: boolean) => {
+    setWorkflow((prev) => ({ ...prev, memoryEnabled: enabled }));
+    markWorkflowDirty();
+  };
+
+  const handleClearMemory = async () => {
+    try {
+      const res = await fetch(`/api/workflows/${encodeURIComponent(workflow.id)}/memory`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        await loadRunsHistory();
+        showNotice(
+          'success',
+          lang === 'fa'
+            ? 'حافظه بین‌اجرایی تیم برای این پروژه پاک‌سازی شد.'
+            : 'Cross-run team memory cleared for this workflow.',
+        );
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleUpdateWorkflowWebhook = async (
+    workflowId: string,
+    patch: { webhookEnabled?: boolean; webhookSecret?: string },
+  ) => {
+    const target = workflows.find((w) => w.id === workflowId) ?? (workflow.id === workflowId ? workflow : null);
+    if (!target) return;
+    const updated: WorkflowConfig = {
+      ...target,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    if (workflow.id === workflowId) {
+      setWorkflow(updated);
+    }
+    setWorkflows((prev) => syncWorkflowInList(prev, updated));
+    await persistWorkflowToServer(updated, false);
   };
 
   const selectedNode = workflow.nodes.find((n) => n.id === selectedNodeId) ?? null;
   const t = COPY[lang];
 
+  if (authState === 'locked') {
+    return (
+      <AuthLockScreen
+        lang={lang}
+        onAuthenticated={() => {
+          setAuthState('ready');
+          bootstrapStudioData();
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="flex h-screen flex-col bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+    <div className="flex h-screen flex-col overflow-x-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
       {/* Strict 3-Zone Top Bar Contract */}
-      <header className="flex h-14 shrink-0 items-center justify-between gap-8 border-b border-slate-200 bg-white px-6 dark:border-slate-800 dark:bg-slate-900">
+      <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 dark:border-slate-800 dark:bg-slate-900 sm:gap-8 sm:px-6">
         <a
           href="/"
           onClick={(e) => {
             e.preventDefault();
             setTopView('canvas');
           }}
-          className="whitespace-nowrap shrink-0 font-display text-base font-bold tracking-tight text-slate-900 dark:text-slate-100"
+          className="whitespace-nowrap shrink-0 font-display text-sm font-bold tracking-tight text-slate-900 dark:text-slate-100 sm:text-base"
         >
-          AetherFlow Studio
+          AetherFlow<span className="hidden sm:inline"> Studio</span>
         </a>
 
-        <nav className="flex items-center gap-6 text-sm font-medium">
+        <nav className="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto text-xs font-medium sm:flex-none sm:gap-6 sm:text-sm">
           <button
             type="button"
             onClick={() => setTopView('canvas')}
@@ -1547,10 +1826,17 @@ export default function App() {
           <button
             type="button"
             onClick={handleSaveWorkflow}
-            className="inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-700"
+            className="inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-slate-800 dark:bg-blue-600 dark:hover:bg-blue-700 sm:px-4 sm:py-2"
           >
             {saveSuccess ? <Check className="h-3.5 w-3.5" /> : <Save className="h-3.5 w-3.5" />}
-            {saveSuccess ? t.savedBtn : t.saveBtn}
+            {saveSuccess ? (
+              t.savedBtn
+            ) : (
+              <>
+                <span className="hidden sm:inline">{t.saveBtn}</span>
+                <span className="sm:hidden">{lang === 'fa' ? 'ذخیره' : 'Save'}</span>
+              </>
+            )}
           </button>
         </div>
       </header>
@@ -1814,6 +2100,120 @@ export default function App() {
               </div>
             )}
 
+            {/* Mobile View Switcher & Templates Trigger */}
+            <div
+              data-testid="mobile-workspace-bar"
+              dir={lang === 'fa' ? 'rtl' : 'ltr'}
+              className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-3 py-1.5 dark:border-slate-800 dark:bg-slate-950 md:hidden"
+            >
+              <button
+                type="button"
+                data-testid="mobile-templates-btn"
+                onClick={() => setIsMobileTemplatesOpen(true)}
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+              >
+                <Menu className="h-3.5 w-3.5" />
+                <span>{lang === 'fa' ? 'قالب‌ها' : 'Templates'}</span>
+              </button>
+
+              <div className="inline-flex shrink-0 rounded-lg border border-slate-200 bg-white p-0.5 dark:border-slate-700 dark:bg-slate-900">
+                <button
+                  type="button"
+                  data-testid="mobile-pane-canvas"
+                  onClick={() => setMobileWorkspacePane('canvas')}
+                  className={`inline-flex items-center gap-1 whitespace-nowrap rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    mobileWorkspacePane === 'canvas'
+                      ? 'bg-slate-900 text-white dark:bg-blue-600'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <Workflow className="h-3 w-3" />
+                  <span>{lang === 'fa' ? 'بوم' : 'Canvas'}</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="mobile-pane-panel"
+                  onClick={() => setMobileWorkspacePane('panel')}
+                  className={`inline-flex items-center gap-1 whitespace-nowrap rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    mobileWorkspacePane === 'panel'
+                      ? 'bg-slate-900 text-white dark:bg-blue-600'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <MessageSquare className="h-3 w-3" />
+                  <span>{lang === 'fa' ? 'چت و تنظیمات' : 'Chat & Config'}</span>
+                </button>
+              </div>
+            </div>
+
+            {isMobileTemplatesOpen && (
+              <div
+                data-testid="mobile-templates-drawer"
+                dir={lang === 'fa' ? 'rtl' : 'ltr'}
+                className="fixed inset-0 z-50 flex bg-slate-950/50 backdrop-blur-[1px] md:hidden"
+              >
+                <div className="flex h-full w-[290px] max-w-[85vw] flex-col border-r border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900">
+                  <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                    <h2 className="font-display text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      {t.templatesTitle}
+                    </h2>
+                    <button
+                      type="button"
+                      aria-label="Close templates drawer"
+                      onClick={() => setIsMobileTemplatesOpen(false)}
+                      className="rounded p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                  <div className="flex-1 space-y-2 overflow-y-auto p-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMobileTemplatesOpen(false);
+                        setBuilderModal({ open: true, mode: 'add_agents', template: null });
+                      }}
+                      className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>
+                        {lang === 'fa'
+                          ? 'افزودن / ساخت ایجنت دلخواه'
+                          : 'Build / Add Custom Agents'}
+                      </span>
+                    </button>
+                    {effectiveTemplates.map((tpl) => (
+                      <button
+                        key={tpl.id}
+                        type="button"
+                        onClick={() => {
+                          handleAddTemplateNode(tpl.id);
+                          setIsMobileTemplatesOpen(false);
+                        }}
+                        className="w-full rounded-lg border border-slate-200 bg-slate-50/70 p-2.5 text-start transition-colors hover:border-blue-500 dark:border-slate-800 dark:bg-slate-950/60"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate font-display text-xs font-semibold text-slate-900 dark:text-slate-100">
+                            {tpl.title}
+                          </span>
+                          <span className="shrink-0 rounded bg-slate-200/80 px-1 text-[9px] font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                            {POWER_LEVEL_META[tpl.powerLevel].short}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 truncate text-[10px] font-medium text-blue-700 dark:text-blue-400">
+                          {tpl.section} · {tpl.positionTitle}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div
+                  className="flex-1"
+                  onClick={() => setIsMobileTemplatesOpen(false)}
+                />
+              </div>
+            )}
+
             {/* 3-Column Studio Workspace */}
             <div className="flex min-h-0 flex-1 overflow-hidden">
               {/* Left Sidebar: Agent Role Templates */}
@@ -1966,14 +2366,22 @@ export default function App() {
               </aside>
 
               {/* Center: React Flow Graph Canvas */}
-              <div className="min-w-0 flex-1">
+              <div
+                className={`min-w-0 flex-1 ${
+                  mobileWorkspacePane === 'canvas' ? 'block' : 'hidden md:block'
+                }`}
+              >
                 <ReactFlowProvider>
                   <WorkflowCanvas
                     nodes={workflow.nodes}
                     edges={workflow.edges}
                     activeNodeId={activeNodeId}
                     waitingNodeId={waitingNodeId}
+                    completedNodeIds={completedNodeIds}
+                    errorNodeIds={errorNodeIds}
                     selectedNodeId={selectedNodeId}
+                    selectedEdgeId={selectedEdgeId}
+                    lang={lang}
                     showMiniMap={appSettings.showMiniMap}
                     gridVariant={appSettings.canvasGridVariant}
                     onNodesChange={(changes: NodeChange<Node<AgentNodeData>>[]) => {
@@ -2023,22 +2431,34 @@ export default function App() {
                       }
                     }}
                     onEdgesChange={(changes: EdgeChange<Edge>[]) => {
+                      const removedEdgeIds = new Set(
+                        changes.filter((c) => c.type === 'remove').map((c) => c.id),
+                      );
                       setWorkflow((prev) => {
+                        const existingById = new Map(prev.edges.map((edge) => [edge.id, edge]));
                         const updated = applyEdgeChanges(
                           changes,
                           prev.edges as unknown as Edge[],
                         );
                         return {
                           ...prev,
-                          edges: updated.map((e) => ({
-                            id: e.id,
-                            source: e.source,
-                            target: e.target,
-                            label: typeof e.label === 'string' ? e.label : undefined,
-                            animated: Boolean(e.animated),
-                          })),
+                          edges: updated.map((e) => {
+                            const orig = existingById.get(e.id);
+                            return {
+                              id: e.id,
+                              source: e.source,
+                              target: e.target,
+                              label: typeof e.label === 'string' ? e.label : orig?.label,
+                              animated: Boolean(e.animated),
+                              conditionType: orig?.conditionType,
+                              conditionValue: orig?.conditionValue,
+                            };
+                          }),
                         };
                       });
+                      if (selectedEdgeId && removedEdgeIds.has(selectedEdgeId)) {
+                        setSelectedEdgeId(null);
+                      }
                       if (
                         workflowsHydratedRef.current &&
                         changes.some((c) => c.type !== 'select')
@@ -2047,33 +2467,51 @@ export default function App() {
                       }
                     }}
                     onConnect={(connection: Connection) => {
+                      const newEdgeId = `edge-${connection.source}-${connection.target}-${Date.now()}`;
                       setWorkflow((prev) => {
+                        const existingById = new Map(prev.edges.map((edge) => [edge.id, edge]));
                         const updated = addEdge(
                           {
                             ...connection,
-                            id: `edge-${connection.source}-${connection.target}-${Date.now()}`,
+                            id: newEdgeId,
                             label: 'Handoff',
                           },
                           prev.edges as unknown as Edge[],
                         );
                         return {
                           ...prev,
-                          edges: updated.map((e) => ({
-                            id: e.id,
-                            source: e.source,
-                            target: e.target,
-                            label: typeof e.label === 'string' ? e.label : undefined,
-                            animated: Boolean(e.animated),
-                          })),
+                          edges: updated.map((e) => {
+                            const orig = existingById.get(e.id);
+                            return {
+                              id: e.id,
+                              source: e.source,
+                              target: e.target,
+                              label: typeof e.label === 'string' ? e.label : orig?.label,
+                              animated: Boolean(e.animated),
+                              conditionType: orig?.conditionType ?? 'always',
+                              conditionValue: orig?.conditionValue,
+                            };
+                          }),
                         };
                       });
+                      setSelectedEdgeId(newEdgeId);
                       markWorkflowDirty();
                     }}
                     onSelectNode={(id) => {
                       setSelectedNodeId(id);
-                      if (id) setRightTab('inspector');
+                      if (id) {
+                        setSelectedEdgeId(null);
+                        setRightTab('inspector');
+                      }
                     }}
+                    onSelectEdge={(edgeId) => {
+                      setSelectedEdgeId(edgeId);
+                      if (edgeId) setSelectedNodeId(null);
+                    }}
+                    onUpdateEdge={handleUpdateEdge}
+                    onDeleteEdge={handleDeleteEdge}
                     onEditNode={(id) => {
+                      setSelectedEdgeId(null);
                       setSelectedNodeId(id);
                       setRightTab('inspector');
                     }}
@@ -2087,7 +2525,11 @@ export default function App() {
               </div>
 
               {/* Right Panel: Inspector & Live GroupChat Execution */}
-              <aside className="flex w-[390px] shrink-0 flex-col border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 xl:w-[430px]">
+              <aside
+                className={`w-full shrink-0 flex-col border-l border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 md:flex md:w-[390px] xl:w-[430px] ${
+                  mobileWorkspacePane === 'panel' ? 'flex flex-1' : 'hidden'
+                }`}
+              >
                 <div className="grid grid-cols-2 border-b border-slate-200 p-1.5 dark:border-slate-800">
                   <button
                     type="button"
@@ -2137,6 +2579,7 @@ export default function App() {
                       onSendChat={() => void handleSendChat()}
                       onConvertToPrompt={handleConvertToPrompt}
                       onStartRun={handleStartRun}
+                      onStopRun={() => void handleStopRun()}
                       onRunTestAndDeploy={() => void handleRunTestAndDeploy()}
                       onClearFeed={handleClearFeed}
                       isRunning={isRunning}
@@ -2145,7 +2588,9 @@ export default function App() {
                       promptEnhancedNotice={promptEnhancedNotice}
                       validationError={validationError}
                       events={events}
+                      streamingEvents={streamingEvents}
                       sandboxFiles={sandboxFiles}
+                      sandboxDiffs={sandboxDiffs}
                       bugReports={bugReports}
                       onUpdateBugStatus={handleUpdateBugStatus}
                       onDeleteBug={handleDeleteBug}
@@ -2167,6 +2612,9 @@ export default function App() {
                       continuousSession={continuousSession}
                       continuousBusy={continuousBusy}
                       onToggleContinuous={() => void handleToggleContinuousWork()}
+                      memoryEnabled={workflow.memoryEnabled !== false}
+                      onToggleMemory={handleToggleMemory}
+                      onClearMemory={() => void handleClearMemory()}
                     />
                   )}
                 </div>
@@ -2179,8 +2627,12 @@ export default function App() {
           <RunHistoryView
             runs={runsHistory}
             loading={runsLoading}
+            lang={lang}
             onRefresh={() => void loadRunsHistory()}
             onInspectRun={(id) => void handleInspectRun(id)}
+            onStopRun={(id) => void handleStopRun(id)}
+            onRerun={(run) => void handleRerun(run)}
+            onDeleteRun={(id) => void handleDeleteRun(id)}
           />
         )}
 
@@ -2227,6 +2679,7 @@ export default function App() {
                 targetRunId,
               })
             }
+            onUpdateWorkflowWebhook={handleUpdateWorkflowWebhook}
           />
         )}
 

@@ -3,17 +3,22 @@ import assert from 'node:assert/strict';
 import {
   buildManagerInspectionContext,
   buildStructuredAgentPrompt,
+  buildWorkflowMemorySnapshot,
   buildWorkflowShareUrl,
   clampContinuousIntervalSec,
   clampMaxRounds,
   clampTemperature,
   computeExecutionOrder,
+  computeParallelFanoutTargets,
   decodeWorkflowFromShareParam,
   detectSensitiveCommand,
+  estimateTokenUsage,
+  evaluateEdgeCondition,
   extractBugReportsFromReply,
   extractFreeOpenCodeModels,
   extractManagerDelegations,
   findManagerNode,
+  getDefaultEdgeLabelForCondition,
   isManagerNode,
   normalizeAppSettings,
   orderGroupChatParticipants,
@@ -90,6 +95,11 @@ test('normalizeAppSettings enforces valid bounds and Gemini env var binding', ()
   assert.equal(normalized.providers.gemini.envVarName, 'GEMINI_API_KEY');
   assert.equal(normalized.providers.opencode.defaultModel, 'big-pickle');
   assert.deepEqual(normalized.providers.gemini.customModels, ['gemini-custom']);
+  assert.equal(normalized.tokenOptimizationMode, 'ultra_compact');
+  assert.equal(
+    normalizeAppSettings({ tokenOptimizationMode: 'balanced' }).tokenOptimizationMode,
+    'balanced',
+  );
 });
 
 test('clampMaxRounds and clampTemperature enforce safe bounds', () => {
@@ -373,5 +383,187 @@ test('syncWorkflowInList keeps active node permission edits synced and preserves
   assert.equal(parsed.workflow?.nodes[0].data.tools.execBash, true);
 });
 
+test('evaluateEdgeCondition and selectNextSpeaker route conditionally on success, failure, and keyword match', () => {
+  const be = makeNode('be', 'backend', 100);
+  const qa = makeNode('qa', 'security_qa', 300);
+  const mgr = makeNode('mgr', 'manager', 500);
+  const fe = makeNode('fe', 'frontend', 700);
+  const ordered = [be, qa, mgr, fe];
+  const edges: WorkflowEdge[] = [
+    { id: 'e-ok', source: 'be', target: 'qa', conditionType: 'on_success' },
+    { id: 'e-err', source: 'be', target: 'mgr', conditionType: 'on_failure' },
+    { id: 'e-kw', source: 'qa', target: 'fe', conditionType: 'when_contains', conditionValue: 'READY_FOR_UI' },
+  ];
 
+  assert.equal(evaluateEdgeCondition(edges[0], { lastTurnHadError: false }), true);
+  assert.equal(evaluateEdgeCondition(edges[0], { lastTurnHadError: true }), false);
+  assert.equal(evaluateEdgeCondition(edges[1], { lastTurnHadError: true }), true);
+  assert.equal(evaluateEdgeCondition(edges[2], { lastReply: 'Checks passed. READY_FOR_UI now.' }), true);
+  assert.equal(evaluateEdgeCondition(edges[2], { lastReply: 'Still investigating bugs.' }), false);
 
+  const okRoute = selectNextSpeaker({
+    orderedNodes: ordered,
+    edges,
+    currentNodeId: 'be',
+    roundIndex: 1,
+    maxRounds: 6,
+    lastTurnHadError: false,
+  });
+  assert.equal(okRoute.node?.id, 'qa');
+
+  const failRoute = selectNextSpeaker({
+    orderedNodes: ordered,
+    edges,
+    currentNodeId: 'be',
+    roundIndex: 1,
+    maxRounds: 6,
+    lastTurnHadError: true,
+  });
+  assert.equal(failRoute.node?.id, 'mgr');
+
+  const kwRoute = selectNextSpeaker({
+    orderedNodes: ordered,
+    edges,
+    currentNodeId: 'qa',
+    roundIndex: 2,
+    maxRounds: 6,
+    lastReply: 'ready_for_ui confirmed',
+  });
+  assert.equal(kwRoute.node?.id, 'fe');
+  assert.equal(getDefaultEdgeLabelForCondition('when_contains', 'DEPLOY'), 'If "DEPLOY"');
+});
+
+test('buildWorkflowMemorySnapshot and estimateTokenUsage summarize cross-run state cleanly', () => {
+  assert.equal(
+    buildWorkflowMemorySnapshot({ priorRuns: [], openBugs: [], workspaceFiles: [] }),
+    '',
+  );
+
+  const mem = buildWorkflowMemorySnapshot({
+    priorRuns: [
+      {
+        taskPrompt: 'Build rate limiter middleware',
+        status: 'completed',
+        summary: 'Implemented token bucket limiter in src/rateLimit.ts',
+        createdAt: '2026-11-15T01:00:00.000Z',
+      },
+    ],
+    openBugs: [
+      {
+        id: 'bug-1',
+        agentId: 'qa',
+        agentName: 'Security & QA',
+        role: 'security_qa',
+        category: 'bug',
+        severity: 'high',
+        title: 'Missing max header check',
+        description: 'Validate X-Forwarded-For cleanly',
+        status: 'open',
+        createdAt: '2026-11-15T01:05:00.000Z',
+      },
+    ],
+    workspaceFiles: [{ path: 'src/rateLimit.ts', size: 420 }],
+  });
+
+  assert.ok(mem.includes('[WORKFLOW MEMORY FROM PRIOR RUNS]'));
+  assert.ok(mem.includes('Build rate limiter middleware'));
+  assert.ok(mem.includes('Missing max header check'));
+  assert.ok(mem.includes('src/rateLimit.ts'));
+
+  const usage = estimateTokenUsage('abcdefgh', '1234');
+  assert.equal(usage.promptTokens, 2);
+  assert.equal(usage.completionTokens, 1);
+  assert.equal(usage.totalTokens, 3);
+  assert.equal(usage.estimated, true);
+});
+
+test('serializeWorkflowForExport preserves edge conditions and strips webhookSecret', () => {
+  const mgr = makeNode('mgr', 'manager', 50);
+  const be = makeNode('be', 'backend', 300);
+  const wf: WorkflowConfig = {
+    id: 'wf-sec-edge',
+    name: 'Webhook Edge Flow',
+    description: 'Conditional + webhook workflow',
+    maxRounds: 6,
+    humanInTheLoop: true,
+    memoryEnabled: false,
+    webhookEnabled: true,
+    webhookSecret: 'super-secret-token-should-not-leak',
+    nodes: [mgr, be],
+    edges: [
+      {
+        id: 'e-cond',
+        source: 'mgr',
+        target: 'be',
+        label: 'If API',
+        conditionType: 'when_contains',
+        conditionValue: 'API',
+      },
+    ],
+    updatedAt: '2026-11-15T00:00:00.000Z',
+  };
+
+  const exported = serializeWorkflowForExport(wf);
+  assert.ok(!exported.includes('super-secret-token-should-not-leak'));
+  const parsed = parseImportedWorkflowJson(exported);
+  assert.equal(parsed.workflow?.memoryEnabled, false);
+  assert.equal(parsed.workflow?.webhookEnabled, true);
+  assert.equal(parsed.workflow?.webhookSecret, undefined);
+  assert.equal(parsed.workflow?.edges[0].conditionType, 'when_contains');
+  assert.equal(parsed.workflow?.edges[0].conditionValue, 'API');
+});
+
+test('computeParallelFanoutTargets detects independent parallel branches vs dependent/linear edges', () => {
+  const mgr = makeNode('mgr', 'manager', 50);
+  const fe = makeNode('fe', 'frontend', 300);
+  const be = makeNode('be', 'backend', 300);
+  const qa = makeNode('qa', 'security_qa', 600);
+
+  // Diamond: mgr -> fe, mgr -> be, fe -> qa, be -> qa
+  const diamondEdges: WorkflowEdge[] = [
+    { id: 'e1', source: 'mgr', target: 'fe', label: 'UI', conditionType: 'always' },
+    { id: 'e2', source: 'mgr', target: 'be', label: 'API', conditionType: 'always' },
+    { id: 'e3', source: 'fe', target: 'qa', label: 'QA', conditionType: 'always' },
+    { id: 'e4', source: 'be', target: 'qa', label: 'QA', conditionType: 'always' },
+  ];
+
+  const ordered = [mgr, fe, be, qa];
+  const targets = computeParallelFanoutTargets({
+    orderedNodes: ordered,
+    edges: diamondEdges,
+    sourceNodeId: 'mgr',
+    alreadyExecutedIds: new Set(['mgr']),
+    lastTurnHadError: false,
+    lastReply: 'Delegate both UI and API now',
+  });
+  assert.deepEqual(
+    targets.map((n) => n.id),
+    ['fe', 'be'],
+  );
+
+  // If fe depends on be (be -> fe), fe is filtered out so only 1 independent remains -> []
+  const dependentEdges: WorkflowEdge[] = [
+    ...diamondEdges,
+    { id: 'e-dep', source: 'be', target: 'fe', label: 'After BE', conditionType: 'always' },
+  ];
+  const noFanout = computeParallelFanoutTargets({
+    orderedNodes: ordered,
+    edges: dependentEdges,
+    sourceNodeId: 'mgr',
+    alreadyExecutedIds: new Set(['mgr']),
+  });
+  assert.deepEqual(noFanout, []);
+
+  // Conditional edge skipped when condition doesn't match -> only 1 matching target -> []
+  const condEdges: WorkflowEdge[] = [
+    { id: 'e1', source: 'mgr', target: 'fe', conditionType: 'always' },
+    { id: 'e2', source: 'mgr', target: 'be', conditionType: 'on_failure' },
+  ];
+  const singleMatch = computeParallelFanoutTargets({
+    orderedNodes: ordered,
+    edges: condEdges,
+    sourceNodeId: 'mgr',
+    lastTurnHadError: false,
+  });
+  assert.deepEqual(singleMatch, []);
+});

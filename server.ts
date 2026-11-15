@@ -5,35 +5,37 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { ThinkingLevel } from '@google/genai';
 import AdmZip from 'adm-zip';
-import { GoogleGenAI } from '@google/genai';
 import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
+  clearWorkflowRunsMemory,
   createBugReport,
   createRunRecord,
   deleteBugReport,
   deleteImportedProject,
   deleteProviderSecret,
+  deleteRunRecord,
   deleteWorkflow,
   getAppSettings,
   getContinuousSession,
   getDb,
   getImportedProjectById,
-  getLatestPrelaunchReport,
   getRunEvents,
+  getRunSummaryById,
   getWorkflowById,
   listActiveContinuousSessions,
   listBugReports,
   listImportedProjects,
   listProviderSecretStatuses,
+  listRecentWorkflowRunsWithSummary,
   listRunSummaries,
   listWorkflows,
   resolveServerSecret,
   saveAppSettings,
   saveImportedProject,
-  savePrelaunchReport,
   setProviderSecret,
   updateBugReportStatus,
   updateImportedProject,
@@ -49,15 +51,14 @@ import type {
   ContinuousWorkSession,
   ExecutionEvent,
   ImportedProjectAnalysis,
-  PrelaunchTestReport,
-  PrelaunchTestResult,
   RecommendedAgentSpec,
   SandboxFile,
+  TokenUsage,
   ToolCallLog,
   WorkflowConfig,
   WorkflowNode,
 } from './src/types/workflow.ts';
-import { POWER_LEVEL_META, PROVIDER_MODELS } from './src/data/agentTemplates.ts';
+import { PROVIDER_MODELS } from './src/data/agentTemplates.ts';
 import {
   analyzeProjectFiles,
   parseGitHubRepoInput,
@@ -78,24 +79,25 @@ import {
   isSafeExportFilePath,
   mergeSandboxSnapshots,
   slugifyBundleName,
+  upsertReadmeChangelog,
   validateGitHubPushParams,
   type BundleFileEntry,
   type ExportBundleScope,
   type ExportChangeSummary,
 } from './src/utils/exportBundle.ts';
 import { createZipBufferFromBundle } from './server/zipBundle.ts';
-import {
-  evaluatePrelaunchGate,
-  findMissingWorkflowCoverage,
-  scanSourceSecurityIssues,
-} from './src/utils/prelaunchTests.ts';
+import { buildProjectDiffEntries } from './src/utils/diffUtils.ts';
+import { compactSandboxOutput, truncateMiddle } from './src/utils/promptOptimizer.ts';
 import {
   buildManagerInspectionContext,
   buildStructuredAgentPrompt,
+  buildWorkflowMemorySnapshot,
   clampContinuousIntervalSec,
   clampMaxRounds,
   computeExecutionOrder,
+  computeParallelFanoutTargets,
   detectSensitiveCommand,
+  estimateTokenUsage,
   extractBugReportsFromReply,
   extractFreeOpenCodeModels,
   extractManagerDelegations,
@@ -106,17 +108,49 @@ import {
   serializeWorkflowForExport,
   validateWorkflowForRun,
 } from './src/utils/workflowEngine.ts';
+import {
+  canNodeRunLive,
+  canWorkflowRunLive,
+  generateLiveAgentReply,
+  getAiClient,
+  sleepWithAbort,
+  type StructuredToolInvocation,
+} from './server/llmRuntime.ts';
+import { getLatestPrelaunchReport, runPrelaunchTestSuite } from './server/prelaunchRunner.ts';
+import { cleanupStaleSandboxDirs, pruneBufferedRunEvents } from './server/sandboxCleanup.ts';
+import {
+  createIpRateLimiter,
+  createSignedSessionToken,
+  getConfiguredOperatorAuthToken,
+  getSessionCookieName,
+  isOperatorAuthEnabled,
+  isRequestAuthorized,
+  requireOperatorAuth,
+  safeEqualSecret,
+  safeResolveSandboxPath,
+  sanitizeSandboxEnv,
+  securityHeadersMiddleware,
+} from './server/security.ts';
 
 const execAsync = promisify(exec);
 const PORT = Number(process.env.PORT || 3000);
 const SANDBOX_BASE = path.resolve('/tmp/aetherflow_sandboxes');
 const PROJECTS_BASE = path.resolve('/tmp/aetherflow_projects');
+const PROJECTS_ORIGINALS_BASE = path.resolve('/tmp/aetherflow_projects_originals');
 
 // Initialize SQLite database on boot
 getDb();
 
 const app = express();
+app.use(securityHeadersMiddleware);
 app.use(express.json({ limit: '25mb' }));
+app.use('/api', requireOperatorAuth);
+
+const authLoginLimiter = createIpRateLimiter({ windowMs: 60_000, maxRequests: 15 });
+const providerTestLimiter = createIpRateLimiter({ windowMs: 60_000, maxRequests: 25 });
+const runStartLimiter = createIpRateLimiter({ windowMs: 60_000, maxRequests: 30 });
+const chatLimiter = createIpRateLimiter({ windowMs: 60_000, maxRequests: 45 });
+const webhookLimiter = createIpRateLimiter({ windowMs: 60_000, maxRequests: 60 });
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -124,82 +158,8 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 const runSubscribers = new Map<string, Set<WebSocket>>();
 const runEventBuffers = new Map<string, ExecutionEvent[]>();
 const pendingApprovals = new Map<string, (approved: boolean) => void>();
-
-function getAiClient(
-  secretRef?: string,
-  options?: {
-    baseUrl?: string;
-    apiKey?: string;
-    apiVersion?: GeminiApiVersion;
-    vertexai?: boolean;
-  },
-): GoogleGenAI | null {
-  const settings = getAppSettings();
-  const primaryRef = secretRef || settings.providers.gemini?.envVarName || 'GEMINI_API_KEY';
-  const resolved =
-    options?.apiKey?.trim() ||
-    resolveServerSecret(primaryRef).value ||
-    (primaryRef !== 'GEMINI_API_KEY' ? resolveServerSecret('GEMINI_API_KEY').value : null);
-  if (!resolved) return null;
-
-  const rawBase =
-    options?.baseUrl?.trim() ||
-    settings.providers.gemini?.baseUrl?.trim() ||
-    process.env.GOOGLE_GEMINI_BASE_URL?.trim() ||
-    '';
-  const parsedBase = options?.vertexai ? {} : parseGeminiBaseUrl(rawBase);
-
-  const httpOptions: {
-    baseUrl?: string;
-    apiVersion?: string;
-    headers: Record<string, string>;
-  } = {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  };
-  if (parsedBase.baseUrl) {
-    httpOptions.baseUrl = parsedBase.baseUrl;
-  }
-  const effectiveVersion = options?.apiVersion || parsedBase.apiVersion;
-  if (effectiveVersion) {
-    httpOptions.apiVersion = effectiveVersion;
-  }
-
-  return new GoogleGenAI({
-    apiKey: resolved,
-    ...(options?.vertexai ? { vertexai: true } : {}),
-    httpOptions,
-  });
-}
-
-function getSecretForNode(node: WorkflowNode, settings: AppSettings): string | null {
-  const defaultRef = settings.providers[node.data.provider]?.envVarName;
-  const customRef = node.data.envSecretRef?.trim();
-  if (customRef) {
-    const customResolved = resolveServerSecret(customRef).value;
-    if (customResolved) return customResolved;
-  }
-  if (defaultRef && defaultRef !== customRef) {
-    return resolveServerSecret(defaultRef).value;
-  }
-  return null;
-}
-
-function canNodeRunLive(node: WorkflowNode, settings: AppSettings): boolean {
-  if (node.data.provider === 'opencode' || node.data.provider === 'ollama') {
-    return true;
-  }
-  if (getSecretForNode(node, settings)) {
-    return true;
-  }
-  return Boolean(getAiClient());
-}
-
-function canWorkflowRunLive(nodes: WorkflowNode[], settings: AppSettings): boolean {
-  if (getAiClient()) return true;
-  return nodes.length > 0 && nodes.every((n) => canNodeRunLive(n, settings));
-}
+const pendingApprovalsByRun = new Map<string, Set<string>>();
+const runAbortControllers = new Map<string, AbortController>();
 
 function buildCapabilitiesPayload() {
   const settings = getAppSettings();
@@ -226,13 +186,21 @@ function buildCapabilitiesPayload() {
       process.env.OLLAMA_BASE_URL ||
       'http://host.docker.internal:11434',
     secrets,
+    authEnabled: isOperatorAuthEnabled(),
+    vaultEncrypted: true,
+    dockerSandbox: process.env.AETHERFLOW_DOCKER_SANDBOX === '1',
   };
 }
 
 function broadcastEvent(runId: string, event: ExecutionEvent): void {
-  const list = runEventBuffers.get(runId) ?? [];
-  list.push(event);
-  runEventBuffers.set(runId, list);
+  if (event.type !== 'agent_chunk') {
+    const list = runEventBuffers.get(runId) ?? [];
+    list.push(event);
+    runEventBuffers.set(runId, list);
+    if (runEventBuffers.size > 60) {
+      pruneBufferedRunEvents(runEventBuffers, 60, new Set(runAbortControllers.keys()));
+    }
+  }
 
   const clients = runSubscribers.get(runId);
   if (!clients) return;
@@ -245,6 +213,11 @@ function broadcastEvent(runId: string, event: ExecutionEvent): void {
 }
 
 wss.on('connection', (ws, req) => {
+  if (isOperatorAuthEnabled() && !isRequestAuthorized(req)) {
+    ws.close(4401, 'Unauthorized');
+    return;
+  }
+
   const url = new URL(req.url || '/ws', `http://${req.headers.host || 'localhost'}`);
   const runId = url.searchParams.get('runId');
 
@@ -304,12 +277,7 @@ function getSandboxDir(runId: string): string {
 }
 
 function safeSandboxPath(runDir: string, relPath: string): string {
-  const cleaned = relPath.replace(/^\/+/, '').replace(/\.\./g, '');
-  const target = path.resolve(runDir, cleaned);
-  if (!target.startsWith(runDir)) {
-    throw new Error(`Blocked path traversal attempt: ${relPath}`);
-  }
-  return target;
+  return safeResolveSandboxPath(runDir, relPath);
 }
 
 function listSandboxFiles(runId: string): SandboxFile[] {
@@ -345,6 +313,38 @@ function getProjectDir(projectId: string): string {
   return dir;
 }
 
+function getProjectOriginalsDir(projectId: string): string {
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const dir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function ensureProjectOriginalsSnapshot(projectId: string): void {
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return;
+  const projDir = path.join(PROJECTS_BASE, safeId);
+  const origDir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
+  if (!fs.existsSync(projDir) || fs.existsSync(origDir)) return;
+  fs.mkdirSync(origDir, { recursive: true });
+  function copyOrig(curr: string) {
+    for (const entry of fs.readdirSync(curr, { withFileTypes: true })) {
+      const full = path.join(curr, entry.name);
+      const rel = path.relative(projDir, full).replace(/\\/g, '/');
+      if (!isSafeExportFilePath(rel)) continue;
+      const dest = path.join(origDir, rel);
+      if (entry.isDirectory()) {
+        fs.mkdirSync(dest, { recursive: true });
+        copyOrig(full);
+      } else if (entry.isFile()) {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(full, dest);
+      }
+    }
+  }
+  copyOrig(projDir);
+}
+
 function extractProjectFilesFromZip(
   zipBuffer: Buffer,
   projectId: string,
@@ -371,6 +371,7 @@ function extractProjectFilesFromZip(
       : firstSegments.size === 1 && allNestedInFolder;
 
   const projectDir = getProjectDir(projectId);
+  const originalsDir = getProjectOriginalsDir(projectId);
   const scanned: ScannedProjectFile[] = [];
 
   for (const entry of rawEntries) {
@@ -387,6 +388,10 @@ function extractProjectFilesFromZip(
     const target = safeSandboxPath(projectDir, relPath);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, text, 'utf-8');
+
+    const origTarget = safeSandboxPath(originalsDir, relPath);
+    fs.mkdirSync(path.dirname(origTarget), { recursive: true });
+    fs.writeFileSync(origTarget, text, 'utf-8');
 
     scanned.push({
       path: relPath,
@@ -407,17 +412,19 @@ function seedSandboxFromProject(runId: string, projectId?: string): void {
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
   const srcDir = path.join(PROJECTS_BASE, safeId);
   if (!fs.existsSync(srcDir)) return;
+  ensureProjectOriginalsSnapshot(safeId);
 
   const runDir = getSandboxDir(runId);
   if (fs.readdirSync(runDir).length > 0) return;
 
   let copied = 0;
   function walkCopy(curr: string) {
-    if (copied >= 45) return;
+    if (copied >= 400) return;
     for (const entry of fs.readdirSync(curr, { withFileTypes: true })) {
-      if (copied >= 45) return;
+      if (copied >= 400) return;
       const full = path.join(curr, entry.name);
-      const rel = path.relative(srcDir, full);
+      const rel = path.relative(srcDir, full).replace(/\\/g, '/');
+      if (!isSafeExportFilePath(rel)) continue;
       const dest = path.join(runDir, rel);
       if (entry.isDirectory()) {
         fs.mkdirSync(dest, { recursive: true });
@@ -432,6 +439,55 @@ function seedSandboxFromProject(runId: string, projectId?: string): void {
   walkCopy(srcDir);
 }
 
+function syncWriteToImportedProject(
+  workflow: WorkflowConfig,
+  relPath: string,
+  content: string,
+): void {
+  const projectId = workflow.projectContext?.projectId;
+  if (!projectId || !isSafeExportFilePath(relPath)) return;
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return;
+  ensureProjectOriginalsSnapshot(safeId);
+  const projectDir = getProjectDir(safeId);
+  const target = safeSandboxPath(projectDir, relPath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content, 'utf-8');
+}
+
+function syncProjectReadmeChangelog(workflow: WorkflowConfig): void {
+  const projectId = workflow.projectContext?.projectId;
+  if (!projectId) return;
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return;
+  const origFiles = listImportedProjectFilesFromDisk(safeId, true);
+  const currFiles = listImportedProjectFilesFromDisk(safeId, false);
+  const origMap = new Map(origFiles.map((f) => [f.path, f.content]));
+  const modifiedPaths: string[] = [];
+  const addedPaths: string[] = [];
+  for (const f of currFiles) {
+    if (f.path === 'README.md') continue;
+    if (!origMap.has(f.path)) {
+      addedPaths.push(f.path);
+    } else if (origMap.get(f.path) !== f.content) {
+      modifiedPaths.push(f.path);
+    }
+  }
+  const bugReports = listBugReports({ workflowId: workflow.id });
+  if (modifiedPaths.length === 0 && addedPaths.length === 0 && bugReports.length === 0) return;
+  const existingReadme =
+    currFiles.find((f) => f.path === 'README.md')?.content ?? origMap.get('README.md');
+  const nextReadme = upsertReadmeChangelog(existingReadme, {
+    workflow,
+    modifiedPaths,
+    addedPaths,
+    bugReports,
+  });
+  const readmeTarget = safeSandboxPath(getProjectDir(safeId), 'README.md');
+  fs.mkdirSync(path.dirname(readmeTarget), { recursive: true });
+  fs.writeFileSync(readmeTarget, nextReadme, 'utf-8');
+}
+
 async function refineProjectAnalysisWithManagerAI(params: {
   baseAnalysis: ImportedProjectAnalysis;
   files: ScannedProjectFile[];
@@ -444,8 +500,8 @@ async function refineProjectAnalysisWithManagerAI(params: {
   if (!ai) return baseAnalysis;
 
   const fileIndex = files
-    .slice(0, 70)
-    .map((f) => `- ${f.path} (${f.size ?? f.content.length}B)`)
+    .slice(0, 35)
+    .map((f) => `${f.path} (${f.size ?? f.content.length}B)`)
     .join('\n');
 
   const manifestSnippets = files
@@ -454,8 +510,8 @@ async function refineProjectAnalysisWithManagerAI(params: {
         f.path,
       ),
     )
-    .slice(0, 6)
-    .map((f) => `### ${f.path}\n${f.content.slice(0, 1500)}`)
+    .slice(0, 4)
+    .map((f) => `### ${f.path}\n${truncateMiddle(f.content, 650)}`)
     .join('\n\n');
 
   const isFa = language === 'fa';
@@ -469,34 +525,18 @@ async function refineProjectAnalysisWithManagerAI(params: {
   ]);
 
   const systemInstruction =
-    `You are the Lead Software Architect & Manager Agent in AetherFlow Studio.\n` +
-    `Analyze the imported software project and recommend the optimal team of AI agents and exact specialties needed to develop, debug, secure, test, and deploy it.\n` +
-    `Respond ONLY with valid JSON matching this schema:\n` +
-    `{\n` +
-    `  "managerSummary": "string (concise architectural assessment & team rationale)",\n` +
-    `  "recommendations": [\n` +
-    `    {\n` +
-    `      "title": "string",\n` +
-    `      "role": "manager" | "backend" | "frontend" | "security_qa" | "executor" | "custom",\n` +
-    `      "specialty": "string (specific tech specialty matching project stack)",\n` +
-    `      "reason": "string (why needed based on actual files)",\n` +
-    `      "priority": "essential" | "recommended" | "optional",\n` +
-    `      "matchedSignals": ["file or package name"],\n` +
-    `      "systemPrompt": "string (tailored specialist prompt)",\n` +
-    `      "tools": { "readFile": true, "writeFile": boolean, "execBash": boolean }\n` +
-    `    }\n` +
-    `  ]\n` +
-    `}\n` +
+    `Lead Architect: analyze repo files & return ONLY compact JSON: ` +
+    `{"managerSummary":"concise assessment","recommendations":[{"title":"","role":"manager|backend|frontend|security_qa|executor|custom","specialty":"","reason":"","priority":"essential|recommended|optional","matchedSignals":[""],"systemPrompt":"concise prompt","tools":{"readFile":true,"writeFile":boolean,"execBash":boolean}}]}. ` +
     (isFa
-      ? `Write managerSummary, title, specialty, and reason in fluent Persian/Farsi (keeping technical framework names accurate).`
-      : `Write managerSummary, title, specialty, and reason in clear English.`);
+      ? `Write managerSummary, title, specialty, reason in concise Persian/Farsi.`
+      : `Write managerSummary, title, specialty, reason in concise English.`);
 
   const userPrompt =
     `Project: ${baseAnalysis.name} (${baseAnalysis.sourceType})\n` +
-    `Detected Languages: ${baseAnalysis.languages.map((l) => `${l.name} (${l.files})`).join(', ')}\n` +
-    `Detected Frameworks: ${baseAnalysis.frameworks.join(', ')}\n\n` +
-    `Files (${files.length} total, top 70 shown):\n${fileIndex}\n\n` +
-    `Key Manifests & README:\n${manifestSnippets}`;
+    `Langs: ${baseAnalysis.languages.map((l) => `${l.name}:${l.files}`).join(', ')}\n` +
+    `Stack: ${baseAnalysis.frameworks.join(', ')}\n\n` +
+    `Files (${files.length}, top 35):\n${fileIndex}\n\n` +
+    `Manifests:\n${manifestSnippets}`;
 
   for (const modelName of ['gemini-3.1-flash-lite', 'gemini-4-argon']) {
     try {
@@ -506,6 +546,9 @@ async function refineProjectAnalysisWithManagerAI(params: {
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
+          ...(/^gemini-4-/i.test(modelName)
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+            : {}),
           httpOptions: { timeout: 14000 },
         },
       });
@@ -598,12 +641,20 @@ async function runSandboxCommand(
   command: string,
   timeoutMs = 8000,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const useDocker =
+    process.env.AETHERFLOW_DOCKER_SANDBOX === '1' &&
+    path.resolve(runDir) !== path.resolve(process.cwd());
+  const effectiveCmd = useDocker
+    ? `docker run --rm --network none -m ${getAppSettings().sandboxMemoryMb}m --pids-limit 128 -v ${JSON.stringify(path.resolve(runDir))}:/workspace -w /workspace alpine:3.20 sh -lc ${JSON.stringify(command)}`
+    : command;
+
   try {
-    const { stdout, stderr } = await execAsync(command, {
+    const { stdout, stderr } = await execAsync(effectiveCmd, {
       cwd: runDir,
       timeout: timeoutMs,
       maxBuffer: 256 * 1024,
       env: {
+        ...sanitizeSandboxEnv(process.env),
         PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
         HOME: runDir,
       },
@@ -961,268 +1012,107 @@ function buildDryRunManagerAuditReply(params: {
   );
 }
 
-async function generateLiveGeminiReply(params: {
-  ai: GoogleGenAI | null;
+function applyStructuredMetaTools(params: {
+  structuredTools?: StructuredToolInvocation[];
+  runId: string;
+  workflowId?: string;
   node: WorkflowNode;
-  history: Array<{ role: string; content: string }>;
-  isGroupDiscussion?: boolean;
-  teammates?: string[];
-  inspectionSnapshot?: string;
-  delegationPhase?: 'test' | 'deploy' | 'review';
-}): Promise<string> {
-  const {
-    ai,
-    node,
-    history,
-    isGroupDiscussion,
-    teammates,
-    inspectionSnapshot,
-    delegationPhase,
-  } = params;
+  nodes: WorkflowNode[];
+  roundNum: number;
+  phase: 'test' | 'deploy' | 'review';
+}): Array<{ targetRole: string; targetAgentId: string; targetAgentName: string; issue: string }> {
+  const { structuredTools, runId, workflowId, node, nodes, roundNum, phase } = params;
+  if (!structuredTools || structuredTools.length === 0) return [];
+  const delegations: Array<{
+    targetRole: string;
+    targetAgentId: string;
+    targetAgentName: string;
+    issue: string;
+  }> = [];
 
-  const toolHints: string[] = [];
-  if (node.data.tools.readFile) toolHints.push('READ_FILE:<relative_path>');
-  if (node.data.tools.writeFile) {
-    toolHints.push('WRITE_FILE:<relative_path>\n```js\n<content>\n```');
-  }
-  if (node.data.tools.execBash) toolHints.push('EXEC_BASH:<command>');
-
-  const managerNodeFlag = isManagerNode(node);
-  const managerDirective = managerNodeFlag
-    ? `\nManager Inspection & Domain Delegation Protocol (${delegationPhase ?? 'review'}):\n` +
-      `- As the Manager (${node.data.label}), carefully analyze all sandbox files, test/deploy logs, and open bug reports from the team.\n` +
-      `- If ANY bug, failing check, or domain defect exists, DO NOT emit TERMINATE. Instead, assign the fix directly to the responsible domain agent (backend, frontend, security_qa, executor) by emitting ONE line:\n` +
-      `DELEGATE: {"targetRole":"backend"|"frontend"|"security_qa"|"executor","issue":"concise issue title","reason":"specific fix required"}\n` +
-      `- Only emit TERMINATE once all checks pass and no unresolved blocking issues remain.\n`
-    : '';
-
-  const groupGuidance = isGroupDiscussion
-    ? `\nLive GroupChat Collaboration Mode:\n` +
-      `- You are chatting live in a real team room with the User and fellow specialists: ${(teammates || []).join(', ')}.\n` +
-      `- Directly respond to the User's latest message AND interact naturally with teammates who spoke before you (reference them by name, e.g. @Backend Agent, agree, refine, or raise concerns).\n` +
-      `- Reply in the SAME language the User used (if the User wrote in Persian/Farsi, write your conversational reply in fluent Persian/Farsi).\n` +
-      `- Do NOT emit TERMINATE unless the user explicitly asked to end the session.\n`
-    : `\n- Reply in the same language the user used where appropriate.\n` +
-      `- If you are the Manager in an automated pipeline and verification is complete, include TERMINATE.\n`;
-
-  const powerKey = node.data.powerLevel ?? 'standard';
-  const powerMeta = POWER_LEVEL_META[powerKey] ?? POWER_LEVEL_META.standard;
-
-  const systemInstruction =
-    `${node.data.systemPrompt}\n\n` +
-    `Agent Name: ${node.data.label}\n` +
-    `Role: ${node.data.role}\n` +
-    (node.data.section ? `Department / Section: ${node.data.section}\n` : '') +
-    (node.data.positionTitle ? `Position / Post: ${node.data.positionTitle}\n` : '') +
-    (node.data.responsibility ? `Assigned Responsibility: ${node.data.responsibility}\n` : '') +
-    `Power & Reasoning Profile: ${powerMeta.en} — ${powerMeta.directive}\n` +
-    `Configured Provider Profile: ${node.data.provider} (${node.data.model})\n` +
-    `Authorized Tools: ${toolHints.length > 0 ? toolHints.join(', ') : 'None'}\n` +
-    `Keep responses focused, technical, and concise (under 200 words). ` +
-    `If you create a file, output WRITE_FILE:<path> followed immediately by a fenced code block. ` +
-    `If you run a bash command, output a single line starting with EXEC_BASH:<command>.` +
-    managerDirective +
-    groupGuidance +
-    `\nBug Report / Improvement Idea Tracking:\n` +
-    `- If you spot a bug, security risk, or concrete improvement idea in your domain, append ONE single-line JSON block at the end:\n` +
-    `BUG_REPORT: {"category":"bug"|"improvement","severity":"critical"|"high"|"medium"|"low","title":"short title","description":"what is wrong or can improve","suggestedFix":"actionable fix"}`;
-
-  const snapshotBlock = inspectionSnapshot ? `\n\n[TEAM AUDIT SNAPSHOT]\n${inspectionSnapshot}` : '';
-  const transcript =
-    history
-      .map((m) => `[${m.role.toUpperCase()}]:\n${m.content}`)
-      .join('\n\n---\n\n') + snapshotBlock;
-
-  const settings = getAppSettings();
-  const nodeKey = getSecretForNode(node, settings);
-
-  if (node.data.provider === 'opencode') {
-    const baseUrl = (settings.providers.opencode?.baseUrl || 'https://opencode.ai/zen/v1').replace(/\/+$/, '');
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (nodeKey) {
-      headers.Authorization = `Bearer ${nodeKey}`;
-    }
-    const openCodeRes = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      signal: AbortSignal.timeout(15000),
-      body: JSON.stringify({
-        model: node.data.model.replace(/^opencode\//, ''),
-        temperature: node.data.temperature,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
-        ],
-      }),
-    }).catch(() => null);
-    if (openCodeRes?.ok) {
-      const data = (await openCodeRes.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const text = data.choices?.[0]?.message?.content;
-      if (text) return text;
-    }
-    if (!ai) {
-      const statusText = openCodeRes ? `HTTP ${openCodeRes.status}` : 'network timeout';
-      const errBody = openCodeRes ? await openCodeRes.text().catch(() => '') : '';
-      throw new Error(
-        `OpenCode Zen returned ${statusText}${errBody ? `: ${errBody.slice(0, 160)}` : ''}`,
-      );
-    }
-  }
-
-  if (node.data.provider === 'openai' && nodeKey) {
-    const baseUrl = (settings.providers.openai?.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
-    const openaiRes = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${nodeKey}`,
-      },
-      signal: AbortSignal.timeout(25000),
-      body: JSON.stringify({
-        model: node.data.model,
-        temperature: node.data.temperature,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
-        ],
-      }),
-    });
-    if (!openaiRes.ok) {
-      const errBody = await openaiRes.text().catch(() => '');
-      throw new Error(`OpenAI API error HTTP ${openaiRes.status}: ${errBody.slice(0, 200)}`);
-    }
-    const data = (await openaiRes.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const text = data.choices?.[0]?.message?.content;
-    if (text) return text;
-    throw new Error('OpenAI returned an empty response.');
-  }
-
-  if (node.data.provider === 'anthropic' && nodeKey) {
-    const baseUrl = (settings.providers.anthropic?.baseUrl || 'https://api.anthropic.com').replace(/\/+$/, '');
-    const antRes = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': nodeKey,
-        'anthropic-version': '2023-06-01',
-      },
-      signal: AbortSignal.timeout(25000),
-      body: JSON.stringify({
-        model: node.data.model,
-        max_tokens: powerMeta.maxTokens,
-        temperature: node.data.temperature,
-        system: systemInstruction,
-        messages: [
-          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
-        ],
-      }),
-    });
-    if (!antRes.ok) {
-      const errBody = await antRes.text().catch(() => '');
-      throw new Error(`Anthropic API error HTTP ${antRes.status}: ${errBody.slice(0, 200)}`);
-    }
-    const data = (await antRes.json()) as {
-      content?: Array<{ type?: string; text?: string }>;
-    };
-    const text = data.content?.map((c) => c.text ?? '').join('') ?? '';
-    if (text) return text;
-    throw new Error('Anthropic returned an empty response.');
-  }
-
-  if (node.data.provider === 'ollama') {
-    const baseUrl = (settings.providers.ollama?.baseUrl || 'http://host.docker.internal:11434').replace(/\/+$/, '');
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (nodeKey) {
-      headers.Authorization = `Bearer ${nodeKey}`;
-    }
-    const ollamaRes = await fetch(`${baseUrl}/api/chat`, {
-      method: 'POST',
-      headers,
-      signal: AbortSignal.timeout(8000),
-      body: JSON.stringify({
-        model: node.data.model.replace(/^ollama\//, ''),
-        stream: false,
-        options: { temperature: node.data.temperature },
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: `${transcript}\n\nNow respond as ${node.data.label}:` },
-        ],
-      }),
-    }).catch(() => null);
-    if (ollamaRes?.ok) {
-      const data = (await ollamaRes.json()) as {
-        message?: { content?: string };
-      };
-      const text = data.message?.content;
-      if (text) return text;
-    }
-    if (!ai) {
-      const statusText = ollamaRes ? `HTTP ${ollamaRes.status}` : 'endpoint unreachable';
-      throw new Error(
-        `Local Ollama (${baseUrl}) failed: ${statusText}. Start Ollama or configure a Gemini/OpenAI API key in Settings.`,
-      );
-    }
-  }
-
-  const effectiveGeminiAi =
-    node.data.provider === 'gemini' ? getAiClient(node.data.envSecretRef) ?? ai : ai;
-
-  if (!effectiveGeminiAi) {
-    throw new Error(
-      `API key not configured for ${node.data.provider} (${node.data.envSecretRef || 'GEMINI_API_KEY'}). Add it in Settings.`,
-    );
-  }
-
-  const preferredModel =
-    node.data.provider === 'gemini' && node.data.model.startsWith('gemini-')
-      ? node.data.model
-      : 'gemini-3.1-flash-lite';
-
-  const candidateModels = Array.from(
-    new Set([preferredModel, 'gemini-3.1-flash-lite', 'gemini-4-argon', 'gemini-4-hydrogen']),
-  );
-
-  let lastErr: unknown = null;
-  for (const modelName of candidateModels) {
-    try {
-      const response = await effectiveGeminiAi.models.generateContent({
-        model: modelName,
-        contents: `${transcript}\n\nNow respond as ${node.data.label}:`,
-        config: {
-          systemInstruction,
-          temperature: node.data.temperature,
-          httpOptions: { timeout: 20000 },
-        },
+  for (const call of structuredTools) {
+    if (call.name === 'report_bug') {
+      const title = String(call.args.title || '').trim();
+      const description = String(call.args.description || '').trim();
+      if (!title || !description) continue;
+      const categoryRaw = String(call.args.category || '').toLowerCase();
+      const severityRaw = String(call.args.severity || '').toLowerCase();
+      const saved = createBugReport({
+        runId,
+        workflowId,
+        agentId: node.id,
+        agentName: node.data.label,
+        role: node.data.role,
+        category: categoryRaw === 'improvement' ? 'improvement' : 'bug',
+        severity:
+          severityRaw === 'critical' ||
+          severityRaw === 'high' ||
+          severityRaw === 'medium' ||
+          severityRaw === 'low'
+            ? severityRaw
+            : 'medium',
+        title,
+        description,
+        suggestedFix:
+          typeof call.args.suggestedFix === 'string' && call.args.suggestedFix.trim()
+            ? call.args.suggestedFix.trim()
+            : undefined,
       });
-      return response.text ?? '';
-    } catch (err) {
-      lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      const retryable =
-        msg.includes('503') ||
-        msg.includes('504') ||
-        msg.includes('429') ||
-        msg.includes('UNAVAILABLE') ||
-        msg.includes('DEADLINE_EXCEEDED') ||
-        msg.toLowerCase().includes('timeout') ||
-        msg.toLowerCase().includes('abort');
-      if (!retryable) {
-        const formatted = formatGeminiApiError(err, settings.language);
-        throw new Error(formatted.message);
-      }
-      await new Promise((r) => setTimeout(r, 300));
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'bug_reported',
+        round: roundNum,
+        agentId: node.id,
+        agentName: node.data.label,
+        role: node.data.role,
+        content: `[${saved.category === 'bug' ? 'BUG' : 'IDEA'} · ${saved.severity.toUpperCase()}] ${saved.title}`,
+        bugReport: saved,
+        timestamp: saved.createdAt,
+      });
+    } else if (call.name === 'delegate_agent' && isManagerNode(node)) {
+      const targetRoleRaw = String(call.args.targetRole || '').trim();
+      const issue = String(call.args.issue || '').trim();
+      if (!targetRoleRaw || !issue) continue;
+      const reason = String(call.args.reason || issue).trim();
+      const targetNode =
+        nodes.find((n) => n.data.role === targetRoleRaw) ??
+        nodes.find((n) => n.id !== node.id) ??
+        node;
+      const delegation = {
+        id: crypto.randomUUID(),
+        managerId: node.id,
+        managerName: node.data.label,
+        targetRole: targetNode.data.role,
+        targetAgentId: targetNode.id,
+        targetAgentName: targetNode.data.label,
+        issue,
+        reason,
+        phase,
+        timestamp: new Date().toISOString(),
+      };
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'manager_delegation',
+        round: roundNum,
+        agentId: node.id,
+        agentName: node.data.label,
+        role: node.data.role,
+        content: `${node.data.label} delegated issue to ${delegation.targetAgentName} (${delegation.targetRole}): ${delegation.issue}`,
+        delegation,
+        timestamp: delegation.timestamp,
+      });
+      delegations.push({
+        targetRole: delegation.targetRole,
+        targetAgentId: delegation.targetAgentId,
+        targetAgentName: delegation.targetAgentName,
+        issue: delegation.issue,
+      });
     }
   }
 
-  if (lastErr) {
-    const formatted = formatGeminiApiError(lastErr, settings.language);
-    throw new Error(formatted.message);
-  }
-  throw new Error('All Gemini fallback models failed');
+  return delegations;
 }
 
 async function processAgentTools(params: {
@@ -1230,30 +1120,53 @@ async function processAgentTools(params: {
   workflow: WorkflowConfig;
   node: WorkflowNode;
   reply: string;
+  structuredTools?: StructuredToolInvocation[];
   roundNum: number;
   mode: 'live' | 'dry_run';
   settings: AppSettings;
 }): Promise<ToolCallLog[]> {
-  const { runId, workflow, node, reply, roundNum, mode, settings } = params;
+  const { runId, workflow, node, reply, structuredTools = [], roundNum, mode, settings } = params;
   const runDir = getSandboxDir(runId);
   const logs: ToolCallLog[] = [];
   const timeoutMs = settings.sandboxTimeoutSec * 1000;
 
   if (node.data.tools.writeFile && settings.allowWriteFile) {
+    const writes: Array<{ relPath: string; content: string }> = [];
+    const seenWritePaths = new Set<string>();
+    for (const call of structuredTools) {
+      if (call.name === 'write_file') {
+        const relPath = String(call.args.path || '').trim();
+        const content = String(call.args.content ?? '');
+        if (relPath && !seenWritePaths.has(relPath)) {
+          seenWritePaths.add(relPath);
+          writes.push({ relPath, content });
+        }
+      }
+    }
     const writeRegex = /WRITE_FILE:([^\n]+)\n```[^\n]*\n([\s\S]*?)```/g;
     let match: RegExpExecArray | null;
     while ((match = writeRegex.exec(reply)) !== null) {
       const relPath = match[1].trim();
       const content = match[2];
+      if (relPath && !seenWritePaths.has(relPath)) {
+        seenWritePaths.add(relPath);
+        writes.push({ relPath, content });
+      }
+    }
+
+    let wroteAnyProjectFile = false;
+    for (const { relPath, content } of writes) {
       try {
         const target = safeSandboxPath(runDir, relPath);
         fs.mkdirSync(path.dirname(target), { recursive: true });
         fs.writeFileSync(target, content, 'utf-8');
+        syncWriteToImportedProject(workflow, relPath, content);
+        wroteAnyProjectFile = true;
         logs.push({
           id: crypto.randomUUID(),
           tool: 'write_file',
           target: relPath,
-          result: `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to /workspace/${relPath}`,
+          result: `Wrote ${Buffer.byteLength(content, 'utf-8')} bytes to ${relPath}`,
           exitCode: 0,
         });
       } catch (err) {
@@ -1266,13 +1179,37 @@ async function processAgentTools(params: {
         });
       }
     }
+    if (wroteAnyProjectFile) {
+      try {
+        syncProjectReadmeChangelog(workflow);
+      } catch {
+        // ignore README sync errors
+      }
+    }
   }
 
   if (node.data.tools.readFile && settings.allowReadFile) {
+    const reads: string[] = [];
+    const seenReadPaths = new Set<string>();
+    for (const call of structuredTools) {
+      if (call.name === 'read_file') {
+        const relPath = String(call.args.path || '').trim();
+        if (relPath && !seenReadPaths.has(relPath)) {
+          seenReadPaths.add(relPath);
+          reads.push(relPath);
+        }
+      }
+    }
     const readRegex = /^READ_FILE:([^\n]+)$/gm;
     let match: RegExpExecArray | null;
     while ((match = readRegex.exec(reply)) !== null) {
       const relPath = match[1].trim();
+      if (relPath && !seenReadPaths.has(relPath)) {
+        seenReadPaths.add(relPath);
+        reads.push(relPath);
+      }
+    }
+    for (const relPath of reads) {
       try {
         const target = safeSandboxPath(runDir, relPath);
         const content = fs.readFileSync(target, 'utf-8');
@@ -1296,10 +1233,28 @@ async function processAgentTools(params: {
   }
 
   if (node.data.tools.execBash && settings.allowExecBash) {
+    const commands: string[] = [];
+    const seenCommands = new Set<string>();
+    for (const call of structuredTools) {
+      if (call.name === 'exec_bash') {
+        const cmd = String(call.args.command || '').trim();
+        if (cmd && !seenCommands.has(cmd)) {
+          seenCommands.add(cmd);
+          commands.push(cmd);
+        }
+      }
+    }
     const bashRegex = /^EXEC_BASH:([^\n]+)$/gm;
     let match: RegExpExecArray | null;
     while ((match = bashRegex.exec(reply)) !== null) {
-      const command = match[1].trim();
+      const cmd = match[1].trim();
+      if (cmd && !seenCommands.has(cmd)) {
+        seenCommands.add(cmd);
+        commands.push(cmd);
+      }
+    }
+
+    for (const command of commands) {
       const sensitivity = detectSensitiveCommand(command, settings.customSensitivePatterns);
       let approved = true;
 
@@ -1332,10 +1287,16 @@ async function processAgentTools(params: {
         approved = await new Promise<boolean>((resolve) => {
           const timer = setTimeout(() => {
             pendingApprovals.delete(approvalId);
+            pendingApprovalsByRun.get(runId)?.delete(approvalId);
             resolve(false);
           }, 5 * 60 * 1000);
+          if (!pendingApprovalsByRun.has(runId)) {
+            pendingApprovalsByRun.set(runId, new Set());
+          }
+          pendingApprovalsByRun.get(runId)!.add(approvalId);
           pendingApprovals.set(approvalId, (decision) => {
             clearTimeout(timer);
+            pendingApprovalsByRun.get(runId)?.delete(approvalId);
             resolve(decision);
           });
         });
@@ -1365,7 +1326,6 @@ async function processAgentTools(params: {
           approved: false,
         });
       } else {
-        // Execute safe command inside isolated temp workspace directory
         const isSafeNodeTest =
           command.startsWith('node --test') ||
           command.startsWith('ls') ||
@@ -1453,6 +1413,8 @@ async function executeWorkflowRun(params: {
   const managerNode = findManagerNode(ordered);
   const ai = mode === 'live' ? getAiClient() : null;
   const bootSettings = getAppSettings();
+  const abortController = new AbortController();
+  runAbortControllers.set(runId, abortController);
 
   seedSandboxFromProject(runId, workflow.projectContext?.projectId);
 
@@ -1474,8 +1436,19 @@ async function executeWorkflowRun(params: {
       events: runEventBuffers.get(runId) ?? [],
       completed: true,
     });
+    runAbortControllers.delete(runId);
     return;
   }
+
+  // Build cross-run persistent workflow memory when enabled (AutoGen-style shared context)
+  const memoryText =
+    workflow.memoryEnabled !== false
+      ? buildWorkflowMemorySnapshot({
+          priorRuns: listRecentWorkflowRunsWithSummary(workflow.id, 4, runId),
+          openBugs: listBugReports({ workflowId: workflow.id }),
+          workspaceFiles: listSandboxFilesReadOnly(runId),
+        })
+      : '';
 
   broadcastEvent(runId, {
     id: crypto.randomUUID(),
@@ -1485,11 +1458,12 @@ async function executeWorkflowRun(params: {
     content:
       runStage === 'test_and_deploy'
         ? `Started Automated Test & Deploy Audit across ${ordered.length} agents${managerNode ? ` (Supervisor: ${managerNode.data.label})` : ''}.`
-        : `Started GroupChat across ${ordered.length} agents (max_rounds=${maxRounds}, HITL=${workflow.humanInTheLoop ? 'enabled' : 'off'}, mode=${mode}).`,
+        : `Started GroupChat across ${ordered.length} agents (max_rounds=${maxRounds}, HITL=${workflow.humanInTheLoop ? 'enabled' : 'off'}, mode=${mode}${memoryText ? ', memory=on' : ''}).`,
     timestamp: new Date().toISOString(),
   });
 
   const history: Array<{ role: string; content: string }> = [
+    ...(memoryText ? [{ role: 'memory', content: memoryText }] : []),
     { role: 'user', content: `Project Task:\n${taskPrompt}` },
   ];
 
@@ -1498,11 +1472,14 @@ async function executeWorkflowRun(params: {
   let pendingDelegatedRole: string | undefined;
   let forceManagerAudit = false;
   let managerReviewedPostTest = false;
+  let lastTurnHadError = false;
+  let lastReply = '';
 
   if (runStage === 'test_and_deploy') {
     const preflightLogs = await runDeployVerificationChecks();
     allToolCalls.push(...preflightLogs);
     const hasFailure = preflightLogs.some((l) => (l.exitCode ?? 0) !== 0);
+    lastTurnHadError = hasFailure;
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
@@ -1528,9 +1505,223 @@ async function executeWorkflowRun(params: {
 
   let currentNodeId: string | null = null;
   let roundsExecuted = 0;
+  const executedNodeIds = new Set<string>();
+
+  async function runSingleSpeakerTurn(paramsTurn: {
+    speaker: WorkflowNode;
+    roundNum: number;
+    historySnapshot: Array<{ role: string; content: string }>;
+  }): Promise<{
+    reply: string;
+    toolCalls: ToolCallLog[];
+    hadError: boolean;
+    delegatedRole?: string;
+    delegationCount: number;
+  }> {
+    const { speaker, roundNum, historySnapshot } = paramsTurn;
+    const turnStartedAt = Date.now();
+    const isMgr = isManagerNode(speaker);
+    const currentSandboxFiles = listSandboxFiles(runId);
+    const currentOpenBugs = listBugReports({ workflowId: workflow.id });
+    const inspection = isMgr
+      ? buildManagerInspectionContext({
+          sandboxFiles: currentSandboxFiles,
+          toolCalls: allToolCalls,
+          openBugs: currentOpenBugs,
+        })
+      : null;
+
+    if (isMgr && (runStage === 'test_and_deploy' || allToolCalls.length > 0)) {
+      managerReviewedPostTest = true;
+    }
+
+    const phase: 'test' | 'deploy' | 'review' =
+      runStage === 'test_and_deploy' ? 'deploy' : allToolCalls.length > 0 ? 'test' : 'review';
+
+    const localHistory = [...historySnapshot];
+    let finalReply = '';
+    const turnToolCalls: ToolCallLog[] = [];
+    let totalTurnUsage: TokenUsage = {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      estimated: false,
+    };
+    let delegatedRole: string | undefined;
+    let delegationCount = 0;
+
+    const maxInnerSteps = mode === 'live' && canNodeRunLive(speaker, getAppSettings()) ? 2 : 0;
+    for (let innerStep = 0; innerStep <= maxInnerSteps; innerStep++) {
+      if (abortController.signal.aborted) break;
+
+      let rawReply: string;
+      let structuredTools: StructuredToolInvocation[] = [];
+      let stepUsage: TokenUsage;
+
+      if (mode === 'live' && canNodeRunLive(speaker, getAppSettings())) {
+        const liveResult = await generateLiveAgentReply({
+          ai,
+          node: speaker,
+          history: localHistory,
+          inspectionSnapshot: inspection?.summaryText,
+          delegationPhase: phase,
+          signal: abortController.signal,
+          onChunk: (accumulatedText) => {
+            broadcastEvent(runId, {
+              id: `chunk-${runId}-${speaker.id}-${roundNum}-${innerStep}`,
+              runId,
+              type: 'agent_chunk',
+              round: roundNum,
+              agentId: speaker.id,
+              agentName: speaker.data.label,
+              role: speaker.data.role,
+              provider: speaker.data.provider,
+              model: speaker.data.model,
+              content: accumulatedText,
+              timestamp: new Date().toISOString(),
+            });
+          },
+        });
+        rawReply = liveResult.text;
+        structuredTools = liveResult.structuredTools;
+        stepUsage = liveResult.tokenUsage;
+      } else {
+        rawReply =
+          isMgr && (runStage === 'test_and_deploy' || allToolCalls.length > 0 || roundNum > 1)
+            ? buildDryRunManagerAuditReply({
+                managerNode: speaker,
+                nodes: ordered,
+                taskPrompt,
+                sandboxFiles: currentSandboxFiles,
+                toolCalls: allToolCalls,
+                openBugs: currentOpenBugs,
+                alreadyDelegatedKeys: delegatedKeys,
+                phase,
+                allowTerminate: roundNum >= 2,
+              })
+            : buildDryRunAgentReply(speaker, taskPrompt, roundNum, maxRounds);
+        stepUsage = estimateTokenUsage(taskPrompt, rawReply);
+      }
+
+      if (abortController.signal.aborted) break;
+
+      totalTurnUsage = {
+        promptTokens: totalTurnUsage.promptTokens + stepUsage.promptTokens,
+        completionTokens: totalTurnUsage.completionTokens + stepUsage.completionTokens,
+        totalTokens: totalTurnUsage.totalTokens + stepUsage.totalTokens,
+        estimated: Boolean(totalTurnUsage.estimated || stepUsage.estimated),
+        ...((totalTurnUsage.savedTokens ?? 0) + (stepUsage.savedTokens ?? 0) > 0
+          ? { savedTokens: (totalTurnUsage.savedTokens ?? 0) + (stepUsage.savedTokens ?? 0) }
+          : {}),
+      };
+
+      const withoutBugs = processAndBroadcastBugReports({
+        reply: rawReply,
+        runId,
+        workflowId: workflow.id,
+        node: speaker,
+        roundNum,
+      });
+
+      const delegationResult = processAndBroadcastManagerDelegations({
+        reply: withoutBugs,
+        runId,
+        managerNode: speaker,
+        nodes: ordered,
+        roundNum,
+        phase,
+      });
+
+      const structuredDelegations = applyStructuredMetaTools({
+        structuredTools,
+        runId,
+        workflowId: workflow.id,
+        node: speaker,
+        nodes: ordered,
+        roundNum,
+        phase,
+      });
+
+      const mergedDelegations = [...delegationResult.delegations, ...structuredDelegations];
+      if (mergedDelegations.length > 0) {
+        delegatedRole = mergedDelegations[0].targetRole;
+        delegationCount += mergedDelegations.length;
+      }
+
+      const stepReply = delegationResult.cleanedReply.trim()
+        ? delegationResult.cleanedReply
+        : structuredTools.length > 0
+          ? `${speaker.data.label} executed ${structuredTools.map((s) => s.name).join(', ')}.`
+          : '';
+      finalReply = finalReply ? `${finalReply}\n\n${stepReply}` : stepReply;
+
+      const settings = getAppSettings();
+      const stepToolCalls = await processAgentTools({
+        runId,
+        workflow,
+        node: speaker,
+        reply: stepReply,
+        structuredTools,
+        roundNum,
+        mode,
+        settings,
+      });
+      turnToolCalls.push(...stepToolCalls);
+
+      const shouldFollowUpReAct =
+        mode === 'live' &&
+        innerStep < maxInnerSteps &&
+        stepToolCalls.some((tc) => tc.tool === 'read_file' || tc.tool === 'exec_bash');
+
+      if (!shouldFollowUpReAct) break;
+
+      localHistory.push({
+        role: speaker.data.label,
+        content: truncateMiddle(stepReply, 450),
+      });
+      localHistory.push({
+        role: 'sandbox',
+        content: stepToolCalls
+          .map(
+            (t) =>
+              `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${compactSandboxOutput(t.result, 320)}`,
+          )
+          .join('\n'),
+      });
+    }
+
+    const hadError = turnToolCalls.some((t) => (t.exitCode ?? 0) !== 0);
+
+    broadcastEvent(runId, {
+      id: crypto.randomUUID(),
+      runId,
+      type: 'agent_message',
+      round: roundNum,
+      agentId: speaker.id,
+      agentName: speaker.data.label,
+      role: speaker.data.role,
+      provider: speaker.data.provider,
+      model: speaker.data.model,
+      content: finalReply,
+      durationMs: Date.now() - turnStartedAt,
+      tokenUsage: totalTurnUsage,
+      toolCalls: turnToolCalls,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      reply: finalReply,
+      toolCalls: turnToolCalls,
+      hadError,
+      delegatedRole,
+      delegationCount,
+    };
+  }
 
   try {
     for (let i = 0; i < maxRounds; i++) {
+      if (abortController.signal.aborted) break;
+
       let speaker: WorkflowNode | null = null;
       if (forceManagerAudit && managerNode && managerNode.id !== currentNodeId) {
         speaker = managerNode;
@@ -1543,6 +1734,8 @@ async function executeWorkflowRun(params: {
           roundIndex: i,
           maxRounds,
           requestedNextRole: pendingDelegatedRole,
+          lastTurnHadError,
+          lastReply,
         });
         speaker = next.node;
         pendingDelegatedRole = undefined;
@@ -1551,89 +1744,30 @@ async function executeWorkflowRun(params: {
       if (!speaker) break;
 
       currentNodeId = speaker.id;
+      executedNodeIds.add(speaker.id);
       roundsExecuted = i + 1;
-      const isMgr = isManagerNode(speaker);
-      const currentSandboxFiles = listSandboxFiles(runId);
-      const currentOpenBugs = listBugReports({ workflowId: workflow.id });
-      const inspection = isMgr
-        ? buildManagerInspectionContext({
-            sandboxFiles: currentSandboxFiles,
-            toolCalls: allToolCalls,
-            openBugs: currentOpenBugs,
-          })
-        : null;
 
-      if (isMgr && (runStage === 'test_and_deploy' || allToolCalls.length > 0)) {
-        managerReviewedPostTest = true;
-      }
-
-      const phase: 'test' | 'deploy' | 'review' =
-        runStage === 'test_and_deploy' ? 'deploy' : allToolCalls.length > 0 ? 'test' : 'review';
-
-      let rawReply: string;
-      if (mode === 'live' && canNodeRunLive(speaker, getAppSettings())) {
-        rawReply = await generateLiveGeminiReply({
-          ai,
-          node: speaker,
-          history,
-          inspectionSnapshot: inspection?.summaryText,
-          delegationPhase: phase,
-        });
-      } else if (isMgr && (runStage === 'test_and_deploy' || allToolCalls.length > 0 || roundsExecuted > 1)) {
-        rawReply = buildDryRunManagerAuditReply({
-          managerNode: speaker,
-          nodes: ordered,
-          taskPrompt,
-          sandboxFiles: currentSandboxFiles,
-          toolCalls: allToolCalls,
-          openBugs: currentOpenBugs,
-          alreadyDelegatedKeys: delegatedKeys,
-          phase,
-          allowTerminate: roundsExecuted >= 2,
-        });
-      } else {
-        rawReply = buildDryRunAgentReply(speaker, taskPrompt, roundsExecuted, maxRounds);
-      }
-
-      const withoutBugs = processAndBroadcastBugReports({
-        reply: rawReply,
-        runId,
-        workflowId: workflow.id,
-        node: speaker,
+      const outcome = await runSingleSpeakerTurn({
+        speaker,
         roundNum: roundsExecuted,
+        historySnapshot: history,
       });
+      if (abortController.signal.aborted) break;
 
-      const delegationResult = processAndBroadcastManagerDelegations({
-        reply: withoutBugs,
-        runId,
-        managerNode: speaker,
-        nodes: ordered,
-        roundNum: roundsExecuted,
-        phase,
-      });
-      const reply = delegationResult.cleanedReply;
+      allToolCalls.push(...outcome.toolCalls);
+      lastTurnHadError = outcome.hadError;
+      lastReply = outcome.reply;
 
-      if (delegationResult.delegations.length > 0) {
-        pendingDelegatedRole = delegationResult.delegations[0].targetRole;
+      if (outcome.delegatedRole) {
+        pendingDelegatedRole = outcome.delegatedRole;
         managerReviewedPostTest = false;
       }
 
-      const settings = getAppSettings();
-      const toolCalls = await processAgentTools({
-        runId,
-        workflow,
-        node: speaker,
-        reply,
-        roundNum: roundsExecuted,
-        mode,
-        settings,
-      });
-      allToolCalls.push(...toolCalls);
-
+      const isMgr = isManagerNode(speaker);
       if (
         managerNode &&
         !isMgr &&
-        (toolCalls.some((t) => (t.exitCode ?? 0) !== 0) ||
+        (lastTurnHadError ||
           speaker.data.role === 'executor' ||
           speaker.data.role === 'security_qa')
       ) {
@@ -1641,30 +1775,15 @@ async function executeWorkflowRun(params: {
         managerReviewedPostTest = false;
       }
 
-      history.push({ role: speaker.data.label, content: reply });
-      if (toolCalls.length > 0) {
+      history.push({ role: speaker.data.label, content: outcome.reply });
+      if (outcome.toolCalls.length > 0) {
         history.push({
           role: 'sandbox',
-          content: toolCalls
+          content: outcome.toolCalls
             .map((t) => `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${t.result}`)
             .join('\n'),
         });
       }
-
-      broadcastEvent(runId, {
-        id: crypto.randomUUID(),
-        runId,
-        type: 'agent_message',
-        round: roundsExecuted,
-        agentId: speaker.id,
-        agentName: speaker.data.label,
-        role: speaker.data.role,
-        provider: speaker.data.provider,
-        model: speaker.data.model,
-        content: reply,
-        toolCalls,
-        timestamp: new Date().toISOString(),
-      });
 
       updateRunRecord({
         id: runId,
@@ -1673,18 +1792,109 @@ async function executeWorkflowRun(params: {
         events: runEventBuffers.get(runId) ?? [],
       });
 
-      if (reply.includes('TERMINATE') && isMgr && delegationResult.delegations.length === 0) {
+      if (outcome.reply.includes('TERMINATE') && isMgr && outcome.delegationCount === 0) {
         break;
       }
 
-      if (mode === 'dry_run') {
-        await new Promise((r) => setTimeout(r, 200));
+      // Execute independent DAG sibling branches in parallel wave if eligible
+      if (!forceManagerAudit && !pendingDelegatedRole && i + 1 < maxRounds) {
+        const fanoutTargets = computeParallelFanoutTargets({
+          orderedNodes: ordered,
+          edges: workflow.edges,
+          sourceNodeId: speaker.id,
+          alreadyExecutedIds: executedNodeIds,
+          lastTurnHadError,
+          lastReply,
+        }).slice(0, maxRounds - (i + 1));
+
+        if (fanoutTargets.length >= 2) {
+          const waveHistory = [...history];
+          const waveResults = await Promise.all(
+            fanoutTargets.map((branchNode, idx) => {
+              executedNodeIds.add(branchNode.id);
+              return runSingleSpeakerTurn({
+                speaker: branchNode,
+                roundNum: i + 2 + idx,
+                historySnapshot: waveHistory,
+              }).then((res) => ({ branchNode, res }));
+            }),
+          );
+
+          if (abortController.signal.aborted) break;
+
+          let waveHadError = false;
+          for (const { branchNode, res } of waveResults) {
+            allToolCalls.push(...res.toolCalls);
+            if (res.hadError) waveHadError = true;
+            lastReply = res.reply;
+            currentNodeId = branchNode.id;
+            history.push({ role: branchNode.data.label, content: res.reply });
+            if (res.toolCalls.length > 0) {
+              history.push({
+                role: 'sandbox',
+                content: res.toolCalls
+                  .map((t) => `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${t.result}`)
+                  .join('\n'),
+              });
+            }
+            if (
+              managerNode &&
+              !isManagerNode(branchNode) &&
+              (res.hadError ||
+                branchNode.data.role === 'executor' ||
+                branchNode.data.role === 'security_qa')
+            ) {
+              forceManagerAudit = true;
+              managerReviewedPostTest = false;
+            }
+          }
+
+          lastTurnHadError = waveHadError;
+          i += waveResults.length;
+          roundsExecuted = i + 1;
+          updateRunRecord({
+            id: runId,
+            status: 'running',
+            roundsExecuted,
+            events: runEventBuffers.get(runId) ?? [],
+          });
+        }
       }
+
+      if (mode === 'dry_run') {
+        const stillRunning = await sleepWithAbort(200, abortController.signal);
+        if (!stillRunning) break;
+      }
+    }
+
+    if (abortController.signal.aborted) {
+      const existingEvents = runEventBuffers.get(runId) ?? [];
+      if (!existingEvents.some((e) => e.type === 'run_cancelled')) {
+        broadcastEvent(runId, {
+          id: crypto.randomUUID(),
+          runId,
+          type: 'run_cancelled',
+          round: roundsExecuted,
+          content: `Execution stopped by operator after ${roundsExecuted} round(s).`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      updateRunRecord({
+        id: runId,
+        status: 'cancelled',
+        roundsExecuted,
+        events: runEventBuffers.get(runId) ?? [],
+        completed: true,
+      });
+      return;
     }
 
     // Automatic Post-Test / Pre-Deploy Manager Inspection if tests ran and Manager hasn't signed off yet
     if (managerNode && !managerReviewedPostTest && (allToolCalls.length > 0 || runStage === 'test_and_deploy')) {
-      roundsExecuted += 1;
+      if (roundsExecuted < maxRounds) {
+        roundsExecuted += 1;
+      }
+      const mgrStartedAt = Date.now();
       const finalFiles = listSandboxFiles(runId);
       const finalBugs = listBugReports({ workflowId: workflow.id });
       const finalCtx = buildManagerInspectionContext({
@@ -1692,26 +1902,50 @@ async function executeWorkflowRun(params: {
         toolCalls: allToolCalls,
         openBugs: finalBugs,
       });
-      const rawFinalMgr =
-        mode === 'live' && canNodeRunLive(managerNode, getAppSettings())
-          ? await generateLiveGeminiReply({
-              ai,
-              node: managerNode,
-              history,
-              inspectionSnapshot: finalCtx.summaryText,
-              delegationPhase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
-            })
-          : buildDryRunManagerAuditReply({
-              managerNode,
-              nodes: ordered,
-              taskPrompt,
-              sandboxFiles: finalFiles,
-              toolCalls: allToolCalls,
-              openBugs: finalBugs,
-              alreadyDelegatedKeys: delegatedKeys,
-              phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
-              allowTerminate: true,
+      let rawFinalMgr: string;
+      let finalMgrStructured: StructuredToolInvocation[] = [];
+      let finalMgrUsage: TokenUsage;
+      if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
+        const liveMgr = await generateLiveAgentReply({
+          ai,
+          node: managerNode,
+          history,
+          inspectionSnapshot: finalCtx.summaryText,
+          delegationPhase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
+          signal: abortController.signal,
+          onChunk: (accumulatedText) => {
+            broadcastEvent(runId, {
+              id: `chunk-${runId}-${managerNode.id}-${roundsExecuted}`,
+              runId,
+              type: 'agent_chunk',
+              round: roundsExecuted,
+              agentId: managerNode.id,
+              agentName: managerNode.data.label,
+              role: managerNode.data.role,
+              provider: managerNode.data.provider,
+              model: managerNode.data.model,
+              content: accumulatedText,
+              timestamp: new Date().toISOString(),
             });
+          },
+        });
+        rawFinalMgr = liveMgr.text;
+        finalMgrStructured = liveMgr.structuredTools;
+        finalMgrUsage = liveMgr.tokenUsage;
+      } else {
+        rawFinalMgr = buildDryRunManagerAuditReply({
+          managerNode,
+          nodes: ordered,
+          taskPrompt,
+          sandboxFiles: finalFiles,
+          toolCalls: allToolCalls,
+          openBugs: finalBugs,
+          alreadyDelegatedKeys: delegatedKeys,
+          phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
+          allowTerminate: true,
+        });
+        finalMgrUsage = estimateTokenUsage(finalCtx.summaryText, rawFinalMgr);
+      }
       const finalMgrClean = processAndBroadcastManagerDelegations({
         reply: rawFinalMgr,
         runId,
@@ -1720,6 +1954,15 @@ async function executeWorkflowRun(params: {
         roundNum: roundsExecuted,
         phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
       }).cleanedReply;
+      applyStructuredMetaTools({
+        structuredTools: finalMgrStructured,
+        runId,
+        workflowId: workflow.id,
+        node: managerNode,
+        nodes: ordered,
+        roundNum: roundsExecuted,
+        phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
+      });
       broadcastEvent(runId, {
         id: crypto.randomUUID(),
         runId,
@@ -1731,6 +1974,8 @@ async function executeWorkflowRun(params: {
         provider: managerNode.data.provider,
         model: managerNode.data.model,
         content: finalMgrClean,
+        durationMs: Date.now() - mgrStartedAt,
+        tokenUsage: finalMgrUsage,
         timestamp: new Date().toISOString(),
       });
     }
@@ -1755,6 +2000,27 @@ async function executeWorkflowRun(params: {
       completed: true,
     });
   } catch (err) {
+    if (abortController.signal.aborted) {
+      const existingEvents = runEventBuffers.get(runId) ?? [];
+      if (!existingEvents.some((e) => e.type === 'run_cancelled')) {
+        broadcastEvent(runId, {
+          id: crypto.randomUUID(),
+          runId,
+          type: 'run_cancelled',
+          round: roundsExecuted,
+          content: `Execution stopped by operator after ${roundsExecuted} round(s).`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      updateRunRecord({
+        id: runId,
+        status: 'cancelled',
+        roundsExecuted,
+        events: runEventBuffers.get(runId) ?? [],
+        completed: true,
+      });
+      return;
+    }
     const settings = getAppSettings();
     const formatted = formatGeminiApiError(err, settings.language);
     const message = formatted.message || (err instanceof Error ? err.message : 'Unexpected execution failure');
@@ -1773,12 +2039,51 @@ async function executeWorkflowRun(params: {
       events: runEventBuffers.get(runId) ?? [],
       completed: true,
     });
+  } finally {
+    runAbortControllers.delete(runId);
   }
 }
 
 // REST API Routes
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', sqlite: true });
+});
+
+app.get('/api/auth/status', (req, res) => {
+  res.json({
+    authEnabled: isOperatorAuthEnabled(),
+    authenticated: isRequestAuthorized(req),
+  });
+});
+
+app.post('/api/auth/login', authLoginLimiter, (req, res) => {
+  const expected = getConfiguredOperatorAuthToken();
+  if (!expected) {
+    res.json({ authenticated: true, authEnabled: false });
+    return;
+  }
+  const { token } = (req.body ?? {}) as { token?: string };
+  if (!token || !safeEqualSecret(token.trim(), expected)) {
+    res.status(401).json({
+      authenticated: false,
+      error: 'Invalid operator access token.',
+    });
+    return;
+  }
+  const signed = createSignedSessionToken(expected);
+  res.setHeader(
+    'Set-Cookie',
+    `${getSessionCookieName()}=${encodeURIComponent(signed)}; Path=/; HttpOnly; SameSite=Lax`,
+  );
+  res.json({ authenticated: true, authEnabled: true });
+});
+
+app.post('/api/auth/logout', (_req, res) => {
+  res.setHeader(
+    'Set-Cookie',
+    `${getSessionCookieName()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+  );
+  res.json({ authenticated: false });
 });
 
 app.get('/api/capabilities', (_req, res) => {
@@ -1823,7 +2128,7 @@ app.delete('/api/provider-keys/:secretName', (req, res) => {
   });
 });
 
-app.post('/api/provider-keys/test', async (req, res) => {
+app.post('/api/provider-keys/test', providerTestLimiter, async (req, res) => {
   const { provider, secretName, baseUrl, apiKey, model, language } = req.body as {
     provider?: WorkflowNode['data']['provider'];
     secretName?: string;
@@ -2138,6 +2443,20 @@ app.get('/api/projects/:id', (req, res) => {
   res.json(proj);
 });
 
+app.get('/api/projects/:id/diff', (req, res) => {
+  const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
+  const proj = getImportedProjectById(req.params.id);
+  const currDir = safeId ? path.join(PROJECTS_BASE, safeId) : '';
+  if (!proj && (!currDir || !fs.existsSync(currDir))) {
+    res.status(404).json({ error: 'Imported project not found' });
+    return;
+  }
+  const originals = listImportedProjectFilesFromDisk(req.params.id, true);
+  const current = listImportedProjectFilesFromDisk(req.params.id, false);
+  const diffs = buildProjectDiffEntries({ originals, current });
+  res.json({ projectId: req.params.id, diffs });
+});
+
 app.put('/api/projects/:id', (req, res) => {
   const patch = req.body as Partial<ImportedProjectAnalysis>;
   if (!patch || typeof patch !== 'object') {
@@ -2160,6 +2479,10 @@ app.delete('/api/projects/:id', (req, res) => {
       const projDir = path.join(PROJECTS_BASE, safeId);
       if (fs.existsSync(projDir)) {
         fs.rmSync(projDir, { recursive: true, force: true });
+      }
+      const origDir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
+      if (fs.existsSync(origDir)) {
+        fs.rmSync(origDir, { recursive: true, force: true });
       }
     }
   } catch {
@@ -2337,7 +2660,19 @@ app.get('/api/runs/:id/files', (req, res) => {
   res.json(listSandboxFiles(req.params.id));
 });
 
-app.post('/api/runs', (req, res) => {
+app.get('/api/runs/:id/diff', (req, res) => {
+  const runId = req.params.id;
+  const summary = getRunSummaryById(runId);
+  const wf = summary ? getWorkflowById(summary.workflowId) : null;
+  const originals = wf?.projectContext?.projectId
+    ? listImportedProjectFilesFromDisk(wf.projectContext.projectId, true)
+    : [];
+  const current = listSandboxFilesReadOnly(runId);
+  const diffs = buildProjectDiffEntries({ originals, current });
+  res.json({ runId, diffs });
+});
+
+app.post('/api/runs', runStartLimiter, (req, res) => {
   const { workflowId, taskPrompt, workflow: inlineWorkflow, mode } = req.body as {
     workflowId?: string;
     taskPrompt?: string;
@@ -2458,6 +2793,183 @@ app.post('/api/runs/:id/approve', (req, res) => {
   res.json({ runId: req.params.id, approvalId, approved: Boolean(approved) });
 });
 
+app.post('/api/runs/:id/stop', (req, res) => {
+  const runId = req.params.id;
+  const controller = runAbortControllers.get(runId);
+  const summary = getRunSummaryById(runId);
+
+  if (!controller && !summary) {
+    res.status(404).json({ error: 'Execution run not found.' });
+    return;
+  }
+
+  // Abort active loop/LLM calls and reject any pending HITL approval gates
+  controller?.abort();
+  const pendingIds = pendingApprovalsByRun.get(runId);
+  if (pendingIds) {
+    for (const approvalId of Array.from(pendingIds)) {
+      const resolver = pendingApprovals.get(approvalId);
+      if (resolver) {
+        resolver(false);
+        pendingApprovals.delete(approvalId);
+      }
+    }
+    pendingApprovalsByRun.delete(runId);
+  }
+
+  const buffered = runEventBuffers.get(runId) ?? getRunEvents(runId);
+  const roundsExecuted = buffered.reduce((max, e) => (e.round > max ? e.round : max), summary?.roundsExecuted ?? 0);
+
+  if (!buffered.some((e) => e.type === 'run_cancelled')) {
+    broadcastEvent(runId, {
+      id: crypto.randomUUID(),
+      runId,
+      type: 'run_cancelled',
+      round: roundsExecuted,
+      content: `Execution stopped by operator after ${roundsExecuted} round(s).`,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  updateRunRecord({
+    id: runId,
+    status: 'cancelled',
+    roundsExecuted,
+    events: runEventBuffers.get(runId) ?? buffered,
+    completed: true,
+  });
+
+  res.json({ ok: true, runId, status: 'cancelled' });
+});
+
+app.delete('/api/runs/:id', (req, res) => {
+  const runId = req.params.id;
+  runAbortControllers.get(runId)?.abort();
+  runAbortControllers.delete(runId);
+  runEventBuffers.delete(runId);
+  const safeId = runId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (safeId) {
+    const runDir = path.join(SANDBOX_BASE, safeId);
+    if (fs.existsSync(runDir)) {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  }
+  const deleted = deleteRunRecord(runId);
+  res.json({ deleted });
+});
+
+app.get('/api/workflows/:id/memory', (req, res) => {
+  const wf = getWorkflowById(req.params.id);
+  if (!wf) {
+    res.status(404).json({ error: 'Workflow not found.' });
+    return;
+  }
+  const priorRuns = listRecentWorkflowRunsWithSummary(wf.id, 5);
+  const openBugs = listBugReports({ workflowId: wf.id }).filter((b) => b.status !== 'resolved');
+  const workspaceFiles = wf.projectContext?.projectId
+    ? listImportedProjectFilesFromDisk(wf.projectContext.projectId).map((f) => ({
+        path: f.path,
+        size: f.content.length,
+      }))
+    : [];
+  const summary = buildWorkflowMemorySnapshot({ priorRuns, openBugs, workspaceFiles });
+  res.json({
+    workflowId: wf.id,
+    memoryEnabled: wf.memoryEnabled !== false,
+    priorRunCount: priorRuns.length,
+    openBugCount: openBugs.length,
+    fileCount: workspaceFiles.length,
+    summary,
+  });
+});
+
+app.delete('/api/workflows/:id/memory', (req, res) => {
+  const deletedRuns = clearWorkflowRunsMemory(req.params.id);
+  res.json({ cleared: true, deletedRuns });
+});
+
+app.post('/api/webhooks/:workflowId', webhookLimiter, (req, res) => {
+  const wf = getWorkflowById(req.params.workflowId);
+  if (!wf) {
+    res.status(404).json({ error: 'Workflow not found.' });
+    return;
+  }
+  if (wf.webhookEnabled === false) {
+    res.status(403).json({ error: 'Webhook trigger is disabled for this workflow.' });
+    return;
+  }
+
+  if (wf.webhookSecret && wf.webhookSecret.trim()) {
+    const expected = wf.webhookSecret.trim();
+    const headerSecret =
+      (typeof req.headers['x-webhook-secret'] === 'string' ? req.headers['x-webhook-secret'] : '') ||
+      (typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')
+        ? req.headers.authorization.slice(7)
+        : '') ||
+      (typeof req.query.secret === 'string' ? req.query.secret : '');
+    if (!safeEqualSecret(headerSecret.trim(), expected)) {
+      res.status(401).json({ error: 'Invalid or missing webhook secret.' });
+      return;
+    }
+  }
+
+  const body = (req.body ?? {}) as {
+    taskPrompt?: string;
+    prompt?: string;
+    message?: string;
+    mode?: 'live' | 'dry_run';
+    payload?: unknown;
+  };
+  const rawPrompt =
+    (typeof body.taskPrompt === 'string' && body.taskPrompt.trim()) ||
+    (typeof body.prompt === 'string' && body.prompt.trim()) ||
+    (typeof body.message === 'string' && body.message.trim()) ||
+    (body.payload !== undefined
+      ? `Webhook event payload:\n${JSON.stringify(body.payload, null, 2).slice(0, 1200)}`
+      : Object.keys(body).length > 0
+        ? `Webhook event payload:\n${JSON.stringify(body, null, 2).slice(0, 1200)}`
+        : wf.description || `Triggered via external webhook for ${wf.name}`);
+
+  const validation = validateWorkflowForRun(wf, rawPrompt);
+  if (!validation.valid) {
+    res.status(400).json({ error: validation.errors[0], errors: validation.errors });
+    return;
+  }
+
+  const resolvedMode: 'live' | 'dry_run' =
+    body.mode === 'live' || body.mode === 'dry_run'
+      ? body.mode
+      : canWorkflowRunLive(wf.nodes, getAppSettings())
+        ? 'live'
+        : 'dry_run';
+
+  const runId = crypto.randomUUID();
+  runEventBuffers.set(runId, []);
+  createRunRecord({
+    id: runId,
+    workflowId: wf.id,
+    workflowName: `${wf.name} · Webhook`,
+    taskPrompt: rawPrompt,
+    mode: resolvedMode,
+    maxRounds: clampMaxRounds(wf.maxRounds),
+  });
+
+  void executeWorkflowRun({
+    runId,
+    workflow: wf,
+    taskPrompt: rawPrompt,
+    mode: resolvedMode,
+  });
+
+  res.status(202).json({
+    accepted: true,
+    runId,
+    workflowId: wf.id,
+    mode: resolvedMode,
+    status: 'running',
+  });
+});
+
 app.post('/api/chat/enhance-prompt', async (req, res) => {
   const { instruction, targetNode, language } = req.body as {
     instruction?: string;
@@ -2489,23 +3001,22 @@ app.post('/api/chat/enhance-prompt', async (req, res) => {
 
   const isPersian = language === 'fa' || /[\u0600-\u06FF]/.test(clean);
   const sysPrompt =
-    `You are a Senior Prompt Architect for a multi-agent software engineering platform.\n` +
-    `Rewrite the user's plain-language request into a crisp, concrete, actionable engineering prompt tailored for: ${targetDesc}.\n` +
-    `Rules:\n` +
+    `Rewrite into a crisp engineering prompt (<=90 words) for ${targetDesc} with Objective, Requirements, Acceptance Criteria. ` +
     (isPersian
-      ? `- CRITICAL: The user wrote in Persian/Farsi. You MUST write the entire rewritten prompt in fluent Persian/Farsi (keeping only technical keywords like WRITE_FILE:<path> or EXEC_BASH:<command> in English).\n`
-      : `- Write the rewritten prompt in clear English.\n`) +
-    `- Keep it structured and concise (under 140 words) with clear Objective, Technical Requirements, and Acceptance Criteria.\n` +
-    `- Where appropriate for enabled tools, mention WRITE_FILE:<path> or EXEC_BASH:<command> conventions.\n` +
-    `- Output ONLY the rewritten prompt text with no preamble or markdown chatter.`;
+      ? `Write in concise Persian/Farsi (keep tool tags like WRITE_FILE:<path> or EXEC_BASH:<cmd> in English). `
+      : `Write in concise English. `) +
+    `Output ONLY the prompt.`;
 
   for (const modelName of ['gemini-3.1-flash-lite', 'gemini-4-argon']) {
     try {
       const response = await ai.models.generateContent({
         model: modelName,
-        contents: `User plain instruction:\n${clean}`,
+        contents: clean,
         config: {
           systemInstruction: sysPrompt,
+          ...(/^gemini-4-/i.test(modelName)
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+            : {}),
           httpOptions: { timeout: 10000 },
         },
       });
@@ -2568,10 +3079,38 @@ async function executeDirectAgentTurn(params: {
       history.push({ role: 'user', content: userMessage });
     }
 
-    const rawReply =
-      mode === 'live' && canNodeRunLive(targetNode, settingsForDirect)
-        ? await generateLiveGeminiReply({ ai, node: targetNode, history })
-        : buildDryRunDirectReply(targetNode, userMessage);
+    const turnStartedAt = Date.now();
+    let rawReply: string;
+    let structuredTools: StructuredToolInvocation[] = [];
+    let turnTokenUsage: TokenUsage;
+    if (mode === 'live' && canNodeRunLive(targetNode, settingsForDirect)) {
+      const liveRes = await generateLiveAgentReply({
+        ai,
+        node: targetNode,
+        history,
+        onChunk: (accumulatedText) => {
+          broadcastEvent(runId, {
+            id: `chunk-${runId}-${targetNode.id}-${roundNum}`,
+            runId,
+            type: 'agent_chunk',
+            round: roundNum,
+            agentId: targetNode.id,
+            agentName: targetNode.data.label,
+            role: targetNode.data.role,
+            provider: targetNode.data.provider,
+            model: targetNode.data.model,
+            content: accumulatedText,
+            timestamp: new Date().toISOString(),
+          });
+        },
+      });
+      rawReply = liveRes.text;
+      structuredTools = liveRes.structuredTools;
+      turnTokenUsage = liveRes.tokenUsage;
+    } else {
+      rawReply = buildDryRunDirectReply(targetNode, userMessage);
+      turnTokenUsage = estimateTokenUsage(userMessage, rawReply);
+    }
 
     const reply = processAndBroadcastBugReports({
       reply: rawReply,
@@ -2580,6 +3119,15 @@ async function executeDirectAgentTurn(params: {
       node: targetNode,
       roundNum,
     });
+    applyStructuredMetaTools({
+      structuredTools,
+      runId,
+      workflowId: workflow.id,
+      node: targetNode,
+      nodes: workflow.nodes,
+      roundNum,
+      phase: 'review',
+    });
 
     const settings = getAppSettings();
     const toolCalls = await processAgentTools({
@@ -2587,6 +3135,7 @@ async function executeDirectAgentTurn(params: {
       workflow,
       node: targetNode,
       reply,
+      structuredTools,
       roundNum,
       mode,
       settings,
@@ -2603,6 +3152,8 @@ async function executeDirectAgentTurn(params: {
       provider: targetNode.data.provider,
       model: targetNode.data.model,
       content: reply,
+      durationMs: Date.now() - turnStartedAt,
+      tokenUsage: turnTokenUsage,
       toolCalls,
       timestamp: new Date().toISOString(),
     });
@@ -2704,23 +3255,47 @@ async function executeGroupDiscussionRound(params: {
     for (let idx = 0; idx < activeSpeakers.length; idx++) {
       const speaker = activeSpeakers[idx];
       currentRound = baseRound + idx;
+      const turnStartedAt = Date.now();
 
-      const rawReply =
-        mode === 'live' && canNodeRunLive(speaker, groupSettings)
-          ? await generateLiveGeminiReply({
-              ai,
-              node: speaker,
-              history,
-              isGroupDiscussion: true,
-              teammates: activeSpeakers
-                .filter((n) => n.id !== speaker.id)
-                .map((n) => `${n.data.label} (${n.data.role})`),
-            })
-          : buildDryRunGroupDiscussionReply({
-              node: speaker,
-              userMessage,
-              priorSpeakers,
+      let rawReply: string;
+      let structuredTools: StructuredToolInvocation[] = [];
+      let turnTokenUsage: TokenUsage;
+      if (mode === 'live' && canNodeRunLive(speaker, groupSettings)) {
+        const liveRes = await generateLiveAgentReply({
+          ai,
+          node: speaker,
+          history,
+          isGroupDiscussion: true,
+          teammates: activeSpeakers
+            .filter((n) => n.id !== speaker.id)
+            .map((n) => `${n.data.label} (${n.data.role})`),
+          onChunk: (accumulatedText) => {
+            broadcastEvent(runId, {
+              id: `chunk-${runId}-${speaker.id}-${currentRound}`,
+              runId,
+              type: 'agent_chunk',
+              round: currentRound,
+              agentId: speaker.id,
+              agentName: speaker.data.label,
+              role: speaker.data.role,
+              provider: speaker.data.provider,
+              model: speaker.data.model,
+              content: accumulatedText,
+              timestamp: new Date().toISOString(),
             });
+          },
+        });
+        rawReply = liveRes.text;
+        structuredTools = liveRes.structuredTools;
+        turnTokenUsage = liveRes.tokenUsage;
+      } else {
+        rawReply = buildDryRunGroupDiscussionReply({
+          node: speaker,
+          userMessage,
+          priorSpeakers,
+        });
+        turnTokenUsage = estimateTokenUsage(userMessage, rawReply);
+      }
 
       const withoutBugs = processAndBroadcastBugReports({
         reply: rawReply,
@@ -2741,12 +3316,23 @@ async function executeGroupDiscussionRound(params: {
           }).cleanedReply
         : withoutBugs;
 
+      applyStructuredMetaTools({
+        structuredTools,
+        runId,
+        workflowId: workflow.id,
+        node: speaker,
+        nodes: workflow.nodes,
+        roundNum: currentRound,
+        phase: 'review',
+      });
+
       const settings = getAppSettings();
       const toolCalls = await processAgentTools({
         runId,
         workflow,
         node: speaker,
         reply,
+        structuredTools,
         roundNum: currentRound,
         mode,
         settings,
@@ -2775,6 +3361,8 @@ async function executeGroupDiscussionRound(params: {
         provider: speaker.data.provider,
         model: speaker.data.model,
         content: reply,
+        durationMs: Date.now() - turnStartedAt,
+        tokenUsage: turnTokenUsage,
         toolCalls,
         timestamp: new Date().toISOString(),
       });
@@ -2801,30 +3389,54 @@ async function executeGroupDiscussionRound(params: {
       });
       if (ctx.hasIssues || turnToolCalls.length > 0 || runBugs.length > 0) {
         currentRound += 1;
-        const rawAudit =
-          mode === 'live' && canNodeRunLive(managerNode, getAppSettings())
-            ? await generateLiveGeminiReply({
-                ai,
-                node: managerNode,
-                history,
-                isGroupDiscussion: true,
-                inspectionSnapshot: ctx.summaryText,
-                delegationPhase: 'review',
-                teammates: activeSpeakers
-                  .filter((n) => n.id !== managerNode.id)
-                  .map((n) => `${n.data.label} (${n.data.role})`),
-              })
-            : buildDryRunManagerAuditReply({
-                managerNode,
-                nodes: workflow.nodes,
-                taskPrompt: userMessage,
-                sandboxFiles: listSandboxFiles(runId),
-                toolCalls: turnToolCalls,
-                openBugs: runBugs,
-                alreadyDelegatedKeys: delegatedKeys,
-                phase: 'review',
-                allowTerminate: false,
+        const mgrStartedAt = Date.now();
+        let rawAudit: string;
+        let auditStructured: StructuredToolInvocation[] = [];
+        let auditTokenUsage: TokenUsage;
+        if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
+          const liveAudit = await generateLiveAgentReply({
+            ai,
+            node: managerNode,
+            history,
+            isGroupDiscussion: true,
+            inspectionSnapshot: ctx.summaryText,
+            delegationPhase: 'review',
+            teammates: activeSpeakers
+              .filter((n) => n.id !== managerNode.id)
+              .map((n) => `${n.data.label} (${n.data.role})`),
+            onChunk: (accumulatedText) => {
+              broadcastEvent(runId, {
+                id: `chunk-${runId}-${managerNode.id}-${currentRound}`,
+                runId,
+                type: 'agent_chunk',
+                round: currentRound,
+                agentId: managerNode.id,
+                agentName: managerNode.data.label,
+                role: managerNode.data.role,
+                provider: managerNode.data.provider,
+                model: managerNode.data.model,
+                content: accumulatedText,
+                timestamp: new Date().toISOString(),
               });
+            },
+          });
+          rawAudit = liveAudit.text;
+          auditStructured = liveAudit.structuredTools;
+          auditTokenUsage = liveAudit.tokenUsage;
+        } else {
+          rawAudit = buildDryRunManagerAuditReply({
+            managerNode,
+            nodes: workflow.nodes,
+            taskPrompt: userMessage,
+            sandboxFiles: listSandboxFiles(runId),
+            toolCalls: turnToolCalls,
+            openBugs: runBugs,
+            alreadyDelegatedKeys: delegatedKeys,
+            phase: 'review',
+            allowTerminate: false,
+          });
+          auditTokenUsage = estimateTokenUsage(ctx.summaryText, rawAudit);
+        }
 
         const auditCleaned = processAndBroadcastManagerDelegations({
           reply: rawAudit,
@@ -2834,6 +3446,15 @@ async function executeGroupDiscussionRound(params: {
           roundNum: currentRound,
           phase: 'review',
         }).cleanedReply;
+        applyStructuredMetaTools({
+          structuredTools: auditStructured,
+          runId,
+          workflowId: workflow.id,
+          node: managerNode,
+          nodes: workflow.nodes,
+          roundNum: currentRound,
+          phase: 'review',
+        });
 
         broadcastEvent(runId, {
           id: crypto.randomUUID(),
@@ -2846,6 +3467,8 @@ async function executeGroupDiscussionRound(params: {
           provider: managerNode.data.provider,
           model: managerNode.data.model,
           content: auditCleaned,
+          durationMs: Date.now() - mgrStartedAt,
+          tokenUsage: auditTokenUsage,
           timestamp: new Date().toISOString(),
         });
       }
@@ -2888,7 +3511,7 @@ async function executeGroupDiscussionRound(params: {
   }
 }
 
-app.post('/api/chat/message', (req, res) => {
+app.post('/api/chat/message', chatLimiter, (req, res) => {
   const {
     runId: existingRunId,
     workflowId,
@@ -3235,11 +3858,16 @@ app.get('/api/blueprint', (_req, res) => {
   res.json({ files });
 });
 
-function listImportedProjectFilesFromDisk(projectId?: string): Array<{ path: string; content: string }> {
+function listImportedProjectFilesFromDisk(
+  projectId?: string,
+  preferOriginals = false,
+): Array<{ path: string; content: string }> {
   if (!projectId) return [];
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
   if (!safeId) return [];
-  const dir = path.join(PROJECTS_BASE, safeId);
+  const origDir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
+  const currDir = path.join(PROJECTS_BASE, safeId);
+  const dir = preferOriginals && fs.existsSync(origDir) ? origDir : currDir;
   if (!fs.existsSync(dir)) return [];
 
   const result: Array<{ path: string; content: string }> = [];
@@ -3390,7 +4018,7 @@ function collectExportBundleForServer(params: {
   const sandboxFiles = resolveSandboxFilesForExport(workflow, params.runId);
   const importedProjectFiles =
     scope === 'project_bundle' || scope === 'sandbox_only'
-      ? listImportedProjectFilesFromDisk(workflow.projectContext?.projectId)
+      ? listImportedProjectFilesFromDisk(workflow.projectContext?.projectId, true)
       : [];
   const studioSourceFiles = scope === 'full_studio' ? listStudioSourceFilesFromDisk() : [];
   const bugReports = listBugReports({ workflowId: workflow.id });
@@ -3703,7 +4331,7 @@ app.post('/api/github/push', async (req, res) => {
     // If repository is completely empty (0 commits), bootstrap initial file via Contents API
     if (!parentCommitSha) {
       const readmeFile =
-        bundle.files.find((f) => f.path === 'AETHERFLOW_WORKFLOW.md') ?? bundle.files[0];
+        bundle.files.find((f) => f.path === 'README.md') ?? bundle.files[0];
       const initRes = await ghFetch(
         `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(readmeFile.path)}`,
         {
@@ -4098,69 +4726,8 @@ app.post('/api/workflows/:id/continuous/stop', (req, res) => {
 });
 
 // =============================================================================
-// Strict Pre-Launch Final Test Gate (4 Categories, 14 Test Types)
+// Strict Pre-Launch Final Test Gate (4 Categories, 14+ Test Types)
 // =============================================================================
-function collectSourceFilesForAudit(
-  rootDir: string,
-  maxFiles = 80,
-): Array<{ path: string; content: string }> {
-  const out: Array<{ path: string; content: string }> = [];
-  const skipDirs = new Set([
-    'node_modules',
-    '.git',
-    'dist',
-    'data',
-    '.playwright-cli',
-    '.aistudio',
-  ]);
-  const allowedExt = new Set([
-    '.ts',
-    '.tsx',
-    '.js',
-    '.jsx',
-    '.mjs',
-    '.py',
-    '.css',
-    '.html',
-    '.json',
-    '.yml',
-    '.yaml',
-    '.sh',
-  ]);
-
-  function walk(dir: string) {
-    if (out.length >= maxFiles || !fs.existsSync(dir)) return;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (out.length >= maxFiles) break;
-      if (skipDirs.has(entry.name)) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-      } else if (entry.isFile()) {
-        const ext = path.extname(entry.name).toLowerCase();
-        if (!allowedExt.has(ext)) continue;
-        try {
-          const stat = fs.statSync(full);
-          if (stat.size > 260_000) continue;
-          const rel = path.relative(rootDir, full).replace(/\\/g, '/');
-          out.push({ path: rel, content: fs.readFileSync(full, 'utf-8') });
-        } catch {
-          // ignore unreadable file
-        }
-      }
-    }
-  }
-
-  walk(rootDir);
-  return out;
-}
-
 app.get('/api/prelaunch-tests/latest', (req, res) => {
   const workflowId = typeof req.query.workflowId === 'string' ? req.query.workflowId : undefined;
   const report = getLatestPrelaunchReport(workflowId);
@@ -4168,522 +4735,38 @@ app.get('/api/prelaunch-tests/latest', (req, res) => {
 });
 
 app.post('/api/prelaunch-tests/run', async (req, res) => {
-  const startedAt = Date.now();
-  const { workflowId, workflow: inlineWorkflow, runId, strictMode } = req.body as {
-    workflowId?: string;
-    workflow?: WorkflowConfig;
-    runId?: string;
-    strictMode?: boolean;
-  };
-
-  const wf: WorkflowConfig =
-    inlineWorkflow ??
-    (workflowId ? getWorkflowById(workflowId) : null) ?? {
-      id: workflowId || 'default-workflow',
-      name: 'Studio Project',
-      description: '',
-      maxRounds: 6,
-      humanInTheLoop: true,
-      nodes: [],
-      edges: [],
-      updatedAt: new Date().toISOString(),
+  try {
+    const { workflowId, workflow: inlineWorkflow, runId, strictMode } = req.body as {
+      workflowId?: string;
+      workflow?: WorkflowConfig;
+      runId?: string;
+      strictMode?: boolean;
     };
-
-  const isStrict = strictMode ?? wf.strictPrelaunchGate ?? true;
-  const sandboxFiles = runId ? listSandboxFiles(runId) : [];
-  const projectId = wf.projectContext?.projectId?.replace(/[^a-zA-Z0-9_-]/g, '');
-  const projectDir = projectId ? path.join(PROJECTS_BASE, projectId) : '';
-  const hasImportedDir = Boolean(projectDir && fs.existsSync(projectDir));
-
-  const targetRoot = hasImportedDir ? projectDir : process.cwd();
-  const targetScope = hasImportedDir
-    ? `Imported Project (${wf.projectContext?.name ?? projectId})`
-    : sandboxFiles.length > 0
-      ? `Studio + Sandbox (${sandboxFiles.length} files)`
-      : 'Studio Codebase';
-
-  const sourceFiles = collectSourceFilesForAudit(targetRoot);
-  const combinedAuditFiles = [
-    ...sourceFiles,
-    ...sandboxFiles.map((f) => ({ path: `sandbox/${f.path}`, content: f.content })),
-  ];
-
-  const results: PrelaunchTestResult[] = [];
-  const localBase = `http://127.0.0.1:${PORT}`;
-  const settings = getAppSettings();
-  const allBugs = listBugReports({ workflowId: wf.id });
-  const openBugs = allBugs.filter((b) => b.status !== 'resolved');
-  const recentRuns = listRunSummaries(15).filter((r) => !wf.id || r.workflowId === wf.id);
-
-  // 1. Unit Testing
-  {
-    const t0 = Date.now();
-    const localTsx = path.resolve(process.cwd(), 'node_modules/.bin/tsx');
-    const tsxBin = fs.existsSync(localTsx) ? localTsx : 'npx --yes tsx';
-    const unitRes = await runSandboxCommand(
-      process.cwd(),
-      `${tsxBin} --test src/utils/*.test.ts`,
-      25000,
-    );
-    const output = [unitRes.stdout, unitRes.stderr].filter(Boolean).join('\n');
-    const passMatch = output.match(/# pass (\d+)/);
-    const failMatch = output.match(/# fail (\d+)/);
-    const passCount = passMatch ? Number(passMatch[1]) : 0;
-    const failCount = failMatch ? Number(failMatch[1]) : unitRes.exitCode === 0 ? 0 : 1;
-    const ok = unitRes.exitCode === 0 && failCount === 0;
-    results.push({
-      id: 'unit',
-      category: 'core_technical',
-      severity: 'critical',
-      status: ok ? 'pass' : 'fail',
-      score: ok ? 100 : 25,
-      durationMs: Date.now() - t0,
-      summaryEn: ok
-        ? `Executed ${passCount || 'all'} unit tests cleanly with 0 failures.`
-        : `Unit test suite exited with code ${unitRes.exitCode} (${failCount} failed).`,
-      summaryFa: ok
-        ? `${passCount || 'تمامی'} تست واحد با موفقیت و بدون خطا اجرا شدند.`
-        : `اجرای تست واحد با کد خطا ${unitRes.exitCode} و ${failCount} مورد ناموفق متوقف شد.`,
-      evidence: [
-        `Command: tsx --test src/utils/*.test.ts`,
-        `Exit code: ${unitRes.exitCode}, Passed: ${passCount}, Failed: ${failCount}`,
-      ],
-      recommendationEn: ok ? undefined : 'Fix failing unit test assertions in src/utils/*.test.ts before launch.',
-      recommendationFa: ok ? undefined : 'تست‌های واحد ناموفق را پیش از لانچ اصلاح کنید.',
+    const report = await runPrelaunchTestSuite({
+      workflowId,
+      inlineWorkflow,
+      runId,
+      strictMode,
+      port: PORT,
+      projectsBase: PROJECTS_BASE,
+      listSandboxFiles,
+      runSandboxCommand,
     });
+    res.json({ report });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Pre-launch test execution failed.';
+    res.status(500).json({ error: message });
   }
-
-  // 2. Integration Testing
-  {
-    const t0 = Date.now();
-    const integrationProbes = await Promise.all([
-      fetch(`${localBase}/api/workflows`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
-      fetch(`${localBase}/api/settings`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
-      fetch(`${localBase}/api/capabilities`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
-      fetch(`${localBase}/api/runs`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
-    ]);
-    const passed = integrationProbes.filter(Boolean).length;
-    const ok = passed === integrationProbes.length;
-    results.push({
-      id: 'integration',
-      category: 'core_technical',
-      severity: 'critical',
-      status: ok ? 'pass' : passed >= 2 ? 'warn' : 'fail',
-      score: Math.round((passed / integrationProbes.length) * 100),
-      durationMs: Date.now() - t0,
-      summaryEn: `${passed}/${integrationProbes.length} core REST/SQLite integration routes verified.`,
-      summaryFa: `${passed} از ${integrationProbes.length} مسیر یکپارچه‌سازی API و SQLite تایید شد.`,
-      evidence: [
-        `Probed /api/workflows, /api/settings, /api/capabilities, /api/runs`,
-        `SQLite workflows persisted: ${listWorkflows().length}`,
-      ],
-      recommendationEn: ok ? undefined : 'Ensure backend API routes and SQLite database connections respond HTTP 200.',
-      recommendationFa: ok ? undefined : 'از پاسخگویی سالم تمام سرویس‌های API و اتصال SQLite مطمئن شوید.',
-    });
-  }
-
-  // 3. System Testing
-  {
-    const t0 = Date.now();
-    const localTsc = path.resolve(process.cwd(), 'node_modules/.bin/tsc');
-    const tscBin = fs.existsSync(localTsc) ? localTsc : 'npx --yes tsc';
-    const tscRes = await runSandboxCommand(process.cwd(), `${tscBin} --noEmit`, 25000);
-    const pyRes = await runSandboxCommand(
-      process.cwd(),
-      'python3 -m py_compile deploy/backend/*.py',
-      15000,
-    );
-    const hasDistOrSrc = fs.existsSync(path.resolve(process.cwd(), 'src/App.tsx'));
-    const ok = tscRes.exitCode === 0 && pyRes.exitCode === 0 && hasDistOrSrc;
-    results.push({
-      id: 'system',
-      category: 'core_technical',
-      severity: 'critical',
-      status: ok ? 'pass' : 'fail',
-      score: ok ? 100 : tscRes.exitCode === 0 ? 60 : 20,
-      durationMs: Date.now() - t0,
-      summaryEn: ok
-        ? 'Full-system TypeScript typecheck (tsc --noEmit) and Python backend compile passed.'
-        : 'System verification reported compilation or typecheck errors.',
-      summaryFa: ok
-        ? 'بررسی کامل ساختار سیستم (TypeScript و بک‌اند پایتون) بدون خطا تایید شد.'
-        : 'بررسی یکپارچه سیستم با خطای کامپایل یا تایپ مواجه شد.',
-      evidence: [
-        `TypeScript tsc --noEmit exit: ${tscRes.exitCode}`,
-        `Python py_compile exit: ${pyRes.exitCode}`,
-      ],
-      recommendationEn: ok ? undefined : 'Resolve TypeScript/Python errors reported by tsc --noEmit before launch.',
-      recommendationFa: ok ? undefined : 'خطاهای تایپ یا سینتکس سیستم را برطرف کنید.',
-    });
-  }
-
-  // 4. Functional Testing
-  {
-    const t0 = Date.now();
-    const workflowIssues = findMissingWorkflowCoverage(wf);
-    const hasTools = wf.nodes.some((n) => n.data.tools.readFile || n.data.tools.writeFile);
-    const score = workflowIssues.length === 0 && hasTools ? 100 : workflowIssues.length === 1 ? 75 : 40;
-    const status = workflowIssues.length === 0 ? (hasTools ? 'pass' : 'warn') : 'fail';
-    results.push({
-      id: 'functional',
-      category: 'functional_nonfunctional',
-      severity: 'critical',
-      status,
-      score,
-      durationMs: Date.now() - t0,
-      summaryEn:
-        workflowIssues.length === 0
-          ? `Workflow "${wf.name}" has ${wf.nodes.length} active agent(s), ${wf.edges.length} edges, and valid prompts.`
-          : `Functional gaps found: ${workflowIssues.join(' ')}`,
-      summaryFa:
-        workflowIssues.length === 0
-          ? `ساختار کارکردی پروژه «${wf.name}» با ${wf.nodes.length} ایجنت و پرامپت‌های معتبر تایید شد.`
-          : `نقص کارکردی شناسایی شد: ${workflowIssues.join(' ')}`,
-      evidence: [
-        `Agents: ${wf.nodes.length}, Edges: ${wf.edges.length}`,
-        `Sandbox deliverable files: ${sandboxFiles.length}`,
-      ],
-      recommendationEn: workflowIssues.length > 0 ? workflowIssues.join(' ') : undefined,
-      recommendationFa: workflowIssues.length > 0 ? 'حداقل یک مدیر و ایجنت‌های دارای پرامپت معتبر به ورکفلو اضافه کنید.' : undefined,
-    });
-  }
-
-  // 5. Performance Testing
-  {
-    const t0 = Date.now();
-    const probeStart = Date.now();
-    await fetch(`${localBase}/api/health`, { signal: AbortSignal.timeout(3000) }).catch(() => null);
-    const apiLatencyMs = Date.now() - probeStart;
-    const oversizedFiles = combinedAuditFiles.filter((f) => f.content.length > 180_000);
-    const ok = apiLatencyMs < 350 && oversizedFiles.length === 0;
-    const status = apiLatencyMs < 800 && oversizedFiles.length <= 2 ? (ok ? 'pass' : 'warn') : 'fail';
-    results.push({
-      id: 'performance',
-      category: 'functional_nonfunctional',
-      severity: 'high',
-      status,
-      score: ok ? 98 : status === 'warn' ? 78 : 45,
-      durationMs: Date.now() - t0,
-      summaryEn: `API health latency ${apiLatencyMs}ms across ${combinedAuditFiles.length} audited files (${oversizedFiles.length} oversized).`,
-      summaryFa: `زمان پاسخ‌دهی API برابر ${apiLatencyMs} میلی‌ثانیه و بررسی ${combinedAuditFiles.length} فایل (${oversizedFiles.length} فایل سنگین).`,
-      evidence: [
-        `/api/health RTT: ${apiLatencyMs}ms`,
-        `Audited files: ${combinedAuditFiles.length}, Files >180KB: ${oversizedFiles.length}`,
-      ],
-      recommendationEn: ok ? undefined : 'Split oversized source modules or optimize slow endpoints.',
-      recommendationFa: ok ? undefined : 'ماژول‌های حجیم را خرد کنید و زمان پاسخ API را بهینه نمایید.',
-    });
-  }
-
-  // 6. Stress Testing
-  {
-    const t0 = Date.now();
-    const concurrency = 12;
-    const stressResults = await Promise.all(
-      Array.from({ length: concurrency }, () =>
-        fetch(`${localBase}/api/health`, { signal: AbortSignal.timeout(4000) })
-          .then((r) => r.ok)
-          .catch(() => false),
-      ),
-    );
-    const okCount = stressResults.filter(Boolean).length;
-    const guardrailsValid =
-      wf.maxRounds >= 1 &&
-      wf.maxRounds <= 25 &&
-      settings.sandboxTimeoutSec >= 5 &&
-      settings.sandboxMemoryMb >= 256;
-    const ok = okCount === concurrency && guardrailsValid;
-    results.push({
-      id: 'stress',
-      category: 'functional_nonfunctional',
-      severity: 'high',
-      status: ok ? 'pass' : okCount >= 10 ? 'warn' : 'fail',
-      score: Math.round((okCount / concurrency) * (guardrailsValid ? 100 : 80)),
-      durationMs: Date.now() - t0,
-      summaryEn: `Burst probe (${concurrency} concurrent requests): ${okCount}/${concurrency} succeeded; sandbox memory=${settings.sandboxMemoryMb}MB, timeout=${settings.sandboxTimeoutSec}s.`,
-      summaryFa: `تست هم‌زمانی (${concurrency} درخواست موازی): ${okCount} از ${concurrency} موفق؛ سقف حافظه سندباکس ${settings.sandboxMemoryMb}MB و تایم‌اوت ${settings.sandboxTimeoutSec} ثانیه.`,
-      evidence: [
-        `Concurrent /api/health probes passed: ${okCount}/${concurrency}`,
-        `Guardrails: maxRounds=${wf.maxRounds}, sandboxTimeout=${settings.sandboxTimeoutSec}s`,
-      ],
-      recommendationEn: ok ? undefined : 'Check concurrency stability and verify maxRounds / sandbox timeout limits.',
-      recommendationFa: ok ? undefined : 'پایداری درخواست‌های هم‌زمان و محدودیت‌های منابع را بررسی کنید.',
-    });
-  }
-
-  // 7. Security Testing
-  {
-    const t0 = Date.now();
-    const secFindings = scanSourceSecurityIssues(combinedAuditFiles);
-    const hitlActive = wf.humanInTheLoop || settings.globalHumanInTheLoop;
-    const criticalCount = secFindings.filter((f) => f.severity === 'critical').length;
-    const ok = criticalCount === 0 && secFindings.length === 0 && hitlActive;
-    const status = criticalCount > 0 ? 'fail' : secFindings.length > 0 || !hitlActive ? 'warn' : 'pass';
-    results.push({
-      id: 'security',
-      category: 'functional_nonfunctional',
-      severity: 'critical',
-      status,
-      score: criticalCount > 0 ? 15 : secFindings.length > 0 ? 70 : hitlActive ? 100 : 82,
-      durationMs: Date.now() - t0,
-      summaryEn:
-        secFindings.length === 0
-          ? `0 hardcoded secrets or injection/XSS flaws found across ${combinedAuditFiles.length} files (HITL=${hitlActive ? 'ON' : 'OFF'}).`
-          : `Detected ${secFindings.length} security finding(s) (${criticalCount} critical).`,
-      summaryFa:
-        secFindings.length === 0
-          ? `هیچ کلید محرمانه افشاشده یا آسیب‌پذیری تزریق/XSS در ${combinedAuditFiles.length} فایل یافت نشد (تایید انسانی: ${hitlActive ? 'فعال' : 'غیرفعال'}).`
-          : `${secFindings.length} مورد ریسک امنیتی (${criticalCount} بحرانی) شناسایی شد.`,
-      evidence:
-        secFindings.length > 0
-          ? secFindings.slice(0, 5).map((f) => `[${f.severity.toUpperCase()}] ${f.file}: ${f.issue}`)
-          : [`Scanned ${combinedAuditFiles.length} source files`, `HITL approval gate: ${hitlActive}`],
-      recommendationEn:
-        secFindings.length > 0
-          ? 'Remove hardcoded secrets/unsafe patterns immediately and store keys in the encrypted/SQLite Secret Vault.'
-          : !hitlActive
-            ? 'Enable Human-in-the-Loop Gate for production shell safety.'
-            : undefined,
-      recommendationFa:
-        secFindings.length > 0
-          ? 'کلیدهای هاردکد یا الگوهای ناامن را فوراً حذف و از مخزن امن سرور استفاده کنید.'
-          : !hitlActive
-            ? 'برای ایمنی بیشتر، تایید انسانی دستورات حساس را فعال کنید.'
-            : undefined,
-    });
-  }
-
-  // 8. Usability & UI/UX Testing
-  {
-    const t0 = Date.now();
-    const indexHtmlPath = path.resolve(process.cwd(), 'index.html');
-    const indexHtml = fs.existsSync(indexHtmlPath) ? fs.readFileSync(indexHtmlPath, 'utf-8') : '';
-    const hasTitle = /<title>[^<]+<\/title>/i.test(indexHtml);
-    const appSource = combinedAuditFiles
-      .filter((f) => f.path.endsWith('.tsx'))
-      .map((f) => f.content)
-      .join('\n');
-    const hasRtlSupport = appSource.includes("dir={lang === 'fa'") || appSource.includes('dir="auto"');
-    const hasAria = appSource.includes('aria-label') && appSource.includes('role=');
-    const hasDarkClasses = appSource.includes('dark:');
-    const ok = hasTitle && hasRtlSupport && hasAria && hasDarkClasses;
-    results.push({
-      id: 'usability',
-      category: 'ux_compatibility',
-      severity: 'high',
-      status: ok ? 'pass' : 'warn',
-      score: ok ? 96 : 75,
-      durationMs: Date.now() - t0,
-      summaryEn: `UX checks: HTML title=${hasTitle}, RTL/LTR=${hasRtlSupport}, ARIA=${hasAria}, Dark theme=${hasDarkClasses}.`,
-      summaryFa: `بررسی رابط کاربری: پشتیبانی RTL/LTR، برچسب‌های دسترس‌پذیری و تم تیره/روشن ${ok ? 'تایید شد' : 'نیاز به بازبینی دارد'}.`,
-      evidence: [
-        `Document title present: ${hasTitle}`,
-        `Bilingual RTL + ARIA + Dark Mode classes detected: ${hasRtlSupport && hasAria && hasDarkClasses}`,
-      ],
-      recommendationEn: ok ? undefined : 'Ensure semantic ARIA labels, bilingual RTL attributes, and clear error feedback across views.',
-      recommendationFa: ok ? undefined : 'از کامل بودن پشتیبانی RTL و برچسب‌های دسترس‌پذیری اطمینان حاصل کنید.',
-    });
-  }
-
-  // 9. Compatibility Testing
-  {
-    const t0 = Date.now();
-    const indexHtmlPath = path.resolve(process.cwd(), 'index.html');
-    const indexHtml = fs.existsSync(indexHtmlPath) ? fs.readFileSync(indexHtmlPath, 'utf-8') : '';
-    const hasViewportMeta = /name=["']viewport["']/i.test(indexHtml);
-    const hasLinuxStack =
-      fs.existsSync(path.resolve(process.cwd(), 'install-linux.sh')) &&
-      fs.existsSync(path.resolve(process.cwd(), 'Dockerfile')) &&
-      fs.existsSync(path.resolve(process.cwd(), 'docker-compose.yml'));
-    const nodeMajor = Number(process.versions.node.split('.')[0]);
-    const ok = hasViewportMeta && hasLinuxStack && nodeMajor >= 20;
-    results.push({
-      id: 'compatibility',
-      category: 'ux_compatibility',
-      severity: 'high',
-      status: ok ? 'pass' : 'warn',
-      score: ok ? 100 : 75,
-      durationMs: Date.now() - t0,
-      summaryEn: `Viewport meta=${hasViewportMeta}, Node v${process.versions.node}, Linux/Docker bundle=${hasLinuxStack}.`,
-      summaryFa: `سازگاری ریسپانسیو موبایل/دسکتاپ، Node v${process.versions.node} و فایل‌های استقرار لینوکس/Docker تایید شد.`,
-      evidence: [
-        `Responsive viewport meta tag: ${hasViewportMeta}`,
-        `Node runtime: v${process.versions.node}`,
-        `Linux installer & Docker manifests present: ${hasLinuxStack}`,
-      ],
-      recommendationEn: ok ? undefined : 'Verify mobile viewport meta tag and Linux Docker/Node compatibility files.',
-      recommendationFa: ok ? undefined : 'تگ viewport و فایل‌های سازگاری لینوکس/داکر را بررسی کنید.',
-    });
-  }
-
-  // 10. Regression Testing
-  {
-    const t0 = Date.now();
-    const criticalBugs = openBugs.filter((b) => b.severity === 'critical' || b.severity === 'high');
-    const failedRecent = recentRuns.filter((r) => r.status === 'failed');
-    const ok = criticalBugs.length === 0;
-    const status = criticalBugs.length > 0 ? 'fail' : openBugs.length > 0 || failedRecent.length > 0 ? 'warn' : 'pass';
-    results.push({
-      id: 'regression',
-      category: 'ux_compatibility',
-      severity: 'critical',
-      status,
-      score: criticalBugs.length > 0 ? 30 : openBugs.length > 0 ? 80 : 100,
-      durationMs: Date.now() - t0,
-      summaryEn:
-        criticalBugs.length === 0
-          ? `0 open critical/high bugs (${openBugs.length} minor open, ${allBugs.length - openBugs.length} resolved).`
-          : `${criticalBugs.length} open critical/high bug report(s) blocking regression stability.`,
-      summaryFa:
-        criticalBugs.length === 0
-          ? `هیچ باگ بحرانی/مهم بازی وجود ندارد (${allBugs.length - openBugs.length} مورد حل‌شده).`
-          : `${criticalBugs.length} باگ باز مهم/بحرانی در سیستم ثبت شده است که باید پیش از لانچ رفع شود.`,
-      evidence: [
-        `Open critical/high bugs: ${criticalBugs.length}`,
-        `Total open bugs: ${openBugs.length}, Recent failed runs: ${failedRecent.length}`,
-      ],
-      recommendationEn: ok ? undefined : 'Ask agents to fix open critical/high bug reports in the Bug Report tab.',
-      recommendationFa: ok ? undefined : 'باگ‌های باز مهم را در تب Bug Report به ایجنت‌ها برای اصلاح ارسال کنید.',
-    });
-  }
-
-  // 11. Smoke Testing
-  {
-    const t0 = Date.now();
-    const healthRes = await fetch(`${localBase}/api/health`, { signal: AbortSignal.timeout(3000) })
-      .then(async (r) => ({ ok: r.ok, body: await r.json().catch(() => null) }))
-      .catch(() => ({ ok: false, body: null }));
-    const blueprintOk = await fetch(`${localBase}/api/blueprint`, { signal: AbortSignal.timeout(3000) })
-      .then((r) => r.ok)
-      .catch(() => false);
-    const ok = Boolean(healthRes.ok && blueprintOk);
-    results.push({
-      id: 'smoke',
-      category: 'final_pre_release',
-      severity: 'critical',
-      status: ok ? 'pass' : 'fail',
-      score: ok ? 100 : 20,
-      durationMs: Date.now() - t0,
-      summaryEn: ok
-        ? 'Live server health, SQLite readiness, and blueprint endpoints passed smoke checks.'
-        : 'Smoke probe failed on core runtime endpoints.',
-      summaryFa: ok
-        ? 'تست دود روی سلامت سرور، دیتابیس SQLite و اندپوینت‌های اصلی با موفقیت پاس شد.'
-        : 'تست دود روی مسیرهای اصلی سرور با خطا مواجه شد.',
-      evidence: [
-        `/api/health ok=${healthRes.ok}`,
-        `/api/blueprint ok=${blueprintOk}`,
-      ],
-    });
-  }
-
-  // 12. Alpha Testing
-  {
-    const t0 = Date.now();
-    const roles = new Set(wf.nodes.map((n) => n.data.role));
-    const hasManager = roles.has('manager');
-    const hasBuilder = roles.has('backend') || roles.has('frontend') || wf.nodes.length >= 2;
-    const hasQa = roles.has('security_qa');
-    const ok = hasManager && hasBuilder && hasQa;
-    results.push({
-      id: 'alpha',
-      category: 'final_pre_release',
-      severity: 'high',
-      status: ok ? 'pass' : hasManager && hasBuilder ? 'warn' : 'fail',
-      score: ok ? 100 : hasManager && hasBuilder ? 75 : 40,
-      durationMs: Date.now() - t0,
-      summaryEn: `Internal Alpha team coverage: Manager=${hasManager}, Engineering=${hasBuilder}, Security & QA=${hasQa}.`,
-      summaryFa: `آمادگی تست آلفای داخلی: مدیر=${hasManager ? 'دارد' : 'ندارد'}، مهندسی=${hasBuilder ? 'دارد' : 'ندارد'}، امنیت و QA=${hasQa ? 'دارد' : 'ندارد'}.`,
-      evidence: [
-        `Assigned roles: ${Array.from(roles).join(', ') || 'none'}`,
-        `Continuous autonomous mode: ${Boolean(wf.continuousAgentWork)}`,
-      ],
-      recommendationEn: ok ? undefined : 'Assign a Manager, Backend/Frontend, and Security & QA agent for complete Alpha coverage.',
-      recommendationFa: ok ? undefined : 'برای پوشش کامل تست آلفا، نقش‌های مدیر، توسعه و امنیت/QA را در تیم داشته باشید.',
-    });
-  }
-
-  // 13. Beta Testing
-  {
-    const t0 = Date.now();
-    const hasEnvExample = fs.existsSync(path.resolve(process.cwd(), '.env.example'));
-    const hasReadme = fs.existsSync(path.resolve(process.cwd(), 'README.md'));
-    const hasNginxSslInstaller =
-      fs.existsSync(path.resolve(process.cwd(), 'install-linux.sh')) &&
-      fs.readFileSync(path.resolve(process.cwd(), 'install-linux.sh'), 'utf-8').includes('--nginx');
-    const ok = hasEnvExample && hasReadme && hasNginxSslInstaller;
-    results.push({
-      id: 'beta',
-      category: 'final_pre_release',
-      severity: 'high',
-      status: ok ? 'pass' : 'warn',
-      score: ok ? 100 : 70,
-      durationMs: Date.now() - t0,
-      summaryEn: `Beta staging package: .env.example=${hasEnvExample}, README=${hasReadme}, Nginx+SSL installer=${hasNginxSslInstaller}.`,
-      summaryFa: `آمادگی بسته تست بتا: فایل env.example، مستندات README و نصب خودکار Nginx+SSL ${ok ? 'کامل است' : 'نیاز به تکمیل دارد'}.`,
-      evidence: [
-        `.env.example: ${hasEnvExample}, README.md: ${hasReadme}`,
-        `Linux Nginx/SSL bootstrap flag verified: ${hasNginxSslInstaller}`,
-      ],
-    });
-  }
-
-  // 14. User Acceptance Testing (UAT)
-  {
-    const t0 = Date.now();
-    const hasGoal = Boolean(wf.description?.trim() || wf.projectContext?.summary?.trim());
-    const anyBlockingCritical = results.some((r) => r.status === 'fail' && r.severity === 'critical');
-    const ok = hasGoal && !anyBlockingCritical;
-    const status = anyBlockingCritical ? 'fail' : hasGoal ? 'pass' : 'warn';
-    results.push({
-      id: 'uat',
-      category: 'final_pre_release',
-      severity: 'critical',
-      status,
-      score: anyBlockingCritical ? 35 : hasGoal ? 100 : 75,
-      durationMs: Date.now() - t0,
-      summaryEn: anyBlockingCritical
-        ? 'UAT blocked because critical technical/security/regression checks failed.'
-        : hasGoal
-          ? 'Project requirements, goal definition, and pre-launch acceptance criteria satisfied.'
-          : 'Technical checks passed, but project description/goal is empty for full UAT sign-off.',
-      summaryFa: anyBlockingCritical
-        ? 'پذیرش کاربر (UAT) به دلیل وجود خطای بحرانی در تست‌های قبلی مسدود است.'
-        : hasGoal
-          ? 'تطابق محصول با اهداف تعریف‌شده و معیارهای پذیرش کاربر (UAT) تایید شد.'
-          : 'تست‌های فنی پاس شدند، اما برای امضای دقیق UAT، هدف و توضیحات پروژه را تکمیل کنید.',
-      evidence: [
-        `Project goal defined: ${hasGoal}`,
-        `Prior critical test failures: ${results.filter((r) => r.status === 'fail' && r.severity === 'critical').length}`,
-      ],
-      recommendationEn: anyBlockingCritical
-        ? 'Resolve all critical failures first, then re-run Strict Pre-Launch Tests.'
-        : !hasGoal
-          ? 'Add a clear project description in Manage Projects.'
-          : undefined,
-      recommendationFa: anyBlockingCritical
-        ? 'ابتدا خطاهای بحرانی را رفع کرده و تست سخت قبل از لانچ را مجدداً اجرا کنید.'
-        : !hasGoal
-          ? 'در بخش مدیریت پروژه‌ها توضیحات و هدف پروژه را مشخص کنید.'
-          : undefined,
-    });
-  }
-
-  const report: PrelaunchTestReport = evaluatePrelaunchGate({
-    id: `prelaunch-${crypto.randomUUID().slice(0, 8)}`,
-    workflowId: wf.id,
-    workflowName: wf.name,
-    strictMode: isStrict,
-    targetScope,
-    durationMs: Date.now() - startedAt,
-    results,
-  });
-
-  savePrelaunchReport(report);
-  res.json({ report });
 });
 
 async function startServer() {
+  cleanupStaleSandboxDirs({ sandboxBaseDir: SANDBOX_BASE });
+  const cleanupTimer = setInterval(
+    () => cleanupStaleSandboxDirs({ sandboxBaseDir: SANDBOX_BASE }),
+    6 * 60 * 60 * 1000,
+  );
+  cleanupTimer.unref();
+
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -4708,4 +4791,8 @@ async function startServer() {
   });
 }
 
-void startServer();
+if (process.env.AETHERFLOW_NO_LISTEN !== '1') {
+  void startServer();
+}
+
+export { app, server, startServer };

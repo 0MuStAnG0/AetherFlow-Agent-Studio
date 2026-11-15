@@ -5,8 +5,10 @@ import type {
   BugReportCategory,
   BugReportItem,
   BugReportSeverity,
+  EdgeConditionType,
   ManagerDelegation,
   SandboxFile,
+  TokenUsage,
   ToolCallLog,
   WorkflowConfig,
   WorkflowEdge,
@@ -34,6 +36,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   allowExecBash: true,
   sandboxTimeoutSec: 20,
   sandboxMemoryMb: 512,
+  tokenOptimizationMode: 'ultra_compact',
   language: 'en',
   darkMode: false,
   showMiniMap: true,
@@ -129,6 +132,10 @@ export function normalizeAppSettings(input: Partial<AppSettings> | null | undefi
     allowExecBash: raw.allowExecBash ?? base.allowExecBash,
     sandboxTimeoutSec: clampedTimeout,
     sandboxMemoryMb: memory,
+    tokenOptimizationMode:
+      raw.tokenOptimizationMode === 'off' || raw.tokenOptimizationMode === 'balanced'
+        ? raw.tokenOptimizationMode
+        : 'ultra_compact',
     language: raw.language === 'fa' ? 'fa' : 'en',
     darkMode: Boolean(raw.darkMode),
     showMiniMap: raw.showMiniMap ?? base.showMiniMap,
@@ -292,6 +299,110 @@ export function computeExecutionOrder(
   return ordered;
 }
 
+export function evaluateEdgeCondition(
+  edge: WorkflowEdge,
+  context: {
+    lastTurnHadError?: boolean;
+    lastReply?: string;
+  } = {},
+): boolean {
+  const cond = edge.conditionType ?? 'always';
+  if (cond === 'always') return true;
+  if (cond === 'on_success') return !context.lastTurnHadError;
+  if (cond === 'on_failure') return Boolean(context.lastTurnHadError);
+  if (cond === 'when_contains') {
+    const keyword = (edge.conditionValue ?? '').trim().toLowerCase();
+    if (!keyword) return true;
+    return (context.lastReply ?? '').toLowerCase().includes(keyword);
+  }
+  return true;
+}
+
+export function getDefaultEdgeLabelForCondition(
+  conditionType: EdgeConditionType,
+  conditionValue?: string,
+): string {
+  switch (conditionType) {
+    case 'on_success':
+      return 'On Success';
+    case 'on_failure':
+      return 'On Failure';
+    case 'when_contains': {
+      const kw = (conditionValue ?? '').trim();
+      return kw ? `If "${kw.slice(0, 18)}"` : 'When Contains';
+    }
+    default:
+      return 'Handoff';
+  }
+}
+
+export function estimateTokenUsage(promptText: string, completionText: string): TokenUsage {
+  const promptTokens = Math.max(1, Math.ceil((promptText || '').length / 4));
+  const completionTokens = Math.max(1, Math.ceil((completionText || '').length / 4));
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+  };
+}
+
+export function buildWorkflowMemorySnapshot(params: {
+  priorRuns: Array<{
+    taskPrompt: string;
+    status: string;
+    roundsExecuted?: number;
+    summary?: string;
+    createdAt: string;
+  }>;
+  openBugs: BugReportItem[];
+  workspaceFiles: Array<{ path: string; size?: number }>;
+}): string {
+  const { priorRuns, openBugs, workspaceFiles } = params;
+  const recentRuns = priorRuns.slice(0, 2);
+  const unresolvedBugs = openBugs.filter((b) => b.status !== 'resolved').slice(0, 4);
+  const files = workspaceFiles.slice(0, 10);
+
+  if (recentRuns.length === 0 && unresolvedBugs.length === 0 && files.length === 0) {
+    return '';
+  }
+
+  const sections: string[] = ['[WORKFLOW MEMORY FROM PRIOR RUNS]'];
+
+  if (recentRuns.length > 0) {
+    sections.push(
+      'Runs:\n' +
+        recentRuns
+          .map((r, idx) => {
+            const promptSnippet = r.taskPrompt.replace(/\s+/g, ' ').trim().slice(0, 80);
+            const summarySnippet = r.summary
+              ? ` -> ${r.summary.replace(/\s+/g, ' ').trim().slice(0, 95)}`
+              : '';
+            return `${idx + 1}.[${r.status.toUpperCase()}] ${promptSnippet}${summarySnippet}`;
+          })
+          .join('\n'),
+    );
+  }
+
+  if (unresolvedBugs.length > 0) {
+    sections.push(
+      'Open Bugs:\n' +
+        unresolvedBugs
+          .map((b) => `- [${b.severity.toUpperCase()}·${b.role}] ${b.title}: ${b.description.slice(0, 65)}`)
+          .join('\n'),
+    );
+  }
+
+  if (files.length > 0) {
+    sections.push(
+      `Files(${workspaceFiles.length}): ` +
+        files.map((f) => f.path).join(', '),
+    );
+  }
+
+  return sections.join('\n').slice(0, 850);
+}
+
 export function selectNextSpeaker(params: {
   orderedNodes: WorkflowNode[];
   edges: WorkflowEdge[];
@@ -299,8 +410,19 @@ export function selectNextSpeaker(params: {
   roundIndex: number;
   maxRounds: number;
   requestedNextRole?: string;
+  lastTurnHadError?: boolean;
+  lastReply?: string;
 }): { node: WorkflowNode | null; reason: string } {
-  const { orderedNodes, edges, currentNodeId, roundIndex, maxRounds, requestedNextRole } = params;
+  const {
+    orderedNodes,
+    edges,
+    currentNodeId,
+    roundIndex,
+    maxRounds,
+    requestedNextRole,
+    lastTurnHadError,
+    lastReply,
+  } = params;
 
   if (orderedNodes.length === 0) {
     return { node: null, reason: 'Workflow contains no agent nodes' };
@@ -314,9 +436,11 @@ export function selectNextSpeaker(params: {
     return { node: orderedNodes[0], reason: 'Entry node selected by topological priority' };
   }
 
-  const outgoingIds = edges
-    .filter((e) => e.source === currentNodeId)
-    .map((e) => e.target);
+  const outgoingEdges = edges.filter((e) => e.source === currentNodeId);
+  const matchingEdges = outgoingEdges.filter((e) =>
+    evaluateEdgeCondition(e, { lastTurnHadError, lastReply }),
+  );
+  const outgoingIds = outgoingEdges.map((e) => e.target);
 
   if (requestedNextRole) {
     const matchingTarget =
@@ -340,13 +464,20 @@ export function selectNextSpeaker(params: {
     }
   }
 
-  if (outgoingIds.length > 0) {
-    const targetId = outgoingIds[roundIndex % outgoingIds.length];
-    const targetNode = orderedNodes.find((n) => n.id === targetId);
+  if (matchingEdges.length > 0) {
+    // Prefer specific conditional edges over generic 'always' when a condition specifically matched
+    const specificMatches = matchingEdges.filter((e) => e.conditionType && e.conditionType !== 'always');
+    const pool = specificMatches.length > 0 ? specificMatches : matchingEdges;
+    const chosenEdge = pool[roundIndex % pool.length];
+    const targetNode = orderedNodes.find((n) => n.id === chosenEdge.target);
     if (targetNode) {
+      const condSuffix =
+        chosenEdge.conditionType && chosenEdge.conditionType !== 'always'
+          ? ` (${chosenEdge.conditionType})`
+          : '';
       return {
         node: targetNode,
-        reason: `Routed along graph edge to ${targetNode.data.label}`,
+        reason: `Routed along graph edge${condSuffix} to ${targetNode.data.label}`,
       };
     }
   }
@@ -357,6 +488,62 @@ export function selectNextSpeaker(params: {
     node: nextNode,
     reason: `Advanced round-robin to ${nextNode.data.label}`,
   };
+}
+
+/**
+ * Identifies independent parallel branch targets fanned out from a source node
+ * (e.g. Manager -> [Backend Agent, Frontend Agent]) that do not directly depend
+ * on each other, enabling concurrent Promise.all execution within a wave.
+ */
+export function computeParallelFanoutTargets(params: {
+  orderedNodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  sourceNodeId: string;
+  alreadyExecutedIds?: Set<string>;
+  lastTurnHadError?: boolean;
+  lastReply?: string;
+}): WorkflowNode[] {
+  const {
+    orderedNodes,
+    edges,
+    sourceNodeId,
+    alreadyExecutedIds,
+    lastTurnHadError,
+    lastReply,
+  } = params;
+
+  const outgoingEdges = edges.filter((e) => e.source === sourceNodeId);
+  const matchingEdges = outgoingEdges.filter((e) =>
+    evaluateEdgeCondition(e, { lastTurnHadError, lastReply }),
+  );
+  if (matchingEdges.length <= 1) return [];
+
+  const nodeMap = new Map(orderedNodes.map((n) => [n.id, n]));
+  const candidates: WorkflowNode[] = [];
+  const seen = new Set<string>();
+
+  for (const edge of matchingEdges) {
+    if (edge.target === sourceNodeId) continue;
+    if (alreadyExecutedIds?.has(edge.target)) continue;
+    const target = nodeMap.get(edge.target);
+    if (target && !seen.has(target.id)) {
+      seen.add(target.id);
+      candidates.push(target);
+    }
+  }
+
+  if (candidates.length <= 1) return [];
+
+  // Keep only candidates that have no direct edge between each other (independent branches)
+  const candidateIds = new Set(candidates.map((c) => c.id));
+  const independent = candidates.filter((c) => {
+    const hasIncomingFromSibling = edges.some(
+      (e) => e.target === c.id && e.source !== sourceNodeId && candidateIds.has(e.source),
+    );
+    return !hasIncomingFromSibling;
+  });
+
+  return independent.length > 1 ? independent : [];
 }
 
 export function validateWorkflowForRun(
@@ -429,31 +616,27 @@ export function buildStructuredAgentPrompt(params: {
   }
 
   if (isPersian) {
-    const targetLabel = target ? `${target.data.label} (${target.data.role})` : 'تیم چندعاملی (GroupChat)';
+    const targetLabel = target ? `${target.data.label} (${target.data.role})` : 'تیم چندعاملی';
     return [
-      `مخاطب: ${targetLabel}`,
-      `هدف اصلی: ${clean}`,
-      `الزامات فنی:`,
-      `1. راه‌حل را گام‌به‌گام، دقیق و بدون کلی‌گویی پیاده‌سازی کن و خطاها/ورودی‌ها را اعتبارسنجی کن.`,
-      `2. برای ساخت یا ویرایش فایل از قالب استاندارد ${tools.includes('WRITE_FILE:<path>') ? 'WRITE_FILE:<path> همراه با بلوک کد' : 'کد مشخص و کامل'} استفاده کن.`,
+      `مخاطب: ${targetLabel} | هدف: ${clean}`,
+      `۱. پیاده‌سازی دقیق با اعتبارسنجی ورودی و مدیریت خطا، بدون توضیح اضافه.`,
+      `۲. ${tools.includes('WRITE_FILE:<path>') ? 'تغییرات فایل را با WRITE_FILE:<path> و بلوک کد اعمال کن.' : 'کد/مشخصات آماده و مستقیم ارائه بده.'}`,
       tools.includes('EXEC_BASH:<command>')
-        ? `3. در صورت نیاز به تست یا اجرا، دستور دقیق را با EXEC_BASH:<command> مشخص کن.`
-        : `3. خروجی را با معیارهای پذیرش و نکات تست جمع‌بندی کن.`,
+        ? `۳. تست/بررسی را با EXEC_BASH:<command> اجرا و نتیجه را خلاصه گزارش کن.`
+        : `۳. معیارهای پذیرش را در ۲ خط خلاصه کن.`,
     ].join('\n');
   }
 
-  const targetLabel = target ? `${target.data.label} (${target.data.role})` : 'Multi-Agent GroupChat Team';
+  const targetLabel = target ? `${target.data.label} (${target.data.role})` : 'Multi-Agent Team';
   return [
-    `Target: ${targetLabel}`,
-    `Objective: ${clean}`,
-    `Execution Requirements:`,
-    `1. Deliver concrete, production-ready output with strict input validation and edge-case handling.`,
+    `Target: ${targetLabel} | Goal: ${clean}`,
+    `1. Implement concisely with strict input validation and error handling; skip boilerplate prose.`,
     tools.includes('WRITE_FILE:<path>')
-      ? `2. Persist any generated files using WRITE_FILE:<relative_path> followed by a fenced code block.`
-      : `2. Provide complete, directly usable specifications or code snippets.`,
+      ? `2. Persist code directly via WRITE_FILE:<path> + fenced block (or write_file tool).`
+      : `2. Provide concise, actionable technical specs.`,
     tools.includes('EXEC_BASH:<command>')
-      ? `3. Verify your changes with automated checks using EXEC_BASH:<command>.`
-      : `3. Summarize acceptance criteria and next verification steps concisely.`,
+      ? `3. Verify via EXEC_BASH:<command> (or exec_bash) and report brief results.`
+      : `3. Summarize acceptance checks briefly.`,
   ].join('\n');
 }
 
@@ -665,44 +848,51 @@ export function buildManagerInspectionContext(params: {
   const openOnly = openBugs.filter((b) => b.status !== 'resolved');
   const openBugsByRole = openOnly.map((bug) => ({ role: bug.role, bug }));
 
+  const visibleFiles = sandboxFiles.slice(0, 8);
   const fileList =
-    sandboxFiles.length > 0
-      ? sandboxFiles
-          .map((f) => `- ${f.path} (${f.size} bytes):\n${f.content.slice(0, 350)}`)
-          .join('\n')
-      : '- No files written in sandbox yet.';
+    visibleFiles.length > 0
+      ? visibleFiles
+          .map((f) => {
+            const firstLines = f.content.replace(/\s+/g, ' ').trim().slice(0, 110);
+            return `- ${f.path} (${f.size}B): ${firstLines}`;
+          })
+          .join('\n') +
+        (sandboxFiles.length > 8 ? `\n- ... +${sandboxFiles.length - 8} more files` : '')
+      : '- No sandbox files yet.';
 
+  const visibleTools = toolCalls.slice(-8);
   const toolSummary =
-    toolCalls.length > 0
-      ? toolCalls
+    visibleTools.length > 0
+      ? visibleTools
           .map(
             (t) =>
-              `- [${(t.exitCode ?? 0) === 0 ? 'PASS' : `FAIL exit=${t.exitCode}`}] ${t.tool}(${t.target}): ${t.result.slice(0, 220)}`,
+              `- [${(t.exitCode ?? 0) === 0 ? 'PASS' : `FAIL exit=${t.exitCode}`}] ${t.tool}(${t.target}): ${t.result.slice(0, 140)}`,
           )
           .join('\n')
-      : '- No tool executions recorded yet.';
+      : '- No tool logs.';
 
   const bugSummary =
     openOnly.length > 0
       ? openOnly
+          .slice(0, 6)
           .map(
             (b) =>
-              `- [${b.severity.toUpperCase()} · ${b.category}] role=${b.role} (${b.agentName}): ${b.title} — ${b.description}`,
+              `- [${b.severity.toUpperCase()}·${b.category}] ${b.role}: ${b.title} — ${b.description.slice(0, 90)}`,
           )
           .join('\n')
-      : '- No open bugs logged.';
+      : '- None.';
 
   const summaryText =
-    `TEAM WORKSPACE & TEST AUDIT SNAPSHOT:\n` +
-    `Sandbox Files (${sandboxFiles.length}):\n${fileList}\n\n` +
-    `Recent Tool & Test Logs (${toolCalls.length}):\n${toolSummary}\n\n` +
-    `Open Bug Reports (${openOnly.length}):\n${bugSummary}`;
+    `AUDIT SNAPSHOT:\n` +
+    `Files(${sandboxFiles.length}):\n${fileList}\n` +
+    `Tools(${toolCalls.length}):\n${toolSummary}\n` +
+    `Bugs(${openOnly.length}):\n${bugSummary}`;
 
   return {
     hasIssues: failingTools.length > 0 || openOnly.some((b) => b.category === 'bug'),
     failingTools,
     openBugsByRole,
-    summaryText,
+    summaryText: summaryText.slice(0, 1400),
   };
 }
 
@@ -727,6 +917,12 @@ export function serializeWorkflowForExport(workflow: WorkflowConfig): string {
       : {}),
     ...(workflow.strictPrelaunchGate !== undefined
       ? { strictPrelaunchGate: Boolean(workflow.strictPrelaunchGate) }
+      : {}),
+    ...(workflow.memoryEnabled !== undefined
+      ? { memoryEnabled: Boolean(workflow.memoryEnabled) }
+      : {}),
+    ...(workflow.webhookEnabled !== undefined
+      ? { webhookEnabled: Boolean(workflow.webhookEnabled) }
       : {}),
     nodes: workflow.nodes.map((node) => ({
       id: node.id,
@@ -761,6 +957,12 @@ export function serializeWorkflowForExport(workflow: WorkflowConfig): string {
       target: edge.target,
       ...(edge.label ? { label: edge.label } : {}),
       ...(edge.animated ? { animated: edge.animated } : {}),
+      ...(edge.conditionType && edge.conditionType !== 'always'
+        ? { conditionType: edge.conditionType }
+        : {}),
+      ...(edge.conditionType === 'when_contains' && edge.conditionValue
+        ? { conditionValue: edge.conditionValue }
+        : {}),
     })),
     ...(workflow.projectContext ? { projectContext: workflow.projectContext } : {}),
     updatedAt: workflow.updatedAt || new Date().toISOString(),
@@ -849,6 +1051,7 @@ export function parseImportedWorkflowJson(rawJson: string): {
     }
 
     const nodeIds = new Set(nodes.map((n) => n.id));
+    const validConditions = new Set(['always', 'on_success', 'on_failure', 'when_contains']);
     const edges: WorkflowEdge[] = Array.isArray(candidate.edges)
       ? candidate.edges
           .filter(
@@ -862,13 +1065,25 @@ export function parseImportedWorkflowJson(rawJson: string): {
                   nodeIds.has(e.target),
               ),
           )
-          .map((e, idx) => ({
-            id: e.id || `edge-${idx + 1}`,
-            source: e.source,
-            target: e.target,
-            ...(e.label ? { label: String(e.label) } : {}),
-            ...(e.animated ? { animated: Boolean(e.animated) } : {}),
-          }))
+          .map((e, idx) => {
+            const cond =
+              typeof e.conditionType === 'string' && validConditions.has(e.conditionType)
+                ? (e.conditionType as EdgeConditionType)
+                : undefined;
+            const condVal =
+              cond === 'when_contains' && typeof e.conditionValue === 'string' && e.conditionValue.trim()
+                ? e.conditionValue.trim()
+                : undefined;
+            return {
+              id: e.id || `edge-${idx + 1}`,
+              source: e.source,
+              target: e.target,
+              ...(e.label ? { label: String(e.label) } : {}),
+              ...(e.animated ? { animated: Boolean(e.animated) } : {}),
+              ...(cond && cond !== 'always' ? { conditionType: cond } : {}),
+              ...(condVal ? { conditionValue: condVal } : {}),
+            };
+          })
       : [];
 
     const workflow: WorkflowConfig = {
@@ -894,6 +1109,12 @@ export function parseImportedWorkflowJson(rawJson: string): {
         : {}),
       ...(candidate.strictPrelaunchGate !== undefined
         ? { strictPrelaunchGate: Boolean(candidate.strictPrelaunchGate) }
+        : {}),
+      ...(candidate.memoryEnabled !== undefined
+        ? { memoryEnabled: Boolean(candidate.memoryEnabled) }
+        : {}),
+      ...(candidate.webhookEnabled !== undefined
+        ? { webhookEnabled: Boolean(candidate.webhookEnabled) }
         : {}),
       nodes,
       edges,

@@ -45,6 +45,7 @@ export const AgentNode = memo(function AgentNode({
   const isSpeaking = data.status === 'speaking';
   const isWaiting = data.status === 'waiting_approval';
   const isError = data.status === 'error';
+  const isDone = data.status === 'done';
   const power: AgentPowerLevel = data.powerLevel ?? 'standard';
 
   let borderClass = 'border-slate-200 dark:border-slate-800';
@@ -56,12 +57,15 @@ export const AgentNode = memo(function AgentNode({
     borderClass = 'border-emerald-600 ring-2 ring-emerald-600/20';
   } else if (isError) {
     borderClass = 'border-red-600 ring-2 ring-red-600/20';
+  } else if (isDone) {
+    borderClass = 'border-emerald-500/70 dark:border-emerald-600/70';
   }
 
   return (
     <div
       className={`group w-[264px] rounded-xl border bg-white px-4 py-3 text-left transition-shadow dark:bg-slate-900 ${borderClass} shadow-sm`}
       data-testid={`agent-node-${data.role}`}
+      data-status={data.status ?? 'idle'}
     >
       <Handle
         type="target"
@@ -160,6 +164,12 @@ export const AgentNode = memo(function AgentNode({
         )}
         {isWaiting && (
           <span className="font-medium text-amber-700 dark:text-amber-400">Approval</span>
+        )}
+        {isError && (
+          <span className="font-medium text-red-700 dark:text-red-400">Error</span>
+        )}
+        {isDone && (
+          <span className="font-medium text-emerald-700 dark:text-emerald-400">Done</span>
         )}
       </div>
 

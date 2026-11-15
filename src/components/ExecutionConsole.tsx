@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   ArrowRight,
+  Brain,
   Bug,
   CheckCircle2,
   FolderOpen,
@@ -15,6 +16,7 @@ import {
   Send,
   ShieldAlert,
   ShieldCheck,
+  Square,
   Terminal,
   Trash2,
   UploadCloud,
@@ -28,9 +30,11 @@ import type {
   BugReportStatus,
   ContinuousWorkSession,
   ExecutionEvent,
+  FileDiffEntry,
   SandboxFile,
   WorkflowNode,
 } from '../types/workflow';
+import { CodeDiffViewer } from './CodeDiffViewer';
 
 interface ExecutionConsoleProps {
   nodes: WorkflowNode[];
@@ -42,6 +46,7 @@ interface ExecutionConsoleProps {
   onSendChat: () => void;
   onConvertToPrompt: () => Promise<void>;
   onStartRun: () => void;
+  onStopRun?: () => void;
   onRunTestAndDeploy?: () => void;
   onClearFeed?: () => void;
   isRunning: boolean;
@@ -50,7 +55,9 @@ interface ExecutionConsoleProps {
   promptEnhancedNotice: string | null;
   validationError: string | null;
   events: ExecutionEvent[];
+  streamingEvents?: Record<string, ExecutionEvent>;
   sandboxFiles: SandboxFile[];
+  sandboxDiffs?: FileDiffEntry[];
   bugReports: BugReportItem[];
   onUpdateBugStatus: (id: string, status: BugReportStatus) => Promise<void>;
   onDeleteBug: (id: string) => Promise<void>;
@@ -71,6 +78,9 @@ interface ExecutionConsoleProps {
   continuousSession?: ContinuousWorkSession | null;
   continuousBusy?: boolean;
   onToggleContinuous?: () => void;
+  memoryEnabled?: boolean;
+  onToggleMemory?: (enabled: boolean) => void;
+  onClearMemory?: () => void;
 }
 
 const ROLE_LABELS: Record<'en' | 'fa', Record<AgentRole, string>> = {
@@ -137,6 +147,10 @@ const CHAT_COPY = {
     openBadge: 'Open',
     viewInBugTab: 'Open Bug Report Tab',
     clearChat: 'New Chat',
+    stopRun: 'Stop Run',
+    memoryOn: 'Team Memory: On',
+    memoryOff: 'Team Memory: Off',
+    clearMemory: 'Clear memory',
   },
   fa: {
     liveLabel: 'اجرای زنده',
@@ -182,6 +196,10 @@ const CHAT_COPY = {
     openBadge: 'باز',
     viewInBugTab: 'مشاهده در باگ رپورت',
     clearChat: 'چت جدید',
+    stopRun: 'توقف اجرا',
+    memoryOn: 'حافظه تیم: روشن',
+    memoryOff: 'حافظه تیم: خاموش',
+    clearMemory: 'پاک‌سازی حافظه',
   },
 };
 
@@ -208,6 +226,7 @@ export function ExecutionConsole({
   onSendChat,
   onConvertToPrompt,
   onStartRun,
+  onStopRun,
   onRunTestAndDeploy,
   onClearFeed,
   isRunning,
@@ -216,7 +235,9 @@ export function ExecutionConsole({
   promptEnhancedNotice,
   validationError,
   events,
+  streamingEvents = {},
   sandboxFiles,
+  sandboxDiffs = [],
   bugReports,
   onUpdateBugStatus,
   onDeleteBug,
@@ -232,8 +253,12 @@ export function ExecutionConsole({
   continuousSession = null,
   continuousBusy = false,
   onToggleContinuous,
+  memoryEnabled = true,
+  onToggleMemory,
+  onClearMemory,
 }: ExecutionConsoleProps) {
   const [subTab, setSubTab] = useState<'stream' | 'sandbox' | 'bugs'>('stream');
+  const [sandboxViewMode, setSandboxViewMode] = useState<'files' | 'diff'>('files');
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [bugCategoryFilter, setBugCategoryFilter] = useState<'all' | BugReportCategory>('all');
   const [bugRoleFilter, setBugRoleFilter] = useState<'all' | AgentRole>('all');
@@ -243,6 +268,7 @@ export function ExecutionConsole({
   const roleNames = ROLE_LABELS[lang];
   const selectedFile =
     sandboxFiles.find((f) => f.path === selectedFilePath) ?? sandboxFiles[0] ?? null;
+  const activeStreamBubbles = useMemo(() => Object.values(streamingEvents), [streamingEvents]);
 
   const filteredBugs = useMemo(() => {
     return bugReports.filter((b) => {
@@ -257,11 +283,25 @@ export function ExecutionConsole({
     [bugReports],
   );
 
+  const tokenTotals = useMemo(() => {
+    let totalTokens = 0;
+    let savedTokens = 0;
+    let estimated = false;
+    for (const evt of events) {
+      if (evt.tokenUsage) {
+        totalTokens += evt.tokenUsage.totalTokens || 0;
+        savedTokens += evt.tokenUsage.savedTokens || 0;
+        if (evt.tokenUsage.estimated) estimated = true;
+      }
+    }
+    return { totalTokens, savedTokens, estimated };
+  }, [events]);
+
   useEffect(() => {
     if (subTab === 'stream') {
       feedEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
     }
-  }, [events.length, subTab]);
+  }, [events.length, activeStreamBubbles.length, subTab]);
 
   const busy = isRunning || isSendingChat;
 
@@ -269,7 +309,7 @@ export function ExecutionConsole({
     <div className="flex h-full flex-col overflow-hidden">
       {/* Compact Header Bar */}
       <div className="shrink-0 space-y-2 border-b border-slate-200 px-3.5 py-2.5 dark:border-slate-800">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
           <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-0.5 dark:bg-slate-800">
             <button
               type="button"
@@ -295,29 +335,71 @@ export function ExecutionConsole({
             </button>
           </div>
 
-          {events.length > 0 && onClearFeed && !busy && (
-            <button
-              type="button"
-              onClick={onClearFeed}
-              title={t.clearChat}
-              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <RotateCcw className="h-3 w-3" />
-              {t.clearChat}
-            </button>
-          )}
+          <div className="flex items-center gap-1.5">
+            {onToggleMemory && (
+              <button
+                type="button"
+                data-testid="memory-toggle-btn"
+                onClick={() => onToggleMemory(!memoryEnabled)}
+                aria-pressed={memoryEnabled}
+                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
+                  memoryEnabled
+                    ? 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300'
+                    : 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400'
+                }`}
+              >
+                <Brain className="h-3 w-3 shrink-0" />
+                <span>{memoryEnabled ? t.memoryOn : t.memoryOff}</span>
+              </button>
+            )}
+            {onClearMemory && memoryEnabled && (
+              <button
+                type="button"
+                data-testid="clear-memory-btn"
+                onClick={onClearMemory}
+                title={t.clearMemory}
+                aria-label={t.clearMemory}
+                className="inline-flex shrink-0 items-center rounded-lg border border-slate-200 p-1 text-slate-500 transition-colors hover:border-rose-300 hover:text-rose-600 dark:border-slate-700 dark:text-slate-400"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            )}
+            {events.length > 0 && onClearFeed && !busy && (
+              <button
+                type="button"
+                onClick={onClearFeed}
+                title={t.clearChat}
+                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+              >
+                <RotateCcw className="h-3 w-3" />
+                {t.clearChat}
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-1.5">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onStartRun}
-            className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <Play className="h-3.5 w-3.5 shrink-0" />
-            <span>{isRunning ? t.executing : t.runWorkflow}</span>
-          </button>
+          {isRunning && onStopRun ? (
+            <button
+              type="button"
+              data-testid="stop-run-btn"
+              onClick={onStopRun}
+              className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-rose-600 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-rose-700"
+            >
+              <Square className="h-3.5 w-3.5 shrink-0" />
+              <span>{t.stopRun}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onStartRun}
+              className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-blue-600 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Play className="h-3.5 w-3.5 shrink-0" />
+              <span>{isRunning ? t.executing : t.runWorkflow}</span>
+            </button>
+          )}
 
           {onRunTestAndDeploy && (
             <button
@@ -453,6 +535,26 @@ export function ExecutionConsole({
           </button>
         </div>
 
+        {tokenTotals.totalTokens > 0 && (
+          <div
+            data-testid="run-token-telemetry"
+            dir="ltr"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-emerald-200 bg-emerald-50/70 px-2.5 py-1 font-mono text-[11px] tabular-nums text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-200"
+          >
+            <span>
+              {lang === 'fa' ? 'مصرف توکن:' : 'Tokens:'}{' '}
+              {tokenTotals.estimated ? '~' : ''}
+              {tokenTotals.totalTokens.toLocaleString()}
+            </span>
+            {tokenTotals.savedTokens > 0 && (
+              <span className="font-semibold text-emerald-700 dark:text-emerald-300">
+                -{tokenTotals.savedTokens.toLocaleString()}{' '}
+                {lang === 'fa' ? 'صرفه‌جویی' : 'saved'}
+              </span>
+            )}
+          </div>
+        )}
+
         {!geminiConfigured && executionMode === 'live' && (
           <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-300">
             {lang === 'fa'
@@ -505,7 +607,7 @@ export function ExecutionConsole({
       {/* Scrollable Feed / Sandbox Explorer / Bug Report Tab */}
       <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
         {subTab === 'stream' ? (
-          events.length === 0 ? (
+          events.length === 0 && activeStreamBubbles.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center py-8 text-center">
               <MessageSquare className="mb-2 h-7 w-7 text-slate-300 dark:text-slate-700" />
               <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
@@ -521,6 +623,7 @@ export function ExecutionConsole({
                 const isUser = evt.type === 'user_message';
                 const isError = evt.type === 'run_error';
                 const isDone = evt.type === 'run_completed';
+                const isCancelled = evt.type === 'run_cancelled';
                 const isBugEvt = evt.type === 'bug_reported' && evt.bugReport;
                 const isDelegationEvt = evt.type === 'manager_delegation' && evt.delegation;
 
@@ -615,6 +718,21 @@ export function ExecutionConsole({
                   );
                 }
 
+                const latencyLabel =
+                  typeof evt.durationMs === 'number'
+                    ? evt.durationMs < 1000
+                      ? `${Math.round(evt.durationMs)}ms`
+                      : `${(evt.durationMs / 1000).toFixed(1)}s`
+                    : null;
+                const tokenLabel =
+                  evt.tokenUsage && evt.tokenUsage.totalTokens > 0
+                    ? `${evt.tokenUsage.estimated ? '~' : ''}${evt.tokenUsage.totalTokens} tok${
+                        evt.tokenUsage.savedTokens && evt.tokenUsage.savedTokens > 0
+                          ? ` (-${evt.tokenUsage.savedTokens} saved)`
+                          : ''
+                      }`
+                    : null;
+
                 return (
                   <article
                     key={evt.id}
@@ -623,12 +741,14 @@ export function ExecutionConsole({
                         ? 'ml-4 border-blue-200 bg-blue-50/80 text-slate-900 dark:border-blue-900/60 dark:bg-blue-950/40 dark:text-slate-100'
                         : isError
                           ? 'border-red-200 bg-red-50 text-red-900 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-200'
-                          : isDone
-                            ? 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200'
-                            : 'border-slate-200 bg-white text-slate-800 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200'
+                          : isCancelled
+                            ? 'border-slate-300 bg-slate-100/80 text-slate-800 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-200'
+                            : isDone
+                              ? 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200'
+                              : 'border-slate-200 bg-white text-slate-800 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200'
                     }`}
                   >
-                    <div className="flex items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-semibold">
                         {evt.agentName ?? 'Orchestrator'}
                         {evt.role ? (
@@ -640,6 +760,8 @@ export function ExecutionConsole({
                       <span className="font-mono tabular-nums text-[11px] text-slate-500 dark:text-slate-400">
                         {evt.round > 0 ? `Round ${evt.round}` : evt.type}
                         {evt.model ? ` · ${evt.model}` : ''}
+                        {latencyLabel ? ` · ${latencyLabel}` : ''}
+                        {tokenLabel ? ` · ${tokenLabel}` : ''}
                       </span>
                     </div>
 
@@ -673,6 +795,29 @@ export function ExecutionConsole({
                   </article>
                 );
               })}
+              {activeStreamBubbles.map((chunk) => (
+                <article
+                  key={`stream-${chunk.agentId ?? chunk.id}`}
+                  data-testid="live-streaming-bubble"
+                  className="rounded-lg border border-blue-200 bg-blue-50/40 p-3 text-xs text-slate-800 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-slate-200"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-blue-800 dark:text-blue-300">
+                      <RefreshCw className="h-3 w-3 animate-spin" />
+                      {chunk.agentName ?? 'Agent'}
+                    </span>
+                    <span className="font-mono text-[10px] text-blue-600 dark:text-blue-400">
+                      {lang === 'fa' ? 'در حال نگارش...' : 'Streaming...'}
+                    </span>
+                  </div>
+                  <pre
+                    dir="auto"
+                    className="mt-2 whitespace-pre-wrap break-words font-sans text-xs leading-relaxed"
+                  >
+                    {chunk.content}
+                  </pre>
+                </article>
+              ))}
               <div ref={feedEndRef} />
             </div>
           )
@@ -715,7 +860,38 @@ export function ExecutionConsole({
               </div>
             )}
 
-            {sandboxFiles.length === 0 ? (
+            <div className="flex items-center justify-between gap-2 border-b border-slate-200 pb-2 dark:border-slate-800">
+              <div className="inline-flex items-center gap-1 rounded-md bg-slate-100 p-0.5 dark:bg-slate-800">
+                <button
+                  type="button"
+                  data-testid="sandbox-view-files-btn"
+                  onClick={() => setSandboxViewMode('files')}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    sandboxViewMode === 'files'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-900 dark:text-slate-100'
+                      : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                  }`}
+                >
+                  {lang === 'fa' ? `فایل‌ها (${sandboxFiles.length})` : `Files (${sandboxFiles.length})`}
+                </button>
+                <button
+                  type="button"
+                  data-testid="sandbox-view-diff-btn"
+                  onClick={() => setSandboxViewMode('diff')}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    sandboxViewMode === 'diff'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-900 dark:text-slate-100'
+                      : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                  }`}
+                >
+                  {lang === 'fa' ? `تغییرات Diff (${sandboxDiffs.length})` : `Diff (${sandboxDiffs.length})`}
+                </button>
+              </div>
+            </div>
+
+            {sandboxViewMode === 'diff' ? (
+              <CodeDiffViewer diffs={sandboxDiffs} lang={lang} />
+            ) : sandboxFiles.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-8 text-center">
                 <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
                   {t.sandboxEmptyTitle}

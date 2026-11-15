@@ -1,6 +1,5 @@
 import type { BugReportItem, SandboxFile, WorkflowConfig } from '../types/workflow';
 import { parseGitHubDeployTarget } from './githubDeploy';
-import { serializeWorkflowForExport } from './workflowEngine';
 
 export type ExportBundleScope = 'project_bundle' | 'sandbox_only' | 'full_studio';
 
@@ -41,6 +40,9 @@ export interface GitHubPushRequestValidation {
 }
 
 const FORBIDDEN_EXPORT_PATHS = /(^|\/)(\.env(\..+)?|.*\.db|.*\.sqlite.*|node_modules|dist|\.git|\.playwright-cli)(\/|$)/i;
+const CHANGELOG_START = '<!-- aetherflow-changelog:start -->';
+const CHANGELOG_END = '<!-- aetherflow-changelog:end -->';
+const CHANGELOG_BLOCK_REGEX = /\n*<!-- aetherflow-changelog:start -->[\s\S]*?<!-- aetherflow-changelog:end -->\n*/g;
 const textEncoder = new TextEncoder();
 
 export function isSafeExportFilePath(relPath: string): boolean {
@@ -120,47 +122,47 @@ export function computeExportChangeSummary(entries: BundleFileEntry[]): ExportCh
   };
 }
 
-export function buildWorkflowMarkdownSummary(
-  workflow: WorkflowConfig,
-  bugReports: BugReportItem[] = [],
-): string {
+export function stripReadmeChangelogBlock(content: string): string {
+  return content.replace(CHANGELOG_BLOCK_REGEX, '\n').trimEnd();
+}
+
+export function buildReadmeChangelogSection(params: {
+  workflow: WorkflowConfig;
+  modifiedPaths: string[];
+  addedPaths: string[];
+  bugReports?: BugReportItem[];
+}): string {
+  const { workflow, modifiedPaths, addedPaths, bugReports = [] } = params;
+  const sortedModified = Array.from(new Set(modifiedPaths)).sort((a, b) => a.localeCompare(b));
+  const sortedAdded = Array.from(new Set(addedPaths)).sort((a, b) => a.localeCompare(b));
+
   const lines: string[] = [
-    `# ${workflow.name}`,
+    CHANGELOG_START,
+    '## Changelog (Agent Team Edits)',
     '',
-    workflow.description || 'Multi-agent workflow exported from AetherFlow Agent Studio.',
-    '',
-    `- **Workflow ID**: \`${workflow.id}\``,
-    `- **Max Rounds**: \`${workflow.maxRounds}\``,
-    `- **Human-in-the-Loop Gate**: \`${workflow.humanInTheLoop ? 'Enabled' : 'Disabled'}\``,
+    `- **Workflow**: ${workflow.name}`,
+    `- **Modified Files (${sortedModified.length})**:`,
   ];
 
-  if (workflow.projectContext) {
-    lines.push(
-      `- **Linked Project**: ${workflow.projectContext.name} (\`${workflow.projectContext.sourceType}\`)`,
-    );
+  if (sortedModified.length > 0) {
+    for (const filePath of sortedModified) {
+      lines.push(`  - \`${filePath}\``);
+    }
+  } else {
+    lines.push('  - None');
   }
 
-  lines.push('', '## Configured Agents', '');
-  lines.push('| Agent | Role | Section | Position / Post | Power | Provider & Model | Tools |');
-  lines.push('| :--- | :--- | :--- | :--- | :--- | :--- | :--- |');
-
-  for (const node of workflow.nodes) {
-    const d = node.data;
-    const tools =
-      [
-        d.tools.readFile ? 'READ' : null,
-        d.tools.writeFile ? 'WRITE' : null,
-        d.tools.execBash ? 'BASH' : null,
-      ]
-        .filter(Boolean)
-        .join(', ') || 'None';
-    lines.push(
-      `| **${d.label}** | \`${d.role}\` | ${d.section || '—'} | ${d.positionTitle || '—'} | \`${d.powerLevel || 'standard'}\` | \`${d.provider} / ${d.model}\` | ${tools} |`,
-    );
+  lines.push(`- **Added Files (${sortedAdded.length})**:`);
+  if (sortedAdded.length > 0) {
+    for (const filePath of sortedAdded) {
+      lines.push(`  - \`${filePath}\``);
+    }
+  } else {
+    lines.push('  - None');
   }
 
   if (bugReports.length > 0) {
-    lines.push('', '## Recorded Bug Reports & Improvement Ideas', '');
+    lines.push('', '### Recorded Bug Reports & Fixes', '');
     for (const bug of bugReports.slice(0, 25)) {
       lines.push(
         `- **[${bug.status.toUpperCase()} · ${bug.severity.toUpperCase()}] ${bug.title}** (${bug.agentName}): ${bug.description}`,
@@ -168,8 +170,25 @@ export function buildWorkflowMarkdownSummary(
     }
   }
 
-  lines.push('');
+  lines.push(CHANGELOG_END);
   return lines.join('\n');
+}
+
+export function upsertReadmeChangelog(
+  existingReadme: string | undefined,
+  params: {
+    workflow: WorkflowConfig;
+    modifiedPaths: string[];
+    addedPaths: string[];
+    bugReports?: BugReportItem[];
+  },
+): string {
+  const cleanedBase = stripReadmeChangelogBlock(existingReadme || '');
+  const section = buildReadmeChangelogSection(params);
+  if (!cleanedBase) {
+    return `# ${params.workflow.projectContext?.name || params.workflow.name}\n\n${section}\n`;
+  }
+  return `${cleanedBase}\n\n${section}\n`;
 }
 
 export function assembleExportBundleFiles(params: BuildExportBundleParams): BundleFileEntry[] {
@@ -193,49 +212,99 @@ export function assembleExportBundleFiles(params: BuildExportBundleParams): Bund
     fileMap.set(cleanPath, { content, changeType });
   };
 
-  const wfSlug = slugifyBundleName(workflow.name);
-  const workflowJson = serializeWorkflowForExport(workflow);
+  const baseContents = new Map<string, string>();
+  const modifiedPaths: string[] = [];
+  const addedPaths: string[] = [];
 
   if (scope === 'full_studio') {
     for (const f of studioSourceFiles) {
-      addFile(f.path, f.content, 'project');
+      const cleanPath = f.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      baseContents.set(cleanPath, f.content);
+      addFile(cleanPath, f.content, 'project');
     }
-    addFile(`workflows/${wfSlug}.workflow.json`, workflowJson, 'metadata');
-    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports), 'metadata');
-    for (const sf of sandboxFiles) {
-      addFile(`sandbox_output/${sf.path.replace(/^\/+/, '')}`, sf.content, 'added');
-    }
-  } else if (scope === 'sandbox_only') {
-    const importedPaths = new Set(
-      importedProjectFiles.map((pf) => pf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim()),
-    );
     for (const sf of sandboxFiles) {
       const cleanPath = sf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
-      addFile(cleanPath, sf.content, importedPaths.has(cleanPath) ? 'modified' : 'added');
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      const existed = baseContents.has(cleanPath);
+      const baseVal = baseContents.get(cleanPath) ?? '';
+      const changed =
+        cleanPath === 'README.md'
+          ? existed && stripReadmeChangelogBlock(baseVal) !== stripReadmeChangelogBlock(sf.content)
+          : existed && baseVal !== sf.content;
+      addFile(cleanPath, sf.content, existed ? (changed ? 'modified' : 'project') : 'added');
+      if (cleanPath !== 'README.md') {
+        if (changed) modifiedPaths.push(cleanPath);
+        else if (!existed) addedPaths.push(cleanPath);
+      }
     }
-    addFile(`${wfSlug}.workflow.json`, workflowJson, 'metadata');
-    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports), 'metadata');
-  } else {
-    // project_bundle (default): Imported project files + Sandbox files overlaid + workflow metadata
-    const importedContents = new Map<string, string>();
+  } else if (scope === 'sandbox_only') {
     for (const pf of importedProjectFiles) {
       const cleanPath = pf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
       if (!isSafeExportFilePath(cleanPath)) continue;
-      importedContents.set(cleanPath, pf.content);
+      baseContents.set(cleanPath, pf.content);
+    }
+    for (const sf of sandboxFiles) {
+      const cleanPath = sf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      const existed = baseContents.has(cleanPath);
+      const baseVal = baseContents.get(cleanPath) ?? '';
+      if (cleanPath === 'README.md') {
+        if (!existed || stripReadmeChangelogBlock(baseVal) !== stripReadmeChangelogBlock(sf.content)) {
+          addFile(cleanPath, sf.content, existed ? 'modified' : 'added');
+        }
+        continue;
+      }
+      if (existed && baseVal === sf.content) {
+        // Skip untouched base files seeded into sandbox when exporting changes only
+        continue;
+      }
+      addFile(cleanPath, sf.content, existed ? 'modified' : 'added');
+      if (existed) modifiedPaths.push(cleanPath);
+      else addedPaths.push(cleanPath);
+    }
+  } else {
+    // project_bundle (default): Base project files + agent edits overlaid directly inside code folders
+    for (const pf of importedProjectFiles) {
+      const cleanPath = pf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      baseContents.set(cleanPath, pf.content);
       addFile(cleanPath, pf.content, 'project');
     }
     for (const sf of sandboxFiles) {
       const cleanPath = sf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
       if (!isSafeExportFilePath(cleanPath)) continue;
-      const existed = importedContents.has(cleanPath);
-      const changed = existed && importedContents.get(cleanPath) !== sf.content;
+      const existed = baseContents.has(cleanPath);
+      const baseVal = baseContents.get(cleanPath) ?? '';
+      const changed =
+        cleanPath === 'README.md'
+          ? existed && stripReadmeChangelogBlock(baseVal) !== stripReadmeChangelogBlock(sf.content)
+          : existed && baseVal !== sf.content;
       addFile(cleanPath, sf.content, existed ? (changed ? 'modified' : 'project') : 'added');
+      if (cleanPath !== 'README.md') {
+        if (changed) modifiedPaths.push(cleanPath);
+        else if (!existed) addedPaths.push(cleanPath);
+      }
     }
-    addFile(`.aetherflow/${wfSlug}.workflow.json`, workflowJson, 'metadata');
-    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports), 'metadata');
-    if (bugReports.length > 0) {
-      addFile('.aetherflow/bug-reports.json', JSON.stringify(bugReports, null, 2), 'metadata');
-    }
+  }
+
+  // Write ONLY the list of changes into README.md (no extra .aetherflow/, workflows/, or AETHERFLOW_WORKFLOW.md files)
+  const shouldUpdateReadme =
+    modifiedPaths.length > 0 ||
+    addedPaths.length > 0 ||
+    bugReports.length > 0 ||
+    fileMap.size === 0;
+
+  if (shouldUpdateReadme) {
+    const baseHadReadme = baseContents.has('README.md');
+    const existingReadme = fileMap.get('README.md')?.content ?? baseContents.get('README.md');
+    const updatedReadme = upsertReadmeChangelog(existingReadme, {
+      workflow,
+      modifiedPaths,
+      addedPaths,
+      bugReports,
+    });
+    addFile('README.md', updatedReadme, baseHadReadme ? 'modified' : 'added');
   }
 
   return Array.from(fileMap.entries())

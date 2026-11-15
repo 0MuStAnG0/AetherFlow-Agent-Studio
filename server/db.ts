@@ -17,6 +17,7 @@ import type {
 } from '../src/types/workflow.ts';
 import { maskApiKey, normalizeSecretName } from '../src/utils/secretUtils.ts';
 import { DEFAULT_APP_SETTINGS, normalizeAppSettings } from '../src/utils/workflowEngine.ts';
+import { decryptSecret, encryptSecret, isEncryptedSecretValue } from './security.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'studio.db');
@@ -139,6 +140,9 @@ export function listWorkflows(): WorkflowConfig[] {
       continuousAgentWork?: boolean;
       continuousIntervalSec?: number;
       strictPrelaunchGate?: boolean;
+      memoryEnabled?: boolean;
+      webhookEnabled?: boolean;
+      webhookSecret?: string;
     };
     return {
       id: row.id,
@@ -154,6 +158,15 @@ export function listWorkflows(): WorkflowConfig[] {
         : {}),
       ...(graph.strictPrelaunchGate !== undefined
         ? { strictPrelaunchGate: Boolean(graph.strictPrelaunchGate) }
+        : {}),
+      ...(graph.memoryEnabled !== undefined
+        ? { memoryEnabled: Boolean(graph.memoryEnabled) }
+        : {}),
+      ...(graph.webhookEnabled !== undefined
+        ? { webhookEnabled: Boolean(graph.webhookEnabled) }
+        : {}),
+      ...(typeof graph.webhookSecret === 'string' && graph.webhookSecret
+        ? { webhookSecret: graph.webhookSecret }
         : {}),
       nodes: graph.nodes ?? [],
       edges: graph.edges ?? [],
@@ -187,6 +200,9 @@ export function getWorkflowById(id: string): WorkflowConfig | null {
     continuousAgentWork?: boolean;
     continuousIntervalSec?: number;
     strictPrelaunchGate?: boolean;
+    memoryEnabled?: boolean;
+    webhookEnabled?: boolean;
+    webhookSecret?: string;
   };
   return {
     id: row.id,
@@ -202,6 +218,15 @@ export function getWorkflowById(id: string): WorkflowConfig | null {
       : {}),
     ...(graph.strictPrelaunchGate !== undefined
       ? { strictPrelaunchGate: Boolean(graph.strictPrelaunchGate) }
+      : {}),
+    ...(graph.memoryEnabled !== undefined
+      ? { memoryEnabled: Boolean(graph.memoryEnabled) }
+      : {}),
+    ...(graph.webhookEnabled !== undefined
+      ? { webhookEnabled: Boolean(graph.webhookEnabled) }
+      : {}),
+    ...(typeof graph.webhookSecret === 'string' && graph.webhookSecret
+      ? { webhookSecret: graph.webhookSecret }
       : {}),
     nodes: graph.nodes ?? [],
     edges: graph.edges ?? [],
@@ -225,6 +250,15 @@ export function upsertWorkflow(workflow: WorkflowConfig): WorkflowConfig {
       : {}),
     ...(workflow.strictPrelaunchGate !== undefined
       ? { strictPrelaunchGate: Boolean(workflow.strictPrelaunchGate) }
+      : {}),
+    ...(workflow.memoryEnabled !== undefined
+      ? { memoryEnabled: Boolean(workflow.memoryEnabled) }
+      : {}),
+    ...(workflow.webhookEnabled !== undefined
+      ? { webhookEnabled: Boolean(workflow.webhookEnabled) }
+      : {}),
+    ...(typeof workflow.webhookSecret === 'string' && workflow.webhookSecret.trim()
+      ? { webhookSecret: workflow.webhookSecret.trim() }
       : {}),
   });
 
@@ -336,18 +370,25 @@ export function listRunSummaries(limit = 20): ExecutionRunSummary[] {
     completed_at: string | null;
   }>;
 
-  return rows.map((row) => ({
-    id: row.id,
-    workflowId: row.workflow_id,
-    workflowName: row.workflow_name,
-    taskPrompt: row.task_prompt,
-    mode: row.mode,
-    status: row.status,
-    roundsExecuted: row.rounds_executed,
-    maxRounds: row.max_rounds,
-    createdAt: row.created_at,
-    completedAt: row.completed_at ?? undefined,
-  }));
+  return rows.map((row) => {
+    const durationMs =
+      row.completed_at && row.created_at
+        ? Math.max(0, new Date(row.completed_at).getTime() - new Date(row.created_at).getTime())
+        : undefined;
+    return {
+      id: row.id,
+      workflowId: row.workflow_id,
+      workflowName: row.workflow_name,
+      taskPrompt: row.task_prompt,
+      mode: row.mode,
+      status: row.status,
+      roundsExecuted: row.rounds_executed,
+      maxRounds: row.max_rounds,
+      durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
+      createdAt: row.created_at,
+      completedAt: row.completed_at ?? undefined,
+    };
+  });
 }
 
 export function getRunEvents(runId: string): ExecutionEvent[] {
@@ -357,6 +398,128 @@ export function getRunEvents(runId: string): ExecutionEvent[] {
     .get(runId) as { events_json: string } | undefined;
   if (!row) return [];
   return JSON.parse(row.events_json) as ExecutionEvent[];
+}
+
+export function getRunSummaryById(runId: string): ExecutionRunSummary | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `
+      SELECT id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, created_at, completed_at
+      FROM execution_runs
+      WHERE id = ?
+    `,
+    )
+    .get(runId) as
+    | {
+        id: string;
+        workflow_id: string;
+        workflow_name: string;
+        task_prompt: string;
+        mode: 'live' | 'dry_run';
+        status: ExecutionRunSummary['status'];
+        rounds_executed: number;
+        max_rounds: number;
+        created_at: string;
+        completed_at: string | null;
+      }
+    | undefined;
+  if (!row) return null;
+  const durationMs =
+    row.completed_at && row.created_at
+      ? Math.max(0, new Date(row.completed_at).getTime() - new Date(row.created_at).getTime())
+      : undefined;
+  return {
+    id: row.id,
+    workflowId: row.workflow_id,
+    workflowName: row.workflow_name,
+    taskPrompt: row.task_prompt,
+    mode: row.mode,
+    status: row.status,
+    roundsExecuted: row.rounds_executed,
+    maxRounds: row.max_rounds,
+    durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
+    createdAt: row.created_at,
+    completedAt: row.completed_at ?? undefined,
+  };
+}
+
+export function deleteRunRecord(runId: string): boolean {
+  const db = getDb();
+  const res = db.prepare('DELETE FROM execution_runs WHERE id = ?').run(runId);
+  return Number(res.changes) > 0;
+}
+
+export function listRecentWorkflowRunsWithSummary(
+  workflowId: string,
+  limit = 5,
+  excludeRunId?: string,
+): Array<{
+  id: string;
+  taskPrompt: string;
+  status: string;
+  roundsExecuted: number;
+  summary?: string;
+  createdAt: string;
+}> {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `
+      SELECT id, task_prompt, status, rounds_executed, events_json, created_at
+      FROM execution_runs
+      WHERE workflow_id = ? AND status IN ('completed', 'failed', 'cancelled')
+      ORDER BY created_at DESC
+      LIMIT ?
+    `,
+    )
+    .all(workflowId, limit + 1) as Array<{
+    id: string;
+    task_prompt: string;
+    status: string;
+    rounds_executed: number;
+    events_json: string;
+    created_at: string;
+  }>;
+
+  const out: Array<{
+    id: string;
+    taskPrompt: string;
+    status: string;
+    roundsExecuted: number;
+    summary?: string;
+    createdAt: string;
+  }> = [];
+
+  for (const row of rows) {
+    if (excludeRunId && row.id === excludeRunId) continue;
+    let summary: string | undefined;
+    try {
+      const evts = JSON.parse(row.events_json) as ExecutionEvent[];
+      const lastAgentMsg = [...evts].reverse().find((e) => e.type === 'agent_message');
+      summary = lastAgentMsg?.content?.slice(0, 160);
+    } catch {
+      // ignore malformed json
+    }
+    out.push({
+      id: row.id,
+      taskPrompt: row.task_prompt,
+      status: row.status,
+      roundsExecuted: row.rounds_executed,
+      summary,
+      createdAt: row.created_at,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+export function clearWorkflowRunsMemory(workflowId: string): number {
+  const db = getDb();
+  const res = db
+    .prepare("DELETE FROM execution_runs WHERE workflow_id = ? AND status IN ('completed', 'failed', 'cancelled')")
+    .run(workflowId);
+  return Number(res.changes);
 }
 
 export function getAppSettings(): AppSettings {
@@ -636,6 +799,7 @@ export function setProviderSecret(secretName: string, secretValue: string): Prov
   const db = getDb();
   const now = new Date().toISOString();
   const trimmed = secretValue.trim();
+  const encrypted = encryptSecret(trimmed);
   db.prepare(
     `
     INSERT INTO provider_secrets (secret_name, secret_value, updated_at)
@@ -644,7 +808,7 @@ export function setProviderSecret(secretName: string, secretValue: string): Prov
       secret_value = excluded.secret_value,
       updated_at = excluded.updated_at
   `,
-  ).run(normalized, trimmed, now);
+  ).run(normalized, encrypted, now);
 
   return {
     secretName: normalized,
@@ -671,7 +835,21 @@ export function getProviderSecret(secretName: string): { value: string; updatedA
     .prepare('SELECT secret_value, updated_at FROM provider_secrets WHERE secret_name = ?')
     .get(normalized) as { secret_value: string; updated_at: string } | undefined;
   if (!row || !row.secret_value.trim()) return null;
-  return { value: row.secret_value.trim(), updatedAt: row.updated_at };
+  try {
+    const { value, wasPlaintext } = decryptSecret(row.secret_value);
+    if (!value) return null;
+    if (wasPlaintext && !isEncryptedSecretValue(row.secret_value)) {
+      // Auto-migrate legacy plaintext vault row to AES-256-GCM encrypted format
+      const encrypted = encryptSecret(value);
+      db.prepare('UPDATE provider_secrets SET secret_value = ? WHERE secret_name = ?').run(
+        encrypted,
+        normalized,
+      );
+    }
+    return { value, updatedAt: row.updated_at };
+  } catch {
+    return null;
+  }
 }
 
 export function resolveServerSecret(secretName: string): {

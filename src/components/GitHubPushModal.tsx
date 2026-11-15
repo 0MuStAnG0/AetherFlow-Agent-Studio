@@ -261,30 +261,30 @@ export function GitHubPushModal({
   }> = [
     {
       id: 'project_bundle',
-      titleEn: 'Project + Sandbox + Workflow Bundle',
-      titleFa: 'بسته کامل پروژه + خروجی سندباکس + ورکفلو',
+      titleEn: 'Project + Agent Edits Applied',
+      titleFa: 'پروژه اصلی + اعمال تغییرات در پوشه کدها',
       descEn:
-        'Includes imported project files, agent-generated sandbox files, .aetherflow/*.workflow.json, and AETHERFLOW_WORKFLOW.md.',
+        'Applies all agent edits directly inside the project code folders and writes the changelog only in README.md.',
       descFa:
-        'شامل فایل‌های پروژه ایمپورت‌شده، کدهای تولیدی ایجنت‌ها در سندباکس، فایل JSON ورکفلو و مستندات تیم.',
+        'تمام تغییرات و فایل‌های ایجنت‌ها را مستقیماً در پوشه و مسیر خود کدها اعمال و لیست تغییرات را فقط در README.md ثبت می‌کند.',
     },
     {
       id: 'sandbox_only',
-      titleEn: 'Sandbox Generated Files + Workflow',
-      titleFa: 'فقط فایل‌های تولیدشده سندباکس + ورکفلو',
+      titleEn: 'Modified & New Code Files Only',
+      titleFa: 'فقط فایل‌های ویرایش‌شده و جدید در مسیر کدها',
       descEn:
-        'Lightweight archive with only the files generated during execution plus workflow JSON and summary.',
+        'Lightweight archive with only the files modified or added by agents in their code folders plus README.md changelog.',
       descFa:
-        'بسته سبک شامل کدها و تست‌های نوشته‌شده توسط ایجنت‌ها در سندباکس به همراه تنظیمات ورکفلو.',
+        'بسته سبک شامل فایل‌های تغییریافته و جدید در مسیر کدها به همراه لیست تغییرات در README.md.',
     },
     {
       id: 'full_studio',
-      titleEn: 'Full AetherFlow Studio + Linux Installer',
-      titleFa: 'کل سورس نرم‌افزار AetherFlow + اسکریپت نصب لینوکس',
+      titleEn: 'Full Studio Codebase + Agent Edits',
+      titleFa: 'کل سورس استودیو + اعمال تغییرات در پوشه کدها',
       descEn:
-        'Complete self-hosted studio source (install-linux.sh, Dockerfile, server.ts, src/, deploy/) with your workflow bundled.',
+        'Complete self-hosted codebase (install-linux.sh, Dockerfile, server.ts, src/, deploy/) with agent edits in-place and changelog in README.md.',
       descFa:
-        'کل سورس نرم‌افزار، اسکریپت نصب لینوکس، داکر و فایل‌های استقرار به همراه ورکفلوی فعلی شما.',
+        'کل سورس نرم‌افزار همراه با اعمال تغییرات ایجنت‌ها در پوشه کدها و ثبت لیست تغییرات در README.md.',
     },
   ];
 

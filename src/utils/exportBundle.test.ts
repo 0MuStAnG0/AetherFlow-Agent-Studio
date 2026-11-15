@@ -10,6 +10,7 @@ import {
   isSafeExportFilePath,
   mergeSandboxSnapshots,
   slugifyBundleName,
+  upsertReadmeChangelog,
   validateGitHubPushParams,
 } from './exportBundle.ts';
 
@@ -27,14 +28,15 @@ test('isSafeExportFilePath blocks .env secrets, databases, and path traversal wh
   assert.equal(isSafeExportFilePath('node_modules/pkg/index.js'), false);
 });
 
-test('assembleExportBundleFiles merges project and sandbox files with accurate changeType and creates valid ZIP buffer', () => {
+test('assembleExportBundleFiles overlays edits inside project folders and writes changelog ONLY into README.md', () => {
   const wf = DEFAULT_SEED_WORKFLOWS[0];
   const files = assembleExportBundleFiles({
     scope: 'project_bundle',
     workflow: wf,
     importedProjectFiles: [
-      { path: 'README.md', content: '# Sample Project' },
+      { path: 'README.md', content: '# Sample Project\n\nOriginal overview.' },
       { path: 'app/service.mjs', content: 'export const v = 1;' },
+      { path: 'app/unchanged.mjs', content: 'export const keep = true;' },
       { path: '.env', content: 'SECRET=should_not_be_exported' },
     ],
     sandboxFiles: [
@@ -42,6 +44,12 @@ test('assembleExportBundleFiles merges project and sandbox files with accurate c
         path: 'app/service.mjs',
         content: 'export const v = 2; // updated by Backend Agent',
         size: 48,
+        updatedAt: '2026-11-14T10:00:00.000Z',
+      },
+      {
+        path: 'app/unchanged.mjs',
+        content: 'export const keep = true;',
+        size: 25,
         updatedAt: '2026-11-14T10:00:00.000Z',
       },
       {
@@ -54,32 +62,122 @@ test('assembleExportBundleFiles merges project and sandbox files with accurate c
   });
 
   const paths = files.map((f) => f.path);
-  assert.ok(paths.includes('README.md'));
-  assert.ok(paths.includes('app/service.mjs'));
-  assert.ok(paths.includes('tests/service.test.mjs'));
-  assert.ok(paths.includes('AETHERFLOW_WORKFLOW.md'));
-  assert.ok(paths.some((p) => p.endsWith('.workflow.json')));
+  assert.deepEqual(paths, [
+    'app/service.mjs',
+    'app/unchanged.mjs',
+    'README.md',
+    'tests/service.test.mjs',
+  ]);
+  assert.equal(paths.some((p) => p.includes('.aetherflow')), false);
+  assert.equal(paths.some((p) => p.includes('AETHERFLOW_WORKFLOW.md')), false);
+  assert.equal(paths.some((p) => p.endsWith('.workflow.json')), false);
+  assert.equal(paths.some((p) => p.startsWith('sandbox_output/')), false);
   assert.equal(paths.includes('.env'), false);
 
-  // Verify sandbox file overlaid imported project file and marked changeType accurately
   const serviceEntry = files.find((f) => f.path === 'app/service.mjs');
   assert.ok(serviceEntry?.content.includes('updated by Backend Agent'));
   assert.equal(serviceEntry?.changeType, 'modified');
-  assert.equal(files.find((f) => f.path === 'README.md')?.changeType, 'project');
+  assert.equal(files.find((f) => f.path === 'app/unchanged.mjs')?.changeType, 'project');
   assert.equal(files.find((f) => f.path === 'tests/service.test.mjs')?.changeType, 'added');
 
+  const readmeEntry = files.find((f) => f.path === 'README.md');
+  assert.equal(readmeEntry?.changeType, 'modified');
+  assert.ok(readmeEntry?.content.includes('# Sample Project'));
+  assert.ok(readmeEntry?.content.includes('Original overview.'));
+  assert.ok(readmeEntry?.content.includes('## Changelog (Agent Team Edits)'));
+  assert.ok(readmeEntry?.content.includes('`app/service.mjs`'));
+  assert.ok(readmeEntry?.content.includes('`tests/service.test.mjs`'));
+  assert.equal(readmeEntry?.content.includes('`app/unchanged.mjs`'), false);
+
   const summary = computeExportChangeSummary(files);
-  assert.equal(summary.modifiedCount, 1);
+  assert.equal(summary.modifiedCount, 2); // app/service.mjs + README.md
   assert.equal(summary.addedCount, 1);
   assert.equal(summary.projectCount, 1);
-  assert.equal(summary.metadataCount, 2);
+  assert.equal(summary.metadataCount, 0);
 
   // Verify ZIP creation round-trip
   const zipBuf = createZipBufferFromBundle(files);
   const zip = new AdmZip(zipBuf);
   const zipEntries = zip.getEntries().map((e) => e.entryName);
-  assert.ok(zipEntries.includes('app/service.mjs'));
-  assert.ok(zipEntries.includes('AETHERFLOW_WORKFLOW.md'));
+  assert.deepEqual(zipEntries.sort(), [
+    'README.md',
+    'app/service.mjs',
+    'app/unchanged.mjs',
+    'tests/service.test.mjs',
+  ]);
+});
+
+test('assembleExportBundleFiles applies edits directly in full_studio and sandbox_only without wrapper folders', () => {
+  const wf = DEFAULT_SEED_WORKFLOWS[0];
+
+  const fullFiles = assembleExportBundleFiles({
+    scope: 'full_studio',
+    workflow: wf,
+    studioSourceFiles: [
+      { path: 'README.md', content: '# Studio Root' },
+      { path: 'src/App.tsx', content: 'export const App = () => null;' },
+    ],
+    sandboxFiles: [
+      {
+        path: 'src/App.tsx',
+        content: 'export const App = () => "updated";',
+        size: 35,
+        updatedAt: '2026-11-15T08:00:00.000Z',
+      },
+      {
+        path: 'src/utils/helper.ts',
+        content: 'export const helper = 1;',
+        size: 24,
+        updatedAt: '2026-11-15T08:01:00.000Z',
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    fullFiles.map((f) => f.path),
+    ['README.md', 'src/App.tsx', 'src/utils/helper.ts'],
+  );
+  assert.equal(fullFiles.find((f) => f.path === 'src/App.tsx')?.changeType, 'modified');
+  assert.equal(fullFiles.find((f) => f.path === 'src/utils/helper.ts')?.changeType, 'added');
+  assert.ok(fullFiles.find((f) => f.path === 'README.md')?.content.includes('`src/App.tsx`'));
+
+  const sandboxOnly = assembleExportBundleFiles({
+    scope: 'sandbox_only',
+    workflow: wf,
+    importedProjectFiles: [
+      { path: 'src/unchanged.ts', content: 'const x = 1;' },
+      { path: 'src/App.tsx', content: 'const app = 1;' },
+    ],
+    sandboxFiles: [
+      { path: 'src/unchanged.ts', content: 'const x = 1;', size: 12, updatedAt: '2026-11-15T08:00:00.000Z' },
+      { path: 'src/App.tsx', content: 'const app = 2;', size: 14, updatedAt: '2026-11-15T08:00:00.000Z' },
+      { path: 'tests/new.test.ts', content: 'export {};', size: 10, updatedAt: '2026-11-15T08:00:00.000Z' },
+    ],
+  });
+
+  assert.deepEqual(
+    sandboxOnly.map((f) => f.path),
+    ['README.md', 'src/App.tsx', 'tests/new.test.ts'],
+  );
+  assert.equal(sandboxOnly.find((f) => f.path === 'README.md')?.changeType, 'added');
+});
+
+test('upsertReadmeChangelog replaces previous changelog markers without duplicating sections', () => {
+  const wf = DEFAULT_SEED_WORKFLOWS[0];
+  const first = upsertReadmeChangelog('# App Title', {
+    workflow: wf,
+    modifiedPaths: ['src/a.ts'],
+    addedPaths: [],
+  });
+  const second = upsertReadmeChangelog(first, {
+    workflow: wf,
+    modifiedPaths: ['src/a.ts', 'src/b.ts'],
+    addedPaths: ['tests/b.test.ts'],
+  });
+  assert.equal((second.match(/## Changelog \(Agent Team Edits\)/g) ?? []).length, 1);
+  assert.ok(second.includes('# App Title'));
+  assert.ok(second.includes('`src/b.ts`'));
+  assert.ok(second.includes('`tests/b.test.ts`'));
 });
 
 test('mergeSandboxSnapshots merges chronological agent runs with newer edits overriding older ones', () => {
@@ -104,7 +202,7 @@ test('mergeSandboxSnapshots merges chronological agent runs with newer edits ove
   );
 });
 
-test('assembleExportBundleFiles produces clean minimal ZIP for non-ASCII workflow with no test artifacts', () => {
+test('assembleExportBundleFiles produces clean README-only fallback ZIP for non-ASCII workflow with no edits', () => {
   const wf = { ...DEFAULT_SEED_WORKFLOWS[0], name: 'تیم مهندسی نرم‌افزار' };
   assert.equal(slugifyBundleName(wf.name), 'aetherflow-project');
   const files = assembleExportBundleFiles({
@@ -116,11 +214,11 @@ test('assembleExportBundleFiles produces clean minimal ZIP for non-ASCII workflo
   });
   assert.deepEqual(
     files.map((f) => f.path),
-    ['.aetherflow/aetherflow-project.workflow.json', 'AETHERFLOW_WORKFLOW.md'],
+    ['README.md'],
   );
   const zipBuf = createZipBufferFromBundle(files);
   const zip = new AdmZip(zipBuf);
-  assert.equal(zip.getEntries().length, 2);
+  assert.equal(zip.getEntries().length, 1);
 });
 
 test('validateGitHubPushParams and buildContentDispositionHeader handle valid/invalid inputs safely', () => {

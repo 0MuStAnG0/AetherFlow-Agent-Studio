@@ -10,9 +10,12 @@ import {
   FolderGit2,
   FolderTree,
   GitBranch,
+  Globe,
+  Key,
   Layers,
   Link2,
   RefreshCw,
+  Send,
   ShieldCheck,
   Terminal,
   UploadCloud,
@@ -20,6 +23,7 @@ import {
 import type {
   BlueprintFile,
   ExecutionRunSummary,
+  FileDiffEntry,
   PrelaunchTestReport,
   WorkflowConfig,
 } from '../types/workflow';
@@ -33,6 +37,7 @@ import {
   buildLinuxOneLineCommand,
   type LinuxInstallMode,
 } from '../utils/githubDeploy';
+import { CodeDiffViewer } from './CodeDiffViewer';
 import { PreLaunchTestSuite } from './PreLaunchTestSuite';
 
 interface ExportableRunSummary extends ExecutionRunSummary {
@@ -83,6 +88,10 @@ interface BlueprintViewProps {
     targetWorkflow?: WorkflowConfig,
     targetRunId?: string | null,
   ) => void;
+  onUpdateWorkflowWebhook?: (
+    workflowId: string,
+    patch: { webhookEnabled?: boolean; webhookSecret?: string },
+  ) => Promise<void> | void;
 }
 
 const STORAGE_REPO_KEY = 'aetherflow_github_deploy_repo';
@@ -138,6 +147,7 @@ export function BlueprintView({
   onDownloadZip,
   downloadingZip = false,
   onOpenGitHubPush,
+  onUpdateWorkflowWebhook,
 }: BlueprintViewProps) {
   const isFa = lang === 'fa';
   const [files, setFiles] = useState<BlueprintFile[]>([]);
@@ -146,6 +156,19 @@ export function BlueprintView({
   const [copied, setCopied] = useState(false);
   const [copiedOneLiner, setCopiedOneLiner] = useState(false);
   const [copiedGitClone, setCopiedGitClone] = useState(false);
+  const [copiedWebhookCurl, setCopiedWebhookCurl] = useState(false);
+  const [webhookEnabledInput, setWebhookEnabledInput] = useState<boolean>(
+    workflow.webhookEnabled !== false,
+  );
+  const [webhookSecretInput, setWebhookSecretInput] = useState<string>(
+    workflow.webhookSecret ?? '',
+  );
+  const [webhookTestBusy, setWebhookTestBusy] = useState(false);
+  const [webhookTestResult, setWebhookTestResult] = useState<{
+    ok: boolean;
+    message: string;
+    runId?: string;
+  } | null>(null);
 
   // Selective project & completed-run export state
   const [exportProjects, setExportProjects] = useState<ExportableProjectInfo[]>([]);
@@ -176,6 +199,9 @@ export function BlueprintView({
   const [installDir, setInstallDir] = useState<string>('');
   const [portInput, setPortInput] = useState<string>('3000');
   const [domainInput, setDomainInput] = useState<string>('');
+  const [exportInspectorTab, setExportInspectorTab] = useState<'files' | 'diff'>('files');
+  const [exportDiffs, setExportDiffs] = useState<FileDiffEntry[]>([]);
+  const [exportDiffLoading, setExportDiffLoading] = useState(false);
 
   const availableWorkflows = useMemo(() => {
     const map = new Map<string, WorkflowConfig>();
@@ -219,10 +245,13 @@ export function BlueprintView({
     }
   }, [availableWorkflows, selectedProjectId, workflow.id]);
 
-  // Reset run selector when switching project
+  // Reset run selector & sync webhook settings when switching project
   useEffect(() => {
     setSelectedRunId('__merged_completed__');
-  }, [selectedProjectId]);
+    setWebhookEnabledInput(selectedWorkflow.webhookEnabled !== false);
+    setWebhookSecretInput(selectedWorkflow.webhookSecret ?? '');
+    setWebhookTestResult(null);
+  }, [selectedProjectId, selectedWorkflow.webhookEnabled, selectedWorkflow.webhookSecret]);
 
   // Fetch live export bundle preview (with agent-modified/added counts)
   useEffect(() => {
@@ -252,6 +281,46 @@ export function BlueprintView({
       active = false;
     };
   }, [selectedScope, selectedWorkflow, selectedRunId, exportProjects]);
+
+  useEffect(() => {
+    if (!showExportFiles) return;
+    let active = true;
+    const effectiveRunId =
+      selectedRunId && selectedRunId !== '__merged_completed__'
+        ? selectedRunId
+        : selectedProjectMeta?.runs.find((r) => r.status === 'completed')?.id ??
+          selectedProjectMeta?.runs[0]?.id ??
+          activeRunId ??
+          null;
+    const projectId = selectedWorkflow.projectContext?.projectId;
+    const endpoint =
+      effectiveRunId
+        ? `/api/runs/${encodeURIComponent(effectiveRunId)}/diff`
+        : projectId
+          ? `/api/projects/${encodeURIComponent(projectId)}/diff`
+          : null;
+    if (!endpoint) {
+      setExportDiffs([]);
+      return;
+    }
+    setExportDiffLoading(true);
+    fetch(endpoint)
+      .then((res) => (res.ok ? res.json() : { diffs: [] }))
+      .then((data: { diffs?: FileDiffEntry[] }) => {
+        if (active && Array.isArray(data.diffs)) {
+          setExportDiffs(data.diffs);
+        }
+      })
+      .catch(() => {
+        if (active) setExportDiffs([]);
+      })
+      .finally(() => {
+        if (active) setExportDiffLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [showExportFiles, selectedRunId, selectedProjectMeta, selectedWorkflow, activeRunId]);
 
   useEffect(() => {
     if (defaultRepoUrl?.trim() && !repoInput.trim()) {
@@ -330,6 +399,85 @@ export function BlueprintView({
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  const webhookEndpointUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}/api/webhooks/${selectedWorkflow.id}`
+      : `/api/webhooks/${selectedWorkflow.id}`;
+
+  const webhookCurlSnippet = `curl -X POST "${webhookEndpointUrl}" \\
+  -H "Content-Type: application/json" \\${
+    webhookSecretInput.trim()
+      ? `\n  -H "x-webhook-secret: ${webhookSecretInput.trim()}" \\`
+      : ''
+  }
+  -d '{"prompt":"Audit new pull request and run QA checks","mode":"dry_run"}'`;
+
+  const handleCopyWebhookCurl = async () => {
+    await navigator.clipboard?.writeText(webhookCurlSnippet).catch(() => {});
+    setCopiedWebhookCurl(true);
+    setTimeout(() => setCopiedWebhookCurl(false), 1800);
+  };
+
+  const handleSaveWebhookSettings = async (
+    nextEnabled = webhookEnabledInput,
+    nextSecret = webhookSecretInput,
+  ) => {
+    if (onUpdateWorkflowWebhook) {
+      await onUpdateWorkflowWebhook(selectedWorkflow.id, {
+        webhookEnabled: nextEnabled,
+        webhookSecret: nextSecret.trim(),
+      });
+    }
+  };
+
+  const handleTestWebhook = async () => {
+    setWebhookTestBusy(true);
+    setWebhookTestResult(null);
+    try {
+      await handleSaveWebhookSettings(webhookEnabledInput, webhookSecretInput);
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (webhookSecretInput.trim()) {
+        headers['x-webhook-secret'] = webhookSecretInput.trim();
+      }
+      const res = await fetch(`/api/webhooks/${encodeURIComponent(selectedWorkflow.id)}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          prompt: `Webhook test dispatch for ${selectedWorkflow.name}`,
+          mode: 'dry_run',
+          source: 'deploy-panel',
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        accepted?: boolean;
+        runId?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setWebhookTestResult({
+          ok: false,
+          message: data.error || `HTTP ${res.status}`,
+        });
+        return;
+      }
+      setWebhookTestResult({
+        ok: true,
+        runId: data.runId,
+        message: isFa
+          ? `وب‌هوک با موفقیت پذیرفته شد (شناسه اجرا: ${data.runId})`
+          : `Accepted (HTTP 202) · Run ID: ${data.runId}`,
+      });
+      fetchExportProjects();
+    } catch {
+      setWebhookTestResult({
+        ok: false,
+        message: isFa ? 'خطای شبکه در ارسال درخواست وب‌هوک' : 'Network error calling webhook',
+      });
+    } finally {
+      setWebhookTestBusy(false);
+    }
   };
 
   return (
@@ -426,8 +574,8 @@ export function BlueprintView({
             </h2>
             <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
               {isFa
-                ? 'پروژه تکمیل‌شده و نسخه خروجی ایجنت‌ها را انتخاب کنید تا تمام فایل‌های ویرایش‌شده و جدید تیم ایجنت‌ها روی کد اصلی پروژه اعمال و در گیت‌هاب یا فایل ZIP ذخیره شود.'
-                : 'Select a completed project and agent run snapshot to merge all agent-modified and created files onto the project before downloading as ZIP or pushing to GitHub.'}
+                ? 'پروژه تکمیل‌شده و نسخه خروجی ایجنت‌ها را انتخاب کنید تا تمام فایل‌های ویرایش‌شده و جدید مستقیماً داخل پوشه و مسیر خود کدها اعمال و لیست تغییرات فقط در README.md ثبت شود.'
+                : 'Select a completed project and agent run snapshot to apply all modified and created files directly inside the project code folders, with the changelog written only in README.md.'}
             </p>
           </div>
 
@@ -640,37 +788,83 @@ export function BlueprintView({
         {showExportFiles && exportPreview && (
           <div
             data-testid="deploy-export-files-list"
-            dir="ltr"
-            className="mt-2.5 max-h-48 overflow-y-auto rounded-lg border border-slate-200 bg-slate-950 p-3 font-mono text-[11px] text-slate-200 dark:border-slate-800"
+            className="mt-2.5 space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950"
           >
-            {exportPreview.files.map((f) => (
-              <div key={f.path} className="flex items-center justify-between gap-2 py-0.5">
-                <span className="min-w-0 truncate">{f.path}</span>
-                <div className="flex shrink-0 items-center gap-2">
-                  {f.changeType === 'modified' && (
-                    <span className="rounded bg-amber-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-amber-300">
-                      MODIFIED
-                    </span>
-                  )}
-                  {f.changeType === 'added' && (
-                    <span className="rounded bg-emerald-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-emerald-300">
-                      NEW
-                    </span>
-                  )}
-                  {f.changeType === 'project' && (
-                    <span className="rounded bg-slate-800 px-1.5 py-0.2 text-[9px] text-slate-300">
-                      PROJECT
-                    </span>
-                  )}
-                  {f.changeType === 'metadata' && (
-                    <span className="rounded bg-blue-950 px-1.5 py-0.2 text-[9px] text-blue-300">
-                      META
-                    </span>
-                  )}
-                  <span className="text-slate-400">{formatByteSize(f.size)}</span>
-                </div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="inline-flex items-center gap-1 rounded-md bg-slate-200/70 p-0.5 dark:bg-slate-800">
+                <button
+                  type="button"
+                  data-testid="deploy-export-tab-files"
+                  onClick={() => setExportInspectorTab('files')}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    exportInspectorTab === 'files'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-900 dark:text-slate-100'
+                      : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                  }`}
+                >
+                  {isFa
+                    ? `فایل‌های خروجی (${exportPreview.files.length})`
+                    : `Output Files (${exportPreview.files.length})`}
+                </button>
+                <button
+                  type="button"
+                  data-testid="deploy-export-tab-diff"
+                  onClick={() => setExportInspectorTab('diff')}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    exportInspectorTab === 'diff'
+                      ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-900 dark:text-slate-100'
+                      : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                  }`}
+                >
+                  {isFa
+                    ? `تغییرات خط‌به‌خط (${exportDiffs.length})`
+                    : `Line Diff (${exportDiffs.length})`}
+                </button>
               </div>
-            ))}
+              {exportDiffLoading && (
+                <span className="text-[11px] text-slate-500">
+                  {isFa ? 'در حال بارگذاری Diff...' : 'Loading diff...'}
+                </span>
+              )}
+            </div>
+
+            {exportInspectorTab === 'diff' ? (
+              <CodeDiffViewer diffs={exportDiffs} lang={lang} />
+            ) : (
+              <div
+                dir="ltr"
+                className="max-h-56 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950 p-3 font-mono text-[11px] text-slate-200"
+              >
+                {exportPreview.files.map((f) => (
+                  <div key={f.path} className="flex items-center justify-between gap-2 py-0.5">
+                    <span className="min-w-0 truncate">{f.path}</span>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {f.changeType === 'modified' && (
+                        <span className="rounded bg-amber-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-amber-300">
+                          MODIFIED
+                        </span>
+                      )}
+                      {f.changeType === 'added' && (
+                        <span className="rounded bg-emerald-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-emerald-300">
+                          NEW
+                        </span>
+                      )}
+                      {f.changeType === 'project' && (
+                        <span className="rounded bg-slate-800 px-1.5 py-0.2 text-[9px] text-slate-300">
+                          PROJECT
+                        </span>
+                      )}
+                      {f.changeType === 'metadata' && (
+                        <span className="rounded bg-blue-950 px-1.5 py-0.2 text-[9px] text-blue-300">
+                          META
+                        </span>
+                      )}
+                      <span className="tabular-nums text-slate-400">{formatByteSize(f.size)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -686,6 +880,124 @@ export function BlueprintView({
         onStrictModeChange={onStrictPrelaunchModeChange}
         onAskAgentsToFix={onFixPrelaunchIssues}
       />
+
+      {/* External Webhook Trigger API (n8n-style event-driven workflow dispatch) */}
+      <div
+        data-testid="webhook-trigger-panel"
+        className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs dark:border-slate-800 dark:bg-slate-900"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3 dark:border-slate-800">
+          <div>
+            <h2 className="flex items-center gap-2 font-display text-sm font-bold text-slate-900 dark:text-slate-100">
+              <Globe className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+              <span>
+                {isFa
+                  ? 'راه‌انداز Webhook خارجی (Webhook Trigger API)'
+                  : 'External Webhook Trigger API (Event-Driven Dispatch)'}
+              </span>
+            </h2>
+            <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+              {isFa
+                ? 'با ارسال درخواست POST به این آدرس از گیت‌هاب، CI/CD یا ابزارهای دیگر، تیم ایجنت‌ها به‌صورت خودکار فعال می‌شود.'
+                : 'Trigger this multi-agent pipeline automatically from CI/CD, GitHub Actions, or external apps via HTTP POST.'}
+            </p>
+          </div>
+
+          <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800 dark:text-slate-200">
+            <input
+              type="checkbox"
+              data-testid="webhook-enable-checkbox"
+              checked={webhookEnabledInput}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setWebhookEnabledInput(next);
+                void handleSaveWebhookSettings(next, webhookSecretInput);
+              }}
+              className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-600"
+            />
+            <span>{isFa ? 'فعال‌سازی Webhook' : 'Enable Webhook'}</span>
+          </label>
+        </div>
+
+        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-12">
+          <div className="flex flex-col gap-1 md:col-span-6">
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+              {isFa ? 'آدرس Webhook Endpoint' : 'Webhook POST Endpoint'}
+            </span>
+            <div
+              dir="ltr"
+              data-testid="webhook-endpoint-url"
+              className="truncate rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-800 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
+            >
+              {webhookEndpointUrl}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1 md:col-span-4">
+            <span className="flex items-center gap-1 text-xs font-semibold text-slate-700 dark:text-slate-300">
+              <Key className="h-3.5 w-3.5 text-slate-500" />
+              {isFa ? 'کلید امنیتی (اختیاری)' : 'Webhook Secret (Optional)'}
+            </span>
+            <input
+              type="text"
+              dir="ltr"
+              data-testid="webhook-secret-input"
+              value={webhookSecretInput}
+              onChange={(e) => setWebhookSecretInput(e.target.value)}
+              onBlur={() => void handleSaveWebhookSettings(webhookEnabledInput, webhookSecretInput)}
+              placeholder={isFa ? 'خالی = بدون احراز هویت' : 'Leave blank or enter secret token'}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-900 outline-none focus:border-blue-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            />
+          </div>
+
+          <div className="flex items-end gap-2 md:col-span-2">
+            <button
+              type="button"
+              data-testid="test-webhook-btn"
+              disabled={webhookTestBusy || !webhookEnabledInput}
+              onClick={() => void handleTestWebhook()}
+              className="inline-flex w-full items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-600 dark:hover:bg-blue-700"
+            >
+              <Send className="h-3.5 w-3.5" />
+              <span>{webhookTestBusy ? (isFa ? 'در حال ارسال...' : 'Testing...') : isFa ? 'تست Webhook' : 'Test Webhook'}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <pre
+            dir="ltr"
+            className="min-w-0 flex-1 overflow-x-auto rounded-lg bg-slate-950 px-3 py-2 font-mono text-[11px] text-slate-200"
+          >
+            <code>{webhookCurlSnippet}</code>
+          </pre>
+          <button
+            type="button"
+            onClick={() => void handleCopyWebhookCurl()}
+            className="inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
+          >
+            {copiedWebhookCurl ? (
+              <Check className="h-3.5 w-3.5 text-emerald-600" />
+            ) : (
+              <Copy className="h-3.5 w-3.5" />
+            )}
+            <span>{copiedWebhookCurl ? (isFa ? 'کپی شد' : 'Copied') : isFa ? 'کپی curl' : 'Copy curl'}</span>
+          </button>
+        </div>
+
+        {webhookTestResult && (
+          <p
+            data-testid="webhook-test-result"
+            className={`mt-2.5 text-xs font-medium ${
+              webhookTestResult.ok
+                ? 'text-emerald-700 dark:text-emerald-400'
+                : 'text-rose-700 dark:text-rose-400'
+            }`}
+          >
+            {webhookTestResult.message}
+          </p>
+        )}
+      </div>
 
       {/* GitHub One-Line Linux Command Builder */}
       <div
