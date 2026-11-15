@@ -4,6 +4,7 @@ import {
   buildManagerInspectionContext,
   buildStructuredAgentPrompt,
   buildWorkflowShareUrl,
+  clampContinuousIntervalSec,
   clampMaxRounds,
   clampTemperature,
   computeExecutionOrder,
@@ -19,6 +20,7 @@ import {
   parseImportedWorkflowJson,
   selectNextSpeaker,
   serializeWorkflowForExport,
+  syncWorkflowInList,
   validateWorkflowForRun,
 } from './workflowEngine';
 import type { WorkflowConfig, WorkflowEdge, WorkflowNode } from '../types/workflow';
@@ -321,5 +323,55 @@ test('serializeWorkflowForExport, parseImportedWorkflowJson, and share URL round
   assert.equal(parseImportedWorkflowJson('{bad json').workflow, null);
   assert.equal(decodeWorkflowFromShareParam('invalid@@@'), null);
 });
+
+test('syncWorkflowInList keeps active node permission edits synced and preserves continuousAgentWork', () => {
+  const mgr = makeNode('mgr', 'manager', 40);
+  mgr.data.powerLevel = 'ultra';
+  mgr.data.section = 'Architecture';
+  mgr.data.tools.execBash = true;
+
+  const baseWf: WorkflowConfig = {
+    id: 'wf-sync-1',
+    name: 'Sync Project',
+    description: 'Continuous build project',
+    maxRounds: 8,
+    humanInTheLoop: true,
+    continuousAgentWork: true,
+    continuousIntervalSec: 45,
+    strictPrelaunchGate: true,
+    nodes: [mgr],
+    edges: [],
+    updatedAt: '2026-11-15T00:00:00.000Z',
+  };
+
+  const modifiedWf: WorkflowConfig = {
+    ...baseWf,
+    nodes: [
+      {
+        ...mgr,
+        data: {
+          ...mgr.data,
+          tools: { readFile: true, writeFile: false, execBash: true },
+        },
+      },
+    ],
+  };
+
+  const synced = syncWorkflowInList([baseWf], modifiedWf);
+  assert.equal(synced.length, 1);
+  assert.equal(synced[0].nodes[0].data.tools.execBash, true);
+  assert.equal(synced[0].nodes[0].data.tools.writeFile, false);
+  assert.equal(clampContinuousIntervalSec(2), 5);
+  assert.equal(clampContinuousIntervalSec(7200), 3600);
+
+  const parsed = parseImportedWorkflowJson(serializeWorkflowForExport(modifiedWf));
+  assert.equal(parsed.workflow?.continuousAgentWork, true);
+  assert.equal(parsed.workflow?.continuousIntervalSec, 45);
+  assert.equal(parsed.workflow?.strictPrelaunchGate, true);
+  assert.equal(parsed.workflow?.nodes[0].data.powerLevel, 'ultra');
+  assert.equal(parsed.workflow?.nodes[0].data.section, 'Architecture');
+  assert.equal(parsed.workflow?.nodes[0].data.tools.execBash, true);
+});
+
 
 

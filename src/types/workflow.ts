@@ -64,10 +64,86 @@ export interface WorkflowConfig {
   description: string;
   maxRounds: number;
   humanInTheLoop: boolean;
+  continuousAgentWork?: boolean;
+  continuousIntervalSec?: number;
+  strictPrelaunchGate?: boolean;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   projectContext?: WorkflowProjectContext;
   updatedAt: string;
+}
+
+export interface ContinuousWorkSession {
+  workflowId: string;
+  active: boolean;
+  status: 'idle' | 'running' | 'cooldown' | 'paused' | 'error_backoff';
+  cyclesCompleted: number;
+  lastRunId?: string;
+  lastRunStatus?: string;
+  lastCycleAt?: string;
+  nextCycleAt?: string;
+  intervalSec: number;
+  mode: 'live' | 'dry_run';
+  taskPrompt: string;
+  consecutiveErrors: number;
+  lastError?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
+export type PrelaunchCategoryId =
+  | 'core_technical'
+  | 'functional_nonfunctional'
+  | 'ux_compatibility'
+  | 'final_pre_release';
+
+export type PrelaunchTestId =
+  | 'unit'
+  | 'integration'
+  | 'system'
+  | 'functional'
+  | 'performance'
+  | 'stress'
+  | 'security'
+  | 'usability'
+  | 'compatibility'
+  | 'regression'
+  | 'smoke'
+  | 'alpha'
+  | 'beta'
+  | 'uat';
+
+export type PrelaunchTestStatus = 'pass' | 'warn' | 'fail';
+
+export interface PrelaunchTestResult {
+  id: PrelaunchTestId;
+  category: PrelaunchCategoryId;
+  severity: 'critical' | 'high' | 'medium';
+  status: PrelaunchTestStatus;
+  score: number;
+  durationMs: number;
+  summaryEn: string;
+  summaryFa: string;
+  evidence: string[];
+  recommendationEn?: string;
+  recommendationFa?: string;
+}
+
+export interface PrelaunchTestReport {
+  id: string;
+  workflowId: string;
+  workflowName: string;
+  strictMode: boolean;
+  gateStatus: 'approved' | 'blocked';
+  overallScore: number;
+  passedCount: number;
+  warnCount: number;
+  failedCount: number;
+  totalTests: number;
+  durationMs: number;
+  targetScope: string;
+  results: PrelaunchTestResult[];
+  createdAt: string;
 }
 
 export interface ToolCallLog {

@@ -20,6 +20,7 @@ import {
   Moon,
   Pencil,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Sun,
@@ -39,9 +40,11 @@ import type {
   BugReportItem,
   BugReportStatus,
   CapabilitiesState,
+  ContinuousWorkSession,
   ExecutionEvent,
   ExecutionRunSummary,
   ImportedProjectAnalysis,
+  PrelaunchTestReport,
   RecommendedAgentSpec,
   SandboxFile,
   WorkflowConfig,
@@ -61,10 +64,12 @@ import { buildWorkflowFromRecommendations } from './utils/projectAnalyzer';
 import {
   DEFAULT_APP_SETTINGS,
   buildWorkflowShareUrl,
+  clampContinuousIntervalSec,
   clampMaxRounds,
   decodeWorkflowFromShareParam,
   parseImportedWorkflowJson,
   serializeWorkflowForExport,
+  syncWorkflowInList,
 } from './utils/workflowEngine';
 import type { ExportBundleScope } from './utils/exportBundle';
 import {
@@ -208,10 +213,30 @@ export default function App() {
     type: 'success' | 'error';
     text: string;
   } | null>(null);
+  const [continuousSession, setContinuousSession] = useState<ContinuousWorkSession | null>(null);
+  const [continuousBusy, setContinuousBusy] = useState(false);
+  const [prelaunchReport, setPrelaunchReport] = useState<PrelaunchTestReport | null>(null);
+  const [dirtyVersion, setDirtyVersion] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
   const hasSharedWorkflowRef = useRef(false);
+  const workflowRef = useRef<WorkflowConfig>(workflow);
+  const isDirtyRef = useRef(false);
+  const workflowsHydratedRef = useRef(false);
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  workflowRef.current = workflow;
+
+  // Keep workflows list synchronized with active workflow on every canvas/inspector edit
+  useEffect(() => {
+    setWorkflows((prevList) => syncWorkflowInList(prevList, workflow));
+  }, [workflow]);
+
+  const markWorkflowDirty = useCallback(() => {
+    isDirtyRef.current = true;
+    setDirtyVersion((v) => v + 1);
+  }, []);
 
   useEffect(() => {
     if (darkMode) {
@@ -226,7 +251,12 @@ export default function App() {
       const res = await fetch('/api/workflows');
       if (!res.ok) return;
       const list = (await res.json()) as WorkflowConfig[];
+      workflowsHydratedRef.current = true;
       if (list.length > 0) {
+        if (isDirtyRef.current) {
+          setWorkflows(syncWorkflowInList(list, workflowRef.current));
+          return;
+        }
         setWorkflows(list);
         if (!hasSharedWorkflowRef.current) {
           setWorkflow((prev) => list.find((w) => w.id === prev.id) ?? list[0]);
@@ -397,21 +427,199 @@ export default function App() {
     };
   }, []);
 
+  const persistWorkflowToServer = useCallback(
+    async (wfToSave: WorkflowConfig, showBadge = false): Promise<WorkflowConfig | null> => {
+      try {
+        const res = await fetch('/api/workflows', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(wfToSave),
+        });
+        if (!res.ok) return null;
+        const saved = (await res.json()) as WorkflowConfig;
+        // Only update local workflow state if no newer edits happened during flight
+        if (workflowRef.current.id === saved.id && !isDirtyRef.current) {
+          setWorkflow(saved);
+        }
+        setWorkflows((prev) => syncWorkflowInList(prev, saved));
+        if (showBadge) {
+          setSaveSuccess(true);
+          setTimeout(() => setSaveSuccess(false), 1800);
+        }
+        return saved;
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
+
+  // Debounced auto-save so agent inspector & canvas edits persist automatically before modal/reload
+  useEffect(() => {
+    if (dirtyVersion === 0) return;
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+    autoSaveTimerRef.current = setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      const snapshot = workflowRef.current;
+      isDirtyRef.current = false;
+      void persistWorkflowToServer(snapshot, false);
+    }, 550);
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, [dirtyVersion, persistWorkflowToServer]);
+
+  const flushWorkflowSave = useCallback(async () => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    if (isDirtyRef.current) {
+      isDirtyRef.current = false;
+      await persistWorkflowToServer(workflowRef.current, false);
+    }
+  }, [persistWorkflowToServer]);
+
   const handleSaveWorkflow = async () => {
-    const res = await fetch('/api/workflows', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(workflow),
-    });
-    if (res.ok) {
-      const saved = (await res.json()) as WorkflowConfig;
-      setWorkflow(saved);
-      setWorkflows((prev) => {
-        const exists = prev.some((w) => w.id === saved.id);
-        return exists ? prev.map((w) => (w.id === saved.id ? saved : w)) : [saved, ...prev];
-      });
-      setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 1800);
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    isDirtyRef.current = false;
+    await persistWorkflowToServer(workflowRef.current, true);
+  };
+
+  // Continuous Autonomous Work Session Sync & Polling
+  const loadContinuousSession = useCallback(
+    async (workflowId: string) => {
+      try {
+        const res = await fetch(`/api/workflows/${encodeURIComponent(workflowId)}/continuous`);
+        if (!res.ok) return;
+        const data = (await res.json()) as { session?: ContinuousWorkSession };
+        if (data.session) {
+          setContinuousSession(data.session);
+          if (
+            data.session.active &&
+            data.session.lastRunId &&
+            data.session.lastRunId !== activeRunId &&
+            !isSendingChat
+          ) {
+            setActiveRunId(data.session.lastRunId);
+            connectRunStream(data.session.lastRunId);
+          }
+        }
+      } catch {
+        // ignore offline errors
+      }
+    },
+    [activeRunId, connectRunStream, isSendingChat],
+  );
+
+  useEffect(() => {
+    void loadContinuousSession(workflow.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflow.id]);
+
+  useEffect(() => {
+    const shouldPoll = Boolean(continuousSession?.active || workflow.continuousAgentWork);
+    if (!shouldPoll) return;
+    const timer = setInterval(() => {
+      void loadContinuousSession(workflow.id);
+    }, 3500);
+    return () => clearInterval(timer);
+  }, [continuousSession?.active, workflow.continuousAgentWork, workflow.id, loadContinuousSession]);
+
+  const handleToggleContinuousWork = async (
+    targetEnable?: boolean,
+    overrideIntervalSec?: number,
+    workflowOverride?: WorkflowConfig,
+  ) => {
+    const baseWf = workflowOverride ?? workflowRef.current;
+    const enable =
+      typeof targetEnable === 'boolean'
+        ? targetEnable
+        : !(continuousSession?.active || baseWf.continuousAgentWork);
+
+    setContinuousBusy(true);
+    try {
+      if (!workflowOverride) {
+        await flushWorkflowSave();
+      }
+      const currentWf = workflowOverride ?? workflowRef.current;
+      if (enable) {
+        if (currentWf.nodes.length === 0) {
+          setValidationError(
+            lang === 'fa'
+              ? 'پیش از فعال‌سازی کار مداوم، حداقل یک ایجنت به بوم اضافه کنید.'
+              : 'Add at least one Agent node before enabling continuous work.',
+          );
+          return;
+        }
+        const resolvedInterval = clampContinuousIntervalSec(
+          overrideIntervalSec ?? currentWf.continuousIntervalSec ?? 30,
+        );
+        const res = await fetch(
+          `/api/workflows/${encodeURIComponent(currentWf.id)}/continuous/start`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              workflow: { ...currentWf, continuousAgentWork: true, continuousIntervalSec: resolvedInterval },
+              taskPrompt: taskPrompt.trim() || currentWf.description,
+              mode: executionMode,
+              intervalSec: resolvedInterval,
+              immediate: true,
+            }),
+          },
+        );
+        const data = (await res.json().catch(() => ({}))) as {
+          session?: ContinuousWorkSession;
+          workflow?: WorkflowConfig;
+          error?: string;
+        };
+        if (!res.ok) {
+          showNotice('error', data.error || 'Could not start continuous agent work.');
+          return;
+        }
+        if (data.session) setContinuousSession(data.session);
+        setWorkflow((prev) => ({
+          ...prev,
+          continuousAgentWork: true,
+          continuousIntervalSec: resolvedInterval,
+        }));
+        showNotice(
+          'success',
+          lang === 'fa'
+            ? `کار مداوم و پیوسته ایجنت‌ها روی پروژه «${currentWf.name}» فعال شد (هر ${resolvedInterval} ثانیه).`
+            : `Continuous 24/7 autonomous work enabled for "${currentWf.name}" (${resolvedInterval}s cycle).`,
+        );
+      } else {
+        const res = await fetch(
+          `/api/workflows/${encodeURIComponent(currentWf.id)}/continuous/stop`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disableWorkflowFlag: true }),
+          },
+        );
+        const data = (await res.json().catch(() => ({}))) as {
+          session?: ContinuousWorkSession;
+        };
+        if (data.session) setContinuousSession(data.session);
+        setWorkflow((prev) => ({ ...prev, continuousAgentWork: false }));
+        showNotice(
+          'success',
+          lang === 'fa'
+            ? `کار مداوم ایجنت‌ها روی «${currentWf.name}» متوقف شد.`
+            : `Continuous work paused for "${currentWf.name}".`,
+        );
+      }
+    } finally {
+      setContinuousBusy(false);
     }
   };
 
@@ -614,6 +822,13 @@ export default function App() {
   };
 
   const handleSaveSpecificWorkflow = async (wfToSave: WorkflowConfig) => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    if (wfToSave.id === workflowRef.current.id) {
+      isDirtyRef.current = false;
+    }
     const res = await fetch('/api/workflows', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -622,10 +837,19 @@ export default function App() {
     if (res.ok) {
       const saved = (await res.json()) as WorkflowConfig;
       setWorkflow((prev) => (prev.id === saved.id ? saved : prev));
-      setWorkflows((prev) => {
-        const exists = prev.some((w) => w.id === saved.id);
-        return exists ? prev.map((w) => (w.id === saved.id ? saved : w)) : [saved, ...prev];
-      });
+      setWorkflows((prev) => syncWorkflowInList(prev, saved));
+
+      if (saved.id === workflowRef.current.id) {
+        workflowRef.current = saved;
+        const wantsContinuous = Boolean(saved.continuousAgentWork);
+        const currentlyActive = Boolean(continuousSession?.active);
+        if (wantsContinuous && !currentlyActive && saved.nodes.length > 0) {
+          await handleToggleContinuousWork(true, saved.continuousIntervalSec, saved);
+        } else if (!wantsContinuous && currentlyActive) {
+          await handleToggleContinuousWork(false, undefined, saved);
+        }
+      }
+
       showNotice(
         'success',
         lang === 'fa'
@@ -828,6 +1052,7 @@ export default function App() {
       ...prev,
       nodes: [...prev.nodes, newNode],
     }));
+    markWorkflowDirty();
     setSelectedNodeId(newNode.id);
     setRightTab('inspector');
   };
@@ -837,6 +1062,7 @@ export default function App() {
       ...prev,
       nodes: prev.nodes.map((n) => (n.id === nodeId ? { ...n, data: nextData } : n)),
     }));
+    markWorkflowDirty();
   };
 
   const handleDuplicateNode = (nodeId: string) => {
@@ -847,6 +1073,7 @@ export default function App() {
       ...prev,
       nodes: [...prev.nodes, cloned],
     }));
+    markWorkflowDirty();
     setSelectedNodeId(cloned.id);
     setRightTab('inspector');
   };
@@ -857,6 +1084,7 @@ export default function App() {
       nodes: prev.nodes.filter((n) => n.id !== nodeId),
       edges: prev.edges.filter((e) => e.source !== nodeId && e.target !== nodeId),
     }));
+    markWorkflowDirty();
     if (selectedNodeId === nodeId) {
       setSelectedNodeId(null);
     }
@@ -914,6 +1142,7 @@ export default function App() {
       nodes: [...prev.nodes, ...nodesToAdd],
       edges: [...prev.edges, ...edgesToAdd],
     }));
+    markWorkflowDirty();
 
     if (nodesToAdd[0]) {
       setSelectedNodeId(nodesToAdd[0].id);
@@ -1367,7 +1596,10 @@ export default function App() {
                 <button
                   type="button"
                   data-testid="toolbar-edit-workflow-btn"
-                  onClick={() => setIsProjectManagerOpen(true)}
+                  onClick={() => {
+                    void flushWorkflowSave();
+                    setIsProjectManagerOpen(true);
+                  }}
                   title={lang === 'fa' ? 'مدیریت، ویرایش و حذف پروژه‌ها' : 'Manage, Edit & Delete Projects'}
                   className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                 >
@@ -1471,12 +1703,13 @@ export default function App() {
                     min={1}
                     max={25}
                     value={workflow.maxRounds}
-                    onChange={(e) =>
+                    onChange={(e) => {
                       setWorkflow((prev) => ({
                         ...prev,
                         maxRounds: clampMaxRounds(Number(e.target.value)),
-                      }))
-                    }
+                      }));
+                      markWorkflowDirty();
+                    }}
                     className="w-14 rounded-md border border-slate-200 bg-white px-2 py-1 text-center font-mono tabular-nums text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
                 </label>
@@ -1485,16 +1718,51 @@ export default function App() {
                   <input
                     type="checkbox"
                     checked={workflow.humanInTheLoop}
-                    onChange={(e) =>
+                    onChange={(e) => {
                       setWorkflow((prev) => ({
                         ...prev,
                         humanInTheLoop: e.target.checked,
-                      }))
-                    }
+                      }));
+                      markWorkflowDirty();
+                    }}
                     className="h-4 w-4 rounded border-slate-300 accent-blue-600"
                   />
                   <span>{t.hitlLabel}</span>
                 </label>
+
+                <button
+                  type="button"
+                  data-testid="toolbar-continuous-toggle-btn"
+                  disabled={continuousBusy}
+                  onClick={() => void handleToggleContinuousWork()}
+                  title={
+                    lang === 'fa'
+                      ? 'فعال/غیرفعال کردن کار مداوم و پیوسته ایجنت‌ها روی پروژه'
+                      : 'Toggle 24/7 Continuous Autonomous Agent Work'
+                  }
+                  className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:opacity-50 ${
+                    continuousSession?.active || workflow.continuousAgentWork
+                      ? 'border-blue-500 bg-blue-50 text-blue-800 dark:border-blue-500 dark:bg-blue-950/50 dark:text-blue-200'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300'
+                  }`}
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${
+                      continuousSession?.active || workflow.continuousAgentWork
+                        ? 'animate-spin text-blue-600 dark:text-blue-400'
+                        : ''
+                    }`}
+                  />
+                  <span>
+                    {lang === 'fa'
+                      ? continuousSession?.active || workflow.continuousAgentWork
+                        ? `کار مداوم فعال (${continuousSession?.cyclesCompleted ?? 0})`
+                        : 'کار مداوم پروژه'
+                      : continuousSession?.active || workflow.continuousAgentWork
+                        ? `24/7 Work Active (${continuousSession?.cyclesCompleted ?? 0})`
+                        : '24/7 Agent Work'}
+                  </span>
+                </button>
 
                 <button
                   type="button"
@@ -1731,11 +1999,23 @@ export default function App() {
                               : prev.edges,
                         };
                       });
+                      if (
+                        workflowsHydratedRef.current &&
+                        changes.some(
+                          (c) =>
+                            c.type === 'add' ||
+                            c.type === 'remove' ||
+                            c.type === 'replace' ||
+                            (c.type === 'position' && c.dragging === false),
+                        )
+                      ) {
+                        markWorkflowDirty();
+                      }
                       if (selectedNodeId && removedIds.has(selectedNodeId)) {
                         setSelectedNodeId(null);
                       }
                     }}
-                    onEdgesChange={(changes: EdgeChange<Edge>[]) =>
+                    onEdgesChange={(changes: EdgeChange<Edge>[]) => {
                       setWorkflow((prev) => {
                         const updated = applyEdgeChanges(
                           changes,
@@ -1751,9 +2031,15 @@ export default function App() {
                             animated: Boolean(e.animated),
                           })),
                         };
-                      })
-                    }
-                    onConnect={(connection: Connection) =>
+                      });
+                      if (
+                        workflowsHydratedRef.current &&
+                        changes.some((c) => c.type !== 'select')
+                      ) {
+                        markWorkflowDirty();
+                      }
+                    }}
+                    onConnect={(connection: Connection) => {
                       setWorkflow((prev) => {
                         const updated = addEdge(
                           {
@@ -1773,8 +2059,9 @@ export default function App() {
                             animated: Boolean(e.animated),
                           })),
                         };
-                      })
-                    }
+                      });
+                      markWorkflowDirty();
+                    }}
                     onSelectNode={(id) => {
                       setSelectedNodeId(id);
                       if (id) setRightTab('inspector');
@@ -1869,6 +2156,10 @@ export default function App() {
                       onOpenGitHubPush={() =>
                         setGitHubPushModal({ open: true, initialScope: 'project_bundle' })
                       }
+                      continuousActive={Boolean(continuousSession?.active || workflow.continuousAgentWork)}
+                      continuousSession={continuousSession}
+                      continuousBusy={continuousBusy}
+                      onToggleContinuous={() => void handleToggleContinuousWork()}
                     />
                   )}
                 </div>
@@ -1889,6 +2180,22 @@ export default function App() {
         {topView === 'blueprint' && (
           <BlueprintView
             lang={lang}
+            workflow={workflow}
+            activeRunId={activeRunId}
+            prelaunchReport={prelaunchReport}
+            onPrelaunchReportChange={setPrelaunchReport}
+            strictPrelaunchMode={workflow.strictPrelaunchGate ?? true}
+            onStrictPrelaunchModeChange={(strict) => {
+              setWorkflow((prev) => ({ ...prev, strictPrelaunchGate: strict }));
+              markWorkflowDirty();
+            }}
+            onFixPrelaunchIssues={(prompt) => {
+              setValidationError(null);
+              setTargetAgentId('all');
+              setTaskPrompt(prompt);
+              setTopView('canvas');
+              setRightTab('execution');
+            }}
             defaultRepoUrl={
               workflow.projectContext?.sourceType === 'github'
                 ? workflow.projectContext.sourceUrl

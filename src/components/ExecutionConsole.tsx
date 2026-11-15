@@ -7,7 +7,9 @@ import {
   FolderOpen,
   Lightbulb,
   MessageSquare,
+  Pause,
   Play,
+  RefreshCw,
   Rocket,
   RotateCcw,
   Send,
@@ -24,6 +26,7 @@ import type {
   BugReportCategory,
   BugReportItem,
   BugReportStatus,
+  ContinuousWorkSession,
   ExecutionEvent,
   SandboxFile,
   WorkflowNode,
@@ -64,6 +67,10 @@ interface ExecutionConsoleProps {
   geminiConfigured: boolean;
   onDownloadZip?: () => void;
   onOpenGitHubPush?: () => void;
+  continuousActive?: boolean;
+  continuousSession?: ContinuousWorkSession | null;
+  continuousBusy?: boolean;
+  onToggleContinuous?: () => void;
 }
 
 const ROLE_LABELS: Record<'en' | 'fa', Record<AgentRole, string>> = {
@@ -221,6 +228,10 @@ export function ExecutionConsole({
   geminiConfigured,
   onDownloadZip,
   onOpenGitHubPush,
+  continuousActive = false,
+  continuousSession = null,
+  continuousBusy = false,
+  onToggleContinuous,
 }: ExecutionConsoleProps) {
   const [subTab, setSubTab] = useState<'stream' | 'sandbox' | 'bugs'>('stream');
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -321,6 +332,78 @@ export function ExecutionConsole({
             </button>
           )}
         </div>
+
+        {onToggleContinuous && (
+          <div
+            dir={lang === 'fa' ? 'rtl' : 'ltr'}
+            data-testid="console-continuous-strip"
+            className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-[11px] ${
+              continuousActive
+                ? 'border-blue-300 bg-blue-50/80 text-blue-950 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-100'
+                : 'border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-300'
+            }`}
+          >
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5 font-semibold">
+                <RefreshCw
+                  className={`h-3 w-3 shrink-0 ${
+                    continuousActive ? 'animate-spin text-blue-600 dark:text-blue-400' : 'text-slate-400'
+                  }`}
+                />
+                <span className="truncate">
+                  {lang === 'fa'
+                    ? continuousActive
+                      ? `کار مداوم فعال · چرخه #${continuousSession?.cyclesCompleted ?? 0}`
+                      : 'کار مداوم خودکار (متوقف)'
+                    : continuousActive
+                      ? `Continuous 24/7 Active · Cycle #${continuousSession?.cyclesCompleted ?? 0}`
+                      : 'Continuous Autonomous Work (Paused)'}
+                </span>
+              </div>
+              {continuousActive && continuousSession && (
+                <div className="mt-0.5 truncate text-[10px] opacity-80">
+                  {continuousSession.status === 'running'
+                    ? lang === 'fa'
+                      ? 'ایجنت‌ها در حال اجرای چرخه فعلی...'
+                      : 'Running active cycle...'
+                    : continuousSession.status === 'error_backoff'
+                      ? lang === 'fa'
+                        ? 'بازیابی خودکار پس از خطای موقت...'
+                        : 'Retrying after transient error...'
+                      : continuousSession.nextCycleAt
+                        ? `${lang === 'fa' ? 'چرخه بعدی:' : 'Next cycle:'} ${new Date(
+                            continuousSession.nextCycleAt,
+                          ).toLocaleTimeString()}`
+                        : `${continuousSession.intervalSec}s interval`}
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              data-testid="console-continuous-toggle-btn"
+              disabled={continuousBusy}
+              onClick={onToggleContinuous}
+              className={`inline-flex shrink-0 items-center gap-1 rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:opacity-50 ${
+                continuousActive
+                  ? 'border border-amber-300 bg-white text-amber-800 hover:bg-amber-50 dark:border-amber-800 dark:bg-slate-900 dark:text-amber-300'
+                  : 'bg-blue-600 text-white hover:bg-blue-700'
+              }`}
+            >
+              {continuousActive ? (
+                <>
+                  <Pause className="h-3 w-3" />
+                  <span>{lang === 'fa' ? 'توقف' : 'Pause'}</span>
+                </>
+              ) : (
+                <>
+                  <Play className="h-3 w-3" />
+                  <span>{lang === 'fa' ? 'شروع مداوم' : 'Start 24/7'}</span>
+                </>
+              )}
+            </button>
+          </div>
+        )}
 
         <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-0.5 dark:bg-slate-800">
           <button

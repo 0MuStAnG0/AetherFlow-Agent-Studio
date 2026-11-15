@@ -517,7 +517,7 @@ export function GitHubPushModal({
                     ? isFa
                       ? 'خالی بگذارید تا از GITHUB_TOKEN ذخیره‌شده استفاده شود یا توکن جدید وارد کنید'
                       : 'Leave blank to use saved GITHUB_TOKEN, or enter a new ghp_... token'
-                    : 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+                    : 'ghp_... (GitHub Personal Access Token)'
                 }
                 className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               />

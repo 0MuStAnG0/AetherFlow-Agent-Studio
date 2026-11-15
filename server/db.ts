@@ -7,9 +7,11 @@ import type {
   AppSettings,
   BugReportItem,
   BugReportStatus,
+  ContinuousWorkSession,
   ExecutionEvent,
   ExecutionRunSummary,
   ImportedProjectAnalysis,
+  PrelaunchTestReport,
   ProviderSecretStatus,
   WorkflowConfig,
 } from '../src/types/workflow.ts';
@@ -87,6 +89,23 @@ export function getDb(): DatabaseSync {
       secret_value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS continuous_sessions (
+      workflow_id TEXT PRIMARY KEY,
+      active INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'idle',
+      session_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS prelaunch_reports (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL,
+      gate_status TEXT NOT NULL,
+      overall_score INTEGER NOT NULL,
+      report_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
 
   const countRow = dbInstance.prepare('SELECT COUNT(*) AS cnt FROM workflows').get() as { cnt: number };
@@ -117,6 +136,9 @@ export function listWorkflows(): WorkflowConfig[] {
       nodes: WorkflowConfig['nodes'];
       edges: WorkflowConfig['edges'];
       projectContext?: WorkflowConfig['projectContext'];
+      continuousAgentWork?: boolean;
+      continuousIntervalSec?: number;
+      strictPrelaunchGate?: boolean;
     };
     return {
       id: row.id,
@@ -124,6 +146,15 @@ export function listWorkflows(): WorkflowConfig[] {
       description: row.description,
       maxRounds: row.max_rounds,
       humanInTheLoop: Boolean(row.human_in_the_loop),
+      ...(graph.continuousAgentWork !== undefined
+        ? { continuousAgentWork: Boolean(graph.continuousAgentWork) }
+        : {}),
+      ...(graph.continuousIntervalSec !== undefined
+        ? { continuousIntervalSec: graph.continuousIntervalSec }
+        : {}),
+      ...(graph.strictPrelaunchGate !== undefined
+        ? { strictPrelaunchGate: Boolean(graph.strictPrelaunchGate) }
+        : {}),
       nodes: graph.nodes ?? [],
       edges: graph.edges ?? [],
       ...(graph.projectContext ? { projectContext: graph.projectContext } : {}),
@@ -153,6 +184,9 @@ export function getWorkflowById(id: string): WorkflowConfig | null {
     nodes: WorkflowConfig['nodes'];
     edges: WorkflowConfig['edges'];
     projectContext?: WorkflowConfig['projectContext'];
+    continuousAgentWork?: boolean;
+    continuousIntervalSec?: number;
+    strictPrelaunchGate?: boolean;
   };
   return {
     id: row.id,
@@ -160,6 +194,15 @@ export function getWorkflowById(id: string): WorkflowConfig | null {
     description: row.description,
     maxRounds: row.max_rounds,
     humanInTheLoop: Boolean(row.human_in_the_loop),
+    ...(graph.continuousAgentWork !== undefined
+      ? { continuousAgentWork: Boolean(graph.continuousAgentWork) }
+      : {}),
+    ...(graph.continuousIntervalSec !== undefined
+      ? { continuousIntervalSec: graph.continuousIntervalSec }
+      : {}),
+    ...(graph.strictPrelaunchGate !== undefined
+      ? { strictPrelaunchGate: Boolean(graph.strictPrelaunchGate) }
+      : {}),
     nodes: graph.nodes ?? [],
     edges: graph.edges ?? [],
     ...(graph.projectContext ? { projectContext: graph.projectContext } : {}),
@@ -174,6 +217,15 @@ export function upsertWorkflow(workflow: WorkflowConfig): WorkflowConfig {
     nodes: workflow.nodes,
     edges: workflow.edges,
     ...(workflow.projectContext ? { projectContext: workflow.projectContext } : {}),
+    ...(workflow.continuousAgentWork !== undefined
+      ? { continuousAgentWork: Boolean(workflow.continuousAgentWork) }
+      : {}),
+    ...(workflow.continuousIntervalSec !== undefined
+      ? { continuousIntervalSec: workflow.continuousIntervalSec }
+      : {}),
+    ...(workflow.strictPrelaunchGate !== undefined
+      ? { strictPrelaunchGate: Boolean(workflow.strictPrelaunchGate) }
+      : {}),
   });
 
   db.prepare(
@@ -683,4 +735,103 @@ export function listProviderSecretStatuses(
   }
   return out;
 }
+
+export function upsertContinuousSession(session: ContinuousWorkSession): ContinuousWorkSession {
+  const db = getDb();
+  const updated = {
+    ...session,
+    updatedAt: new Date().toISOString(),
+  };
+  db.prepare(
+    `
+    INSERT INTO continuous_sessions (workflow_id, active, status, session_json, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(workflow_id) DO UPDATE SET
+      active = excluded.active,
+      status = excluded.status,
+      session_json = excluded.session_json,
+      updated_at = excluded.updated_at
+  `,
+  ).run(
+    updated.workflowId,
+    updated.active ? 1 : 0,
+    updated.status,
+    JSON.stringify(updated),
+    updated.updatedAt,
+  );
+  return updated;
+}
+
+export function getContinuousSession(workflowId: string): ContinuousWorkSession | null {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT session_json FROM continuous_sessions WHERE workflow_id = ?')
+    .get(workflowId) as { session_json: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.session_json) as ContinuousWorkSession;
+  } catch {
+    return null;
+  }
+}
+
+export function listActiveContinuousSessions(): ContinuousWorkSession[] {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT session_json FROM continuous_sessions WHERE active = 1 ORDER BY updated_at DESC')
+    .all() as Array<{ session_json: string }>;
+  const out: ContinuousWorkSession[] = [];
+  for (const r of rows) {
+    try {
+      out.push(JSON.parse(r.session_json) as ContinuousWorkSession);
+    } catch {
+      // ignore corrupted entry
+    }
+  }
+  return out;
+}
+
+export function savePrelaunchReport(report: PrelaunchTestReport): PrelaunchTestReport {
+  const db = getDb();
+  db.prepare(
+    `
+    INSERT INTO prelaunch_reports (id, workflow_id, gate_status, overall_score, report_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      gate_status = excluded.gate_status,
+      overall_score = excluded.overall_score,
+      report_json = excluded.report_json
+  `,
+  ).run(
+    report.id,
+    report.workflowId,
+    report.gateStatus,
+    report.overallScore,
+    JSON.stringify(report),
+    report.createdAt,
+  );
+  return report;
+}
+
+export function getLatestPrelaunchReport(workflowId?: string): PrelaunchTestReport | null {
+  const db = getDb();
+  const row = (
+    workflowId
+      ? db
+          .prepare(
+            'SELECT report_json FROM prelaunch_reports WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1',
+          )
+          .get(workflowId)
+      : db
+          .prepare('SELECT report_json FROM prelaunch_reports ORDER BY created_at DESC LIMIT 1')
+          .get()
+  ) as { report_json: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.report_json) as PrelaunchTestReport;
+  } catch {
+    return null;
+  }
+}
+
 

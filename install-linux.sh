@@ -668,4 +668,4 @@ fi
 
 setup_nginx_and_ssl
 log "Build complete! Starting AetherFlow Agent Studio in production mode on port ${PORT:-3000}..."
-exec env NODE_ENV=production NODE_USE_ENV_PROXY=1 ./node_modules/.bin/tsx server.ts
+exec env NODE_ENV=production NODE_USE_ENV_PROXY=1 ./node_modules/.bin/tsx --env-file-if-exists=.env server.ts

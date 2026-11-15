@@ -1,6 +1,8 @@
 {
-  "name": "AetherFlow Agent Studio",
+  "name": "Remix AetherFlow Agent Studio",
   "description": "Visual node-based Multi-Agent Workflow Orchestrator combining n8n-style graph routing with AutoGen GroupChat, multi-LLM routing, Human-in-the-Loop gates, and isolated Docker code execution.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

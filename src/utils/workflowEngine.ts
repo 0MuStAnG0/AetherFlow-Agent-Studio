@@ -220,6 +220,20 @@ export function clampMaxRounds(rounds: number): number {
   return Math.max(1, Math.min(25, Math.round(rounds)));
 }
 
+export function clampContinuousIntervalSec(seconds: number): number {
+  if (!Number.isFinite(seconds)) return 30;
+  return Math.max(5, Math.min(3600, Math.round(seconds)));
+}
+
+export function syncWorkflowInList(
+  workflows: WorkflowConfig[],
+  updated: WorkflowConfig,
+): WorkflowConfig[] {
+  const exists = workflows.some((w) => w.id === updated.id);
+  if (!exists) return [updated, ...workflows];
+  return workflows.map((w) => (w.id === updated.id ? updated : w));
+}
+
 export function clampTemperature(temp: number): number {
   if (!Number.isFinite(temp)) return 0.3;
   return Math.round(Math.max(0, Math.min(1, temp)) * 100) / 100;
@@ -705,6 +719,15 @@ export function serializeWorkflowForExport(workflow: WorkflowConfig): string {
     description: workflow.description || '',
     maxRounds: clampMaxRounds(workflow.maxRounds),
     humanInTheLoop: Boolean(workflow.humanInTheLoop),
+    ...(workflow.continuousAgentWork !== undefined
+      ? { continuousAgentWork: Boolean(workflow.continuousAgentWork) }
+      : {}),
+    ...(workflow.continuousIntervalSec !== undefined
+      ? { continuousIntervalSec: clampContinuousIntervalSec(workflow.continuousIntervalSec) }
+      : {}),
+    ...(workflow.strictPrelaunchGate !== undefined
+      ? { strictPrelaunchGate: Boolean(workflow.strictPrelaunchGate) }
+      : {}),
     nodes: workflow.nodes.map((node) => ({
       id: node.id,
       type: 'agentNode',
@@ -715,6 +738,10 @@ export function serializeWorkflowForExport(workflow: WorkflowConfig): string {
       data: {
         label: node.data.label,
         role: node.data.role,
+        ...(node.data.section ? { section: node.data.section } : {}),
+        ...(node.data.positionTitle ? { positionTitle: node.data.positionTitle } : {}),
+        ...(node.data.responsibility ? { responsibility: node.data.responsibility } : {}),
+        ...(node.data.powerLevel ? { powerLevel: node.data.powerLevel } : {}),
         provider: node.data.provider,
         model: node.data.model,
         envSecretRef: node.data.envSecretRef || getDefaultEnvRef(node.data.provider),
@@ -791,6 +818,21 @@ export function parseImportedWorkflowJson(rawJson: string): {
         data: {
           label: String(rawNode.data.label || rawNode.id),
           role,
+          ...(typeof rawNode.data.section === 'string' && rawNode.data.section.trim()
+            ? { section: rawNode.data.section.trim() }
+            : {}),
+          ...(typeof rawNode.data.positionTitle === 'string' && rawNode.data.positionTitle.trim()
+            ? { positionTitle: rawNode.data.positionTitle.trim() }
+            : {}),
+          ...(typeof rawNode.data.responsibility === 'string' && rawNode.data.responsibility.trim()
+            ? { responsibility: rawNode.data.responsibility.trim() }
+            : {}),
+          ...(rawNode.data.powerLevel === 'eco' ||
+          rawNode.data.powerLevel === 'standard' ||
+          rawNode.data.powerLevel === 'pro' ||
+          rawNode.data.powerLevel === 'ultra'
+            ? { powerLevel: rawNode.data.powerLevel }
+            : {}),
           provider,
           model: String(rawNode.data.model || 'gemini-4-hydrogen'),
           envSecretRef: String(rawNode.data.envSecretRef || getDefaultEnvRef(provider)),
@@ -844,6 +886,15 @@ export function parseImportedWorkflowJson(rawJson: string): {
           : 'Imported agent workflow configuration',
       maxRounds: clampMaxRounds(Number(candidate.maxRounds ?? 6)),
       humanInTheLoop: candidate.humanInTheLoop ?? true,
+      ...(candidate.continuousAgentWork !== undefined
+        ? { continuousAgentWork: Boolean(candidate.continuousAgentWork) }
+        : {}),
+      ...(candidate.continuousIntervalSec !== undefined
+        ? { continuousIntervalSec: clampContinuousIntervalSec(Number(candidate.continuousIntervalSec)) }
+        : {}),
+      ...(candidate.strictPrelaunchGate !== undefined
+        ? { strictPrelaunchGate: Boolean(candidate.strictPrelaunchGate) }
+        : {}),
       nodes,
       edges,
       ...(candidate.projectContext && typeof candidate.projectContext === 'object'

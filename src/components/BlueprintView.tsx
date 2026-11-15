@@ -11,15 +11,23 @@ import {
   Terminal,
   UploadCloud,
 } from 'lucide-react';
-import type { BlueprintFile } from '../types/workflow';
+import type { BlueprintFile, PrelaunchTestReport, WorkflowConfig } from '../types/workflow';
 import {
   DEFAULT_GITHUB_REPO_URL,
   buildLinuxOneLineCommand,
   type LinuxInstallMode,
 } from '../utils/githubDeploy';
+import { PreLaunchTestSuite } from './PreLaunchTestSuite';
 
 interface BlueprintViewProps {
   lang?: 'en' | 'fa';
+  workflow: WorkflowConfig;
+  activeRunId: string | null;
+  prelaunchReport: PrelaunchTestReport | null;
+  onPrelaunchReportChange: (report: PrelaunchTestReport | null) => void;
+  strictPrelaunchMode: boolean;
+  onStrictPrelaunchModeChange: (strict: boolean) => void;
+  onFixPrelaunchIssues: (prompt: string) => void;
   defaultRepoUrl?: string;
   defaultBranch?: string;
   onRunDeployAudit?: () => void;
@@ -67,6 +75,13 @@ const DIRECTORY_TREE = `aetherflow-agent-studio/
 
 export function BlueprintView({
   lang = 'en',
+  workflow,
+  activeRunId,
+  prelaunchReport,
+  onPrelaunchReportChange,
+  strictPrelaunchMode,
+  onStrictPrelaunchModeChange,
+  onFixPrelaunchIssues,
   defaultRepoUrl,
   defaultBranch,
   onRunDeployAudit,
@@ -191,6 +206,24 @@ export function BlueprintView({
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          {prelaunchReport && (
+            <span
+              data-testid="blueprint-gate-pill"
+              className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[11px] font-bold ${
+                prelaunchReport.gateStatus === 'approved'
+                  ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                  : 'border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-800 dark:bg-rose-950/60 dark:text-rose-300'
+              }`}
+            >
+              {prelaunchReport.gateStatus === 'approved'
+                ? lang === 'fa'
+                  ? `تست لانچ: تایید (${prelaunchReport.overallScore}%)`
+                  : `Gate: APPROVED (${prelaunchReport.overallScore}%)`
+                : lang === 'fa'
+                  ? `تست لانچ: مسدود (${prelaunchReport.failedCount} خطا)`
+                  : `Gate: BLOCKED (${prelaunchReport.failedCount} failed)`}
+            </span>
+          )}
           {onDownloadZip && (
             <button
               type="button"
@@ -229,6 +262,18 @@ export function BlueprintView({
           )}
         </div>
       </div>
+
+      {/* Strict Pre-Launch Final Test Gate (4 Categories, 14 Test Types) */}
+      <PreLaunchTestSuite
+        lang={lang}
+        workflow={workflow}
+        activeRunId={activeRunId}
+        report={prelaunchReport}
+        onReportChange={onPrelaunchReportChange}
+        strictMode={strictPrelaunchMode}
+        onStrictModeChange={onStrictPrelaunchModeChange}
+        onAskAgentsToFix={onFixPrelaunchIssues}
+      />
 
       {/* GitHub One-Line Linux Command Builder */}
       <div

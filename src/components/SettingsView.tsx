@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   Check,
+  Copy,
   Eye,
   EyeOff,
   KeyRound,
@@ -139,6 +140,16 @@ export function SettingsView({
   const [savedToast, setSavedToast] = useState(false);
   const [syncingOpenCode, setSyncingOpenCode] = useState(false);
   const [openCodeSyncMessage, setOpenCodeSyncMessage] = useState<string | null>(null);
+  const [showGeminiProxyGuide, setShowGeminiProxyGuide] = useState(false);
+  const [copiedWorkerSnippet, setCopiedWorkerSnippet] = useState(false);
+
+  const CLOUDFLARE_WORKER_RELAY = `export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    url.hostname = 'generativelanguage.googleapis.com';
+    return fetch(new Request(url, request));
+  },
+};`;
 
   useEffect(() => {
     setDraft(settings);
@@ -216,6 +227,13 @@ export function SettingsView({
       if (data.capabilities && onCapabilitiesUpdated) {
         onCapabilitiesUpdated(data.capabilities);
       }
+      if (
+        draft.providers[provider].baseUrl.trim() !== settings.providers[provider].baseUrl.trim() ||
+        draft.providers[provider].defaultModel !== settings.providers[provider].defaultModel ||
+        draft.providers[provider].envVarName.trim() !== settings.providers[provider].envVarName.trim()
+      ) {
+        await onSaveSettings(draft);
+      }
       setApiKeyInputs((prev) => ({ ...prev, [provider]: '' }));
       setKeyFeedback((prev) => ({
         ...prev,
@@ -284,6 +302,16 @@ export function SettingsView({
         }),
       });
       const data = (await res.json()) as { ok?: boolean; message?: string };
+      if (
+        data.ok &&
+        (draft.providers[provider].baseUrl.trim() !== settings.providers[provider].baseUrl.trim() ||
+          draft.providers[provider].defaultModel !== settings.providers[provider].defaultModel)
+      ) {
+        await onSaveSettings(draft);
+      }
+      if (!data.ok && provider === 'gemini' && (data.message || '').includes('403')) {
+        setShowGeminiProxyGuide(true);
+      }
       setKeyFeedback((prev) => ({
         ...prev,
         [provider]: {
@@ -702,11 +730,79 @@ export function SettingsView({
                         className="mt-1 w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                       />
                       {provider === 'gemini' && (
-                        <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-                          {isFa
-                            ? 'در صورت خطای 403 (محدودیت منطقه/IP)، آدرس پراکسی یا ورکر Gemini را اینجا وارد کرده و Save Settings را بزنید.'
-                            : 'If direct Google access returns 403 (region/IP block), set a Gemini proxy/relay URL here and save settings.'}
-                        </p>
+                        <div className="mt-1.5 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                            <span>
+                              {isFa
+                                ? 'در صورت خطای 403 (محدودیت منطقه/IP)، آدرس رله/پراکسی Gemini را اینجا وارد کنید.'
+                                : 'If direct Google access returns 403 (region/IP block), set a Gemini relay/proxy URL here.'}
+                            </span>
+                            <button
+                              type="button"
+                              data-testid="toggle-gemini-proxy-guide"
+                              onClick={() => setShowGeminiProxyGuide((prev) => !prev)}
+                              className="font-medium text-blue-600 underline hover:text-blue-700 dark:text-blue-400"
+                            >
+                              {showGeminiProxyGuide
+                                ? isFa
+                                  ? 'بستن راهنمای رفع 403'
+                                  : 'Hide 403 Relay Guide'
+                                : isFa
+                                  ? 'راهنمای رفع 403 (Cloudflare Worker)'
+                                  : 'How to bypass 403 (Cloudflare Worker)'}
+                            </button>
+                          </div>
+
+                          {showGeminiProxyGuide && (
+                            <div
+                              data-testid="gemini-proxy-guide"
+                              className="rounded-lg border border-amber-200 bg-amber-50/70 p-2.5 text-[11px] text-amber-950 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-semibold">
+                                  {isFa
+                                    ? 'کد رله رایگان Cloudflare Worker برای عبور از خطای 403:'
+                                    : 'Free Cloudflare Worker Relay (paste worker URL into Base URL above):'}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    void navigator.clipboard.writeText(CLOUDFLARE_WORKER_RELAY);
+                                    setCopiedWorkerSnippet(true);
+                                    setTimeout(() => setCopiedWorkerSnippet(false), 1800);
+                                  }}
+                                  className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-300 bg-white px-2 py-0.5 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-800 dark:bg-slate-900 dark:text-amber-200"
+                                >
+                                  {copiedWorkerSnippet ? (
+                                    <Check className="h-3 w-3 text-emerald-600" />
+                                  ) : (
+                                    <Copy className="h-3 w-3" />
+                                  )}
+                                  <span>
+                                    {copiedWorkerSnippet
+                                      ? isFa
+                                        ? 'کپی شد'
+                                        : 'Copied'
+                                      : isFa
+                                        ? 'کپی کد'
+                                        : 'Copy Code'}
+                                  </span>
+                                </button>
+                              </div>
+                              <pre
+                                dir="ltr"
+                                className="mt-2 overflow-x-auto rounded bg-slate-950 p-2 font-mono text-[10px] leading-relaxed text-emerald-300"
+                              >
+                                <code>{CLOUDFLARE_WORKER_RELAY}</code>
+                              </pre>
+                              <p className="mt-1.5 leading-relaxed opacity-90">
+                                {isFa
+                                  ? 'یا در فایل .env سرور مقدار HTTPS_PROXY را تنظیم کرده و سرویس را ری‌استارت کنید.'
+                                  : 'Or set HTTPS_PROXY in your server .env file and restart the service.'}
+                              </p>
+                            </div>
+                          )}
+                        </div>
                       )}
                     </div>
 

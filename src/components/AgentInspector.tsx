@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Trash2, Check, ShieldCheck, KeyRound, CopyPlus } from 'lucide-react';
 import {
   AGENT_SECTIONS,
@@ -57,13 +57,29 @@ export function AgentInspector({
   const [inlineApiKey, setInlineApiKey] = useState('');
   const [savingKey, setSavingKey] = useState(false);
   const [keyStatusMsg, setKeyStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const lastCommittedSigRef = useRef<string>('');
+  const prevNodeIdRef = useRef<string | null>(node?.id ?? null);
 
   useEffect(() => {
-    setDraft(node ? { ...node.data, tools: { ...node.data.tools } } : null);
-    setSavedToast(false);
-    setShowKeyForm(false);
-    setInlineApiKey('');
-    setKeyStatusMsg(null);
+    const incomingSig = node ? JSON.stringify(node.data) : '';
+    const nodeChanged = (node?.id ?? null) !== prevNodeIdRef.current;
+    if (nodeChanged) {
+      prevNodeIdRef.current = node?.id ?? null;
+      lastCommittedSigRef.current = incomingSig;
+      setDraft(node ? { ...node.data, tools: { ...node.data.tools } } : null);
+      setSavedToast(false);
+      setShowKeyForm(false);
+      setInlineApiKey('');
+      setKeyStatusMsg(null);
+      return;
+    }
+    if (node && incomingSig !== lastCommittedSigRef.current) {
+      lastCommittedSigRef.current = incomingSig;
+      setDraft({ ...node.data, tools: { ...node.data.tools } });
+    } else if (!node) {
+      lastCommittedSigRef.current = '';
+      setDraft(null);
+    }
   }, [node]);
 
   if (!node || !draft) {
@@ -91,19 +107,36 @@ export function AgentInspector({
   const secretsMap = capabilities?.secrets ?? {};
   const secretInfo: ProviderSecretStatus | undefined = secretsMap[normalizedRef];
 
+  const commitDraft = (next: AgentNodeData, trimFields = false) => {
+    setDraft(next);
+    const cleanLabel = trimFields ? next.label.trim() : next.label;
+    const cleanPrompt = trimFields ? next.systemPrompt.trim() : next.systemPrompt;
+    if (!cleanLabel.trim() || !cleanPrompt.trim()) return;
+    const ref = normalizeSecretName(next.envSecretRef || '') || getDefaultEnvRef(next.provider);
+    const payload: AgentNodeData = {
+      ...next,
+      label: cleanLabel,
+      section: trimFields ? next.section?.trim() || undefined : next.section,
+      positionTitle: trimFields ? next.positionTitle?.trim() || undefined : next.positionTitle,
+      responsibility: trimFields ? next.responsibility?.trim() || undefined : next.responsibility,
+      powerLevel: next.powerLevel ?? 'standard',
+      envSecretRef: ref,
+      temperature: clampTemperature(next.temperature),
+      tools: { ...next.tools },
+    };
+    lastCommittedSigRef.current = JSON.stringify(payload);
+    onUpdateNode(node.id, payload);
+  };
+
   const handleProviderChange = (provider: LLMProvider) => {
     const providerModels = getEffectiveProviderModels(provider, appSettings?.providers[provider]);
     const configuredDefault = appSettings?.providers[provider]?.defaultModel;
-    setDraft((prev) =>
-      prev
-        ? {
-            ...prev,
-            provider,
-            model: configuredDefault || providerModels[0]?.id || '',
-            envSecretRef: appSettings?.providers[provider]?.envVarName || getDefaultEnvRef(provider),
-          }
-        : null,
-    );
+    commitDraft({
+      ...draft,
+      provider,
+      model: configuredDefault || providerModels[0]?.id || '',
+      envSecretRef: appSettings?.providers[provider]?.envVarName || getDefaultEnvRef(provider),
+    });
   };
 
   const handleSaveInlineKey = async () => {
@@ -145,16 +178,7 @@ export function AgentInspector({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!draft.label.trim() || !draft.systemPrompt.trim()) return;
-    onUpdateNode(node.id, {
-      ...draft,
-      label: draft.label.trim(),
-      section: draft.section?.trim() || undefined,
-      positionTitle: draft.positionTitle?.trim() || undefined,
-      responsibility: draft.responsibility?.trim() || undefined,
-      powerLevel: draft.powerLevel ?? 'standard',
-      envSecretRef: normalizedRef,
-      temperature: clampTemperature(draft.temperature),
-    });
+    commitDraft(draft, true);
     setSavedToast(true);
     setTimeout(() => setSavedToast(false), 1800);
   };
@@ -214,6 +238,7 @@ export function AgentInspector({
             required
             value={draft.label}
             onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+            onBlur={() => commitDraft(draft, true)}
             className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
           />
           {(draft.role === 'manager' || /مدیر|manager/i.test(draft.label)) && (
@@ -243,7 +268,7 @@ export function AgentInspector({
               value={AGENT_SECTIONS.some((s) => s.id === draft.section) ? draft.section : '__custom__'}
               onChange={(e) => {
                 if (e.target.value !== '__custom__') {
-                  setDraft({ ...draft, section: e.target.value });
+                  commitDraft({ ...draft, section: e.target.value });
                 }
               }}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
@@ -264,6 +289,7 @@ export function AgentInspector({
               type="text"
               value={draft.section ?? ''}
               onChange={(e) => setDraft({ ...draft, section: e.target.value })}
+              onBlur={() => commitDraft(draft, true)}
               placeholder={lang === 'fa' ? 'مثلاً Database یا Payment' : 'e.g. Backend & API'}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
             />
@@ -288,7 +314,7 @@ export function AgentInspector({
               onChange={(e) => {
                 const sp = AGENT_SPECIALTY_PRESETS.find((p) => p.id === e.target.value);
                 if (!sp) return;
-                setDraft({
+                commitDraft({
                   ...draft,
                   section: sp.section,
                   role: sp.role,
@@ -317,6 +343,7 @@ export function AgentInspector({
               type="text"
               value={draft.positionTitle ?? ''}
               onChange={(e) => setDraft({ ...draft, positionTitle: e.target.value })}
+              onBlur={() => commitDraft(draft, true)}
               placeholder={lang === 'fa' ? 'مثلاً معمار ارشد API' : 'e.g. Senior API Lead'}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
             />
@@ -336,6 +363,7 @@ export function AgentInspector({
             type="text"
             value={draft.responsibility ?? ''}
             onChange={(e) => setDraft({ ...draft, responsibility: e.target.value })}
+            onBlur={() => commitDraft(draft, true)}
             placeholder={
               lang === 'fa'
                 ? 'شرح دقیق وظایف و مسئولیت این ایجنت...'
@@ -356,7 +384,7 @@ export function AgentInspector({
                 type="button"
                 data-testid={`inspector-power-${lvl}`}
                 onClick={() =>
-                  setDraft({
+                  commitDraft({
                     ...draft,
                     powerLevel: lvl,
                     temperature: POWER_LEVEL_META[lvl].defaultTemp,
@@ -385,7 +413,7 @@ export function AgentInspector({
             <select
               id="agent-role-select"
               value={draft.role}
-              onChange={(e) => setDraft({ ...draft, role: e.target.value as AgentRole })}
+              onChange={(e) => commitDraft({ ...draft, role: e.target.value as AgentRole })}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
             >
               {ROLE_OPTIONS.map((opt) => (
@@ -430,7 +458,7 @@ export function AgentInspector({
             value={knownModelIds.includes(draft.model) ? draft.model : '__custom__'}
             onChange={(e) => {
               if (e.target.value !== '__custom__') {
-                setDraft({ ...draft, model: e.target.value });
+                commitDraft({ ...draft, model: e.target.value });
               }
             }}
             className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
@@ -448,6 +476,7 @@ export function AgentInspector({
             aria-label="Custom Model Name"
             value={draft.model}
             onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+            onBlur={() => commitDraft(draft, true)}
             placeholder="Model identifier"
             className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-1 font-mono text-xs text-slate-800 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200"
           />
@@ -485,6 +514,7 @@ export function AgentInspector({
               type="text"
               value={draft.envSecretRef}
               onChange={(e) => setDraft({ ...draft, envSecretRef: e.target.value })}
+              onBlur={() => commitDraft(draft, true)}
               placeholder={getDefaultEnvRef(draft.provider)}
               className="min-w-0 flex-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 font-mono text-xs text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
             />
@@ -568,7 +598,7 @@ export function AgentInspector({
             max={1}
             step={0.05}
             value={draft.temperature}
-            onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })}
+            onChange={(e) => commitDraft({ ...draft, temperature: Number(e.target.value) })}
             className="mt-1 w-full accent-blue-600"
           />
         </div>
@@ -586,6 +616,7 @@ export function AgentInspector({
             required
             value={draft.systemPrompt}
             onChange={(e) => setDraft({ ...draft, systemPrompt: e.target.value })}
+            onBlur={() => commitDraft(draft, true)}
             className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs leading-relaxed text-slate-900 focus:border-blue-600 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
           />
         </div>
@@ -598,9 +629,10 @@ export function AgentInspector({
             <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300">
               <input
                 type="checkbox"
+                data-testid="inspector-tool-readFile"
                 checked={draft.tools.readFile}
                 onChange={(e) =>
-                  setDraft({
+                  commitDraft({
                     ...draft,
                     tools: { ...draft.tools, readFile: e.target.checked },
                   })
@@ -612,9 +644,10 @@ export function AgentInspector({
             <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300">
               <input
                 type="checkbox"
+                data-testid="inspector-tool-writeFile"
                 checked={draft.tools.writeFile}
                 onChange={(e) =>
-                  setDraft({
+                  commitDraft({
                     ...draft,
                     tools: { ...draft.tools, writeFile: e.target.checked },
                   })
@@ -626,9 +659,10 @@ export function AgentInspector({
             <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300">
               <input
                 type="checkbox"
+                data-testid="inspector-tool-execBash"
                 checked={draft.tools.execBash}
                 onChange={(e) =>
-                  setDraft({
+                  commitDraft({
                     ...draft,
                     tools: { ...draft.tools, execBash: e.target.checked },
                   })

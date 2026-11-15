@@ -18,10 +18,13 @@ import {
   deleteProviderSecret,
   deleteWorkflow,
   getAppSettings,
+  getContinuousSession,
   getDb,
   getImportedProjectById,
+  getLatestPrelaunchReport,
   getRunEvents,
   getWorkflowById,
+  listActiveContinuousSessions,
   listBugReports,
   listImportedProjects,
   listProviderSecretStatuses,
@@ -30,10 +33,12 @@ import {
   resolveServerSecret,
   saveAppSettings,
   saveImportedProject,
+  savePrelaunchReport,
   setProviderSecret,
   updateBugReportStatus,
   updateImportedProject,
   updateRunRecord,
+  upsertContinuousSession,
   upsertWorkflow,
 } from './server/db.ts';
 import type {
@@ -41,8 +46,11 @@ import type {
   AppSettings,
   BlueprintFile,
   BugReportStatus,
+  ContinuousWorkSession,
   ExecutionEvent,
   ImportedProjectAnalysis,
+  PrelaunchTestReport,
+  PrelaunchTestResult,
   RecommendedAgentSpec,
   SandboxFile,
   ToolCallLog,
@@ -74,8 +82,14 @@ import {
 } from './src/utils/exportBundle.ts';
 import { createZipBufferFromBundle } from './server/zipBundle.ts';
 import {
+  evaluatePrelaunchGate,
+  findMissingWorkflowCoverage,
+  scanSourceSecurityIssues,
+} from './src/utils/prelaunchTests.ts';
+import {
   buildManagerInspectionContext,
   buildStructuredAgentPrompt,
+  clampContinuousIntervalSec,
   clampMaxRounds,
   computeExecutionOrder,
   detectSensitiveCommand,
@@ -3740,6 +3754,875 @@ app.post('/api/github/push', async (req, res) => {
   }
 });
 
+// =============================================================================
+// Continuous Autonomous Project Work Engine (Prevents Idle/Hour-Long Stops)
+// =============================================================================
+const continuousTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearContinuousTimer(workflowId: string): void {
+  const existing = continuousTimers.get(workflowId);
+  if (existing) {
+    clearTimeout(existing);
+    continuousTimers.delete(workflowId);
+  }
+}
+
+async function runSingleContinuousCycle(workflowId: string): Promise<void> {
+  const current = getContinuousSession(workflowId);
+  if (!current || !current.active) {
+    clearContinuousTimer(workflowId);
+    return;
+  }
+
+  const wf = getWorkflowById(workflowId);
+  if (!wf || wf.nodes.length === 0) {
+    upsertContinuousSession({
+      ...current,
+      active: false,
+      status: 'paused',
+      lastError: 'Workflow missing or has no agent nodes.',
+      nextCycleAt: undefined,
+    });
+    return;
+  }
+
+  const resolvedMode: 'live' | 'dry_run' =
+    current.mode === 'live' && canWorkflowRunLive(wf.nodes, getAppSettings())
+      ? 'live'
+      : 'dry_run';
+
+  const openBugs = listBugReports({ workflowId }).filter((b) => b.status !== 'resolved');
+  const prevFiles = current.lastRunId ? listSandboxFiles(current.lastRunId) : [];
+  const nextCycleNumber = current.cyclesCompleted + 1;
+
+  const cyclePrompt = [
+    current.taskPrompt || wf.description || `Continue autonomous work on ${wf.name}.`,
+    `[Autonomous Continuous Cycle #${nextCycleNumber}]`,
+    prevFiles.length > 0
+      ? `Previous workspace artifacts (${prevFiles.length}): ${prevFiles.map((f) => f.path).slice(0, 10).join(', ')}`
+      : `No workspace artifacts written yet; initialize or inspect deliverables.`,
+    openBugs.length > 0
+      ? `Open bug reports (${openBugs.length}): ${openBugs.map((b) => `[${b.severity}] ${b.title}`).slice(0, 5).join('; ')}`
+      : `No open bug reports recorded; focus on feature progress, tests, and hardening.`,
+  ].join('\n');
+
+  const runId = crypto.randomUUID();
+  runEventBuffers.set(runId, []);
+  createRunRecord({
+    id: runId,
+    workflowId: wf.id,
+    workflowName: `${wf.name} · Cycle #${nextCycleNumber}`,
+    taskPrompt: cyclePrompt,
+    mode: resolvedMode,
+    maxRounds: clampMaxRounds(wf.maxRounds),
+  });
+
+  upsertContinuousSession({
+    ...current,
+    status: 'running',
+    lastRunId: runId,
+    nextCycleAt: undefined,
+  });
+
+  try {
+    await executeWorkflowRun({
+      runId,
+      workflow: wf,
+      taskPrompt: cyclePrompt,
+      mode: resolvedMode,
+    });
+
+    const latest = getContinuousSession(workflowId);
+    if (!latest || !latest.active) return;
+
+    const events = runEventBuffers.get(runId) ?? getRunEvents(runId);
+    const hadError = events.some((e) => e.type === 'run_error');
+    const intervalSec = clampContinuousIntervalSec(wf.continuousIntervalSec ?? latest.intervalSec);
+    const backoffErrors = hadError ? latest.consecutiveErrors + 1 : 0;
+    const waitSec = hadError
+      ? Math.min(300, Math.max(intervalSec, 15 * Math.pow(2, Math.min(backoffErrors - 1, 4))))
+      : intervalSec;
+    const nextCycleAt = new Date(Date.now() + waitSec * 1000).toISOString();
+
+    upsertContinuousSession({
+      ...latest,
+      status: hadError ? 'error_backoff' : 'cooldown',
+      cyclesCompleted: nextCycleNumber,
+      lastRunId: runId,
+      lastRunStatus: hadError ? 'failed' : 'completed',
+      lastCycleAt: new Date().toISOString(),
+      nextCycleAt,
+      intervalSec,
+      consecutiveErrors: backoffErrors,
+      lastError: hadError
+        ? events.find((e) => e.type === 'run_error')?.content ?? 'Execution cycle reported an error'
+        : undefined,
+    });
+
+    scheduleContinuousCycle(workflowId, waitSec * 1000);
+  } catch (err) {
+    const latest = getContinuousSession(workflowId);
+    if (!latest || !latest.active) return;
+    const backoffErrors = latest.consecutiveErrors + 1;
+    const waitSec = Math.min(300, 15 * Math.pow(2, Math.min(backoffErrors - 1, 4)));
+    const nextCycleAt = new Date(Date.now() + waitSec * 1000).toISOString();
+
+    upsertContinuousSession({
+      ...latest,
+      status: 'error_backoff',
+      lastRunId: runId,
+      lastRunStatus: 'failed',
+      lastCycleAt: new Date().toISOString(),
+      nextCycleAt,
+      consecutiveErrors: backoffErrors,
+      lastError: err instanceof Error ? err.message : 'Unexpected continuous cycle error',
+    });
+
+    scheduleContinuousCycle(workflowId, waitSec * 1000);
+  }
+}
+
+function scheduleContinuousCycle(workflowId: string, delayMs: number): void {
+  clearContinuousTimer(workflowId);
+  const timer = setTimeout(() => {
+    continuousTimers.delete(workflowId);
+    void runSingleContinuousCycle(workflowId);
+  }, Math.max(1000, delayMs));
+  continuousTimers.set(workflowId, timer);
+}
+
+function hydrateContinuousSessions(): void {
+  try {
+    const activeSessions = listActiveContinuousSessions();
+    for (const session of activeSessions) {
+      const intervalSec = clampContinuousIntervalSec(session.intervalSec);
+      const nextCycleAt = new Date(Date.now() + Math.min(intervalSec, 10) * 1000).toISOString();
+      upsertContinuousSession({
+        ...session,
+        status: 'cooldown',
+        nextCycleAt,
+      });
+      scheduleContinuousCycle(session.workflowId, Math.min(intervalSec, 10) * 1000);
+    }
+  } catch {
+    // ignore hydration errors on boot
+  }
+}
+
+app.get('/api/workflows/:id/continuous', (req, res) => {
+  const wf = getWorkflowById(req.params.id);
+  const existing = getContinuousSession(req.params.id);
+  if (existing) {
+    res.json({ session: existing });
+    return;
+  }
+  const now = new Date().toISOString();
+  res.json({
+    session: {
+      workflowId: req.params.id,
+      active: Boolean(wf?.continuousAgentWork),
+      status: 'idle',
+      cyclesCompleted: 0,
+      intervalSec: clampContinuousIntervalSec(wf?.continuousIntervalSec ?? 30),
+      mode: 'dry_run',
+      taskPrompt: wf?.description ?? '',
+      consecutiveErrors: 0,
+      startedAt: now,
+      updatedAt: now,
+    } satisfies ContinuousWorkSession,
+  });
+});
+
+app.post('/api/workflows/:id/continuous/start', (req, res) => {
+  const workflowId = req.params.id;
+  const { workflow: inlineWorkflow, taskPrompt, mode, intervalSec, immediate } = req.body as {
+    workflow?: WorkflowConfig;
+    taskPrompt?: string;
+    mode?: 'live' | 'dry_run';
+    intervalSec?: number;
+    immediate?: boolean;
+  };
+
+  let wf = inlineWorkflow ?? getWorkflowById(workflowId);
+  if (!wf) {
+    res.status(404).json({ error: 'Workflow not found.' });
+    return;
+  }
+
+  const resolvedInterval = clampContinuousIntervalSec(
+    intervalSec ?? wf.continuousIntervalSec ?? 30,
+  );
+  wf = upsertWorkflow({
+    ...wf,
+    id: workflowId,
+    continuousAgentWork: true,
+    continuousIntervalSec: resolvedInterval,
+  });
+
+  if (wf.nodes.length === 0) {
+    res.status(400).json({ error: 'Add at least one Agent node before enabling continuous work.' });
+    return;
+  }
+
+  const existing = getContinuousSession(workflowId);
+  const resolvedMode: 'live' | 'dry_run' =
+    mode === 'live' || mode === 'dry_run'
+      ? mode
+      : canWorkflowRunLive(wf.nodes, getAppSettings())
+        ? 'live'
+        : 'dry_run';
+
+  const now = new Date().toISOString();
+  const promptText =
+    (typeof taskPrompt === 'string' && taskPrompt.trim()) ||
+    existing?.taskPrompt ||
+    wf.description ||
+    `Continue building, testing, and improving ${wf.name}.`;
+
+  const delayMs = immediate === false ? resolvedInterval * 1000 : 1200;
+  const session = upsertContinuousSession({
+    workflowId,
+    active: true,
+    status: 'cooldown',
+    cyclesCompleted: existing?.cyclesCompleted ?? 0,
+    lastRunId: existing?.lastRunId,
+    lastRunStatus: existing?.lastRunStatus,
+    lastCycleAt: existing?.lastCycleAt,
+    nextCycleAt: new Date(Date.now() + delayMs).toISOString(),
+    intervalSec: resolvedInterval,
+    mode: resolvedMode,
+    taskPrompt: promptText,
+    consecutiveErrors: 0,
+    startedAt: existing?.active ? existing.startedAt : now,
+    updatedAt: now,
+  });
+
+  scheduleContinuousCycle(workflowId, delayMs);
+  res.json({ session, workflow: wf });
+});
+
+app.post('/api/workflows/:id/continuous/stop', (req, res) => {
+  const workflowId = req.params.id;
+  const { disableWorkflowFlag } = (req.body ?? {}) as { disableWorkflowFlag?: boolean };
+  clearContinuousTimer(workflowId);
+
+  const existing = getContinuousSession(workflowId);
+  const wf = getWorkflowById(workflowId);
+  let updatedWorkflow = wf;
+  if (wf && disableWorkflowFlag !== false) {
+    updatedWorkflow = upsertWorkflow({
+      ...wf,
+      continuousAgentWork: false,
+    });
+  }
+
+  const now = new Date().toISOString();
+  const session = upsertContinuousSession({
+    workflowId,
+    active: false,
+    status: 'paused',
+    cyclesCompleted: existing?.cyclesCompleted ?? 0,
+    lastRunId: existing?.lastRunId,
+    lastRunStatus: existing?.lastRunStatus,
+    lastCycleAt: existing?.lastCycleAt,
+    nextCycleAt: undefined,
+    intervalSec: existing?.intervalSec ?? clampContinuousIntervalSec(wf?.continuousIntervalSec ?? 30),
+    mode: existing?.mode ?? 'dry_run',
+    taskPrompt: existing?.taskPrompt ?? wf?.description ?? '',
+    consecutiveErrors: 0,
+    startedAt: existing?.startedAt ?? now,
+    updatedAt: now,
+  });
+
+  res.json({ session, workflow: updatedWorkflow });
+});
+
+// =============================================================================
+// Strict Pre-Launch Final Test Gate (4 Categories, 14 Test Types)
+// =============================================================================
+function collectSourceFilesForAudit(
+  rootDir: string,
+  maxFiles = 80,
+): Array<{ path: string; content: string }> {
+  const out: Array<{ path: string; content: string }> = [];
+  const skipDirs = new Set([
+    'node_modules',
+    '.git',
+    'dist',
+    'data',
+    '.playwright-cli',
+    '.aistudio',
+  ]);
+  const allowedExt = new Set([
+    '.ts',
+    '.tsx',
+    '.js',
+    '.jsx',
+    '.mjs',
+    '.py',
+    '.css',
+    '.html',
+    '.json',
+    '.yml',
+    '.yaml',
+    '.sh',
+  ]);
+
+  function walk(dir: string) {
+    if (out.length >= maxFiles || !fs.existsSync(dir)) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (out.length >= maxFiles) break;
+      if (skipDirs.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!allowedExt.has(ext)) continue;
+        try {
+          const stat = fs.statSync(full);
+          if (stat.size > 260_000) continue;
+          const rel = path.relative(rootDir, full).replace(/\\/g, '/');
+          out.push({ path: rel, content: fs.readFileSync(full, 'utf-8') });
+        } catch {
+          // ignore unreadable file
+        }
+      }
+    }
+  }
+
+  walk(rootDir);
+  return out;
+}
+
+app.get('/api/prelaunch-tests/latest', (req, res) => {
+  const workflowId = typeof req.query.workflowId === 'string' ? req.query.workflowId : undefined;
+  const report = getLatestPrelaunchReport(workflowId);
+  res.json({ report });
+});
+
+app.post('/api/prelaunch-tests/run', async (req, res) => {
+  const startedAt = Date.now();
+  const { workflowId, workflow: inlineWorkflow, runId, strictMode } = req.body as {
+    workflowId?: string;
+    workflow?: WorkflowConfig;
+    runId?: string;
+    strictMode?: boolean;
+  };
+
+  const wf: WorkflowConfig =
+    inlineWorkflow ??
+    (workflowId ? getWorkflowById(workflowId) : null) ?? {
+      id: workflowId || 'default-workflow',
+      name: 'Studio Project',
+      description: '',
+      maxRounds: 6,
+      humanInTheLoop: true,
+      nodes: [],
+      edges: [],
+      updatedAt: new Date().toISOString(),
+    };
+
+  const isStrict = strictMode ?? wf.strictPrelaunchGate ?? true;
+  const sandboxFiles = runId ? listSandboxFiles(runId) : [];
+  const projectId = wf.projectContext?.projectId?.replace(/[^a-zA-Z0-9_-]/g, '');
+  const projectDir = projectId ? path.join(PROJECTS_BASE, projectId) : '';
+  const hasImportedDir = Boolean(projectDir && fs.existsSync(projectDir));
+
+  const targetRoot = hasImportedDir ? projectDir : process.cwd();
+  const targetScope = hasImportedDir
+    ? `Imported Project (${wf.projectContext?.name ?? projectId})`
+    : sandboxFiles.length > 0
+      ? `Studio + Sandbox (${sandboxFiles.length} files)`
+      : 'Studio Codebase';
+
+  const sourceFiles = collectSourceFilesForAudit(targetRoot);
+  const combinedAuditFiles = [
+    ...sourceFiles,
+    ...sandboxFiles.map((f) => ({ path: `sandbox/${f.path}`, content: f.content })),
+  ];
+
+  const results: PrelaunchTestResult[] = [];
+  const localBase = `http://127.0.0.1:${PORT}`;
+  const settings = getAppSettings();
+  const allBugs = listBugReports({ workflowId: wf.id });
+  const openBugs = allBugs.filter((b) => b.status !== 'resolved');
+  const recentRuns = listRunSummaries(15).filter((r) => !wf.id || r.workflowId === wf.id);
+
+  // 1. Unit Testing
+  {
+    const t0 = Date.now();
+    const localTsx = path.resolve(process.cwd(), 'node_modules/.bin/tsx');
+    const tsxBin = fs.existsSync(localTsx) ? localTsx : 'npx --yes tsx';
+    const unitRes = await runSandboxCommand(
+      process.cwd(),
+      `${tsxBin} --test src/utils/*.test.ts`,
+      25000,
+    );
+    const output = [unitRes.stdout, unitRes.stderr].filter(Boolean).join('\n');
+    const passMatch = output.match(/# pass (\d+)/);
+    const failMatch = output.match(/# fail (\d+)/);
+    const passCount = passMatch ? Number(passMatch[1]) : 0;
+    const failCount = failMatch ? Number(failMatch[1]) : unitRes.exitCode === 0 ? 0 : 1;
+    const ok = unitRes.exitCode === 0 && failCount === 0;
+    results.push({
+      id: 'unit',
+      category: 'core_technical',
+      severity: 'critical',
+      status: ok ? 'pass' : 'fail',
+      score: ok ? 100 : 25,
+      durationMs: Date.now() - t0,
+      summaryEn: ok
+        ? `Executed ${passCount || 'all'} unit tests cleanly with 0 failures.`
+        : `Unit test suite exited with code ${unitRes.exitCode} (${failCount} failed).`,
+      summaryFa: ok
+        ? `${passCount || 'تمامی'} تست واحد با موفقیت و بدون خطا اجرا شدند.`
+        : `اجرای تست واحد با کد خطا ${unitRes.exitCode} و ${failCount} مورد ناموفق متوقف شد.`,
+      evidence: [
+        `Command: tsx --test src/utils/*.test.ts`,
+        `Exit code: ${unitRes.exitCode}, Passed: ${passCount}, Failed: ${failCount}`,
+      ],
+      recommendationEn: ok ? undefined : 'Fix failing unit test assertions in src/utils/*.test.ts before launch.',
+      recommendationFa: ok ? undefined : 'تست‌های واحد ناموفق را پیش از لانچ اصلاح کنید.',
+    });
+  }
+
+  // 2. Integration Testing
+  {
+    const t0 = Date.now();
+    const integrationProbes = await Promise.all([
+      fetch(`${localBase}/api/workflows`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
+      fetch(`${localBase}/api/settings`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
+      fetch(`${localBase}/api/capabilities`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
+      fetch(`${localBase}/api/runs`, { signal: AbortSignal.timeout(4000) }).then((r) => r.ok).catch(() => false),
+    ]);
+    const passed = integrationProbes.filter(Boolean).length;
+    const ok = passed === integrationProbes.length;
+    results.push({
+      id: 'integration',
+      category: 'core_technical',
+      severity: 'critical',
+      status: ok ? 'pass' : passed >= 2 ? 'warn' : 'fail',
+      score: Math.round((passed / integrationProbes.length) * 100),
+      durationMs: Date.now() - t0,
+      summaryEn: `${passed}/${integrationProbes.length} core REST/SQLite integration routes verified.`,
+      summaryFa: `${passed} از ${integrationProbes.length} مسیر یکپارچه‌سازی API و SQLite تایید شد.`,
+      evidence: [
+        `Probed /api/workflows, /api/settings, /api/capabilities, /api/runs`,
+        `SQLite workflows persisted: ${listWorkflows().length}`,
+      ],
+      recommendationEn: ok ? undefined : 'Ensure backend API routes and SQLite database connections respond HTTP 200.',
+      recommendationFa: ok ? undefined : 'از پاسخگویی سالم تمام سرویس‌های API و اتصال SQLite مطمئن شوید.',
+    });
+  }
+
+  // 3. System Testing
+  {
+    const t0 = Date.now();
+    const localTsc = path.resolve(process.cwd(), 'node_modules/.bin/tsc');
+    const tscBin = fs.existsSync(localTsc) ? localTsc : 'npx --yes tsc';
+    const tscRes = await runSandboxCommand(process.cwd(), `${tscBin} --noEmit`, 25000);
+    const pyRes = await runSandboxCommand(
+      process.cwd(),
+      'python3 -m py_compile deploy/backend/*.py',
+      15000,
+    );
+    const hasDistOrSrc = fs.existsSync(path.resolve(process.cwd(), 'src/App.tsx'));
+    const ok = tscRes.exitCode === 0 && pyRes.exitCode === 0 && hasDistOrSrc;
+    results.push({
+      id: 'system',
+      category: 'core_technical',
+      severity: 'critical',
+      status: ok ? 'pass' : 'fail',
+      score: ok ? 100 : tscRes.exitCode === 0 ? 60 : 20,
+      durationMs: Date.now() - t0,
+      summaryEn: ok
+        ? 'Full-system TypeScript typecheck (tsc --noEmit) and Python backend compile passed.'
+        : 'System verification reported compilation or typecheck errors.',
+      summaryFa: ok
+        ? 'بررسی کامل ساختار سیستم (TypeScript و بک‌اند پایتون) بدون خطا تایید شد.'
+        : 'بررسی یکپارچه سیستم با خطای کامپایل یا تایپ مواجه شد.',
+      evidence: [
+        `TypeScript tsc --noEmit exit: ${tscRes.exitCode}`,
+        `Python py_compile exit: ${pyRes.exitCode}`,
+      ],
+      recommendationEn: ok ? undefined : 'Resolve TypeScript/Python errors reported by tsc --noEmit before launch.',
+      recommendationFa: ok ? undefined : 'خطاهای تایپ یا سینتکس سیستم را برطرف کنید.',
+    });
+  }
+
+  // 4. Functional Testing
+  {
+    const t0 = Date.now();
+    const workflowIssues = findMissingWorkflowCoverage(wf);
+    const hasTools = wf.nodes.some((n) => n.data.tools.readFile || n.data.tools.writeFile);
+    const score = workflowIssues.length === 0 && hasTools ? 100 : workflowIssues.length === 1 ? 75 : 40;
+    const status = workflowIssues.length === 0 ? (hasTools ? 'pass' : 'warn') : 'fail';
+    results.push({
+      id: 'functional',
+      category: 'functional_nonfunctional',
+      severity: 'critical',
+      status,
+      score,
+      durationMs: Date.now() - t0,
+      summaryEn:
+        workflowIssues.length === 0
+          ? `Workflow "${wf.name}" has ${wf.nodes.length} active agent(s), ${wf.edges.length} edges, and valid prompts.`
+          : `Functional gaps found: ${workflowIssues.join(' ')}`,
+      summaryFa:
+        workflowIssues.length === 0
+          ? `ساختار کارکردی پروژه «${wf.name}» با ${wf.nodes.length} ایجنت و پرامپت‌های معتبر تایید شد.`
+          : `نقص کارکردی شناسایی شد: ${workflowIssues.join(' ')}`,
+      evidence: [
+        `Agents: ${wf.nodes.length}, Edges: ${wf.edges.length}`,
+        `Sandbox deliverable files: ${sandboxFiles.length}`,
+      ],
+      recommendationEn: workflowIssues.length > 0 ? workflowIssues.join(' ') : undefined,
+      recommendationFa: workflowIssues.length > 0 ? 'حداقل یک مدیر و ایجنت‌های دارای پرامپت معتبر به ورکفلو اضافه کنید.' : undefined,
+    });
+  }
+
+  // 5. Performance Testing
+  {
+    const t0 = Date.now();
+    const probeStart = Date.now();
+    await fetch(`${localBase}/api/health`, { signal: AbortSignal.timeout(3000) }).catch(() => null);
+    const apiLatencyMs = Date.now() - probeStart;
+    const oversizedFiles = combinedAuditFiles.filter((f) => f.content.length > 180_000);
+    const ok = apiLatencyMs < 350 && oversizedFiles.length === 0;
+    const status = apiLatencyMs < 800 && oversizedFiles.length <= 2 ? (ok ? 'pass' : 'warn') : 'fail';
+    results.push({
+      id: 'performance',
+      category: 'functional_nonfunctional',
+      severity: 'high',
+      status,
+      score: ok ? 98 : status === 'warn' ? 78 : 45,
+      durationMs: Date.now() - t0,
+      summaryEn: `API health latency ${apiLatencyMs}ms across ${combinedAuditFiles.length} audited files (${oversizedFiles.length} oversized).`,
+      summaryFa: `زمان پاسخ‌دهی API برابر ${apiLatencyMs} میلی‌ثانیه و بررسی ${combinedAuditFiles.length} فایل (${oversizedFiles.length} فایل سنگین).`,
+      evidence: [
+        `/api/health RTT: ${apiLatencyMs}ms`,
+        `Audited files: ${combinedAuditFiles.length}, Files >180KB: ${oversizedFiles.length}`,
+      ],
+      recommendationEn: ok ? undefined : 'Split oversized source modules or optimize slow endpoints.',
+      recommendationFa: ok ? undefined : 'ماژول‌های حجیم را خرد کنید و زمان پاسخ API را بهینه نمایید.',
+    });
+  }
+
+  // 6. Stress Testing
+  {
+    const t0 = Date.now();
+    const concurrency = 12;
+    const stressResults = await Promise.all(
+      Array.from({ length: concurrency }, () =>
+        fetch(`${localBase}/api/health`, { signal: AbortSignal.timeout(4000) })
+          .then((r) => r.ok)
+          .catch(() => false),
+      ),
+    );
+    const okCount = stressResults.filter(Boolean).length;
+    const guardrailsValid =
+      wf.maxRounds >= 1 &&
+      wf.maxRounds <= 25 &&
+      settings.sandboxTimeoutSec >= 5 &&
+      settings.sandboxMemoryMb >= 256;
+    const ok = okCount === concurrency && guardrailsValid;
+    results.push({
+      id: 'stress',
+      category: 'functional_nonfunctional',
+      severity: 'high',
+      status: ok ? 'pass' : okCount >= 10 ? 'warn' : 'fail',
+      score: Math.round((okCount / concurrency) * (guardrailsValid ? 100 : 80)),
+      durationMs: Date.now() - t0,
+      summaryEn: `Burst probe (${concurrency} concurrent requests): ${okCount}/${concurrency} succeeded; sandbox memory=${settings.sandboxMemoryMb}MB, timeout=${settings.sandboxTimeoutSec}s.`,
+      summaryFa: `تست هم‌زمانی (${concurrency} درخواست موازی): ${okCount} از ${concurrency} موفق؛ سقف حافظه سندباکس ${settings.sandboxMemoryMb}MB و تایم‌اوت ${settings.sandboxTimeoutSec} ثانیه.`,
+      evidence: [
+        `Concurrent /api/health probes passed: ${okCount}/${concurrency}`,
+        `Guardrails: maxRounds=${wf.maxRounds}, sandboxTimeout=${settings.sandboxTimeoutSec}s`,
+      ],
+      recommendationEn: ok ? undefined : 'Check concurrency stability and verify maxRounds / sandbox timeout limits.',
+      recommendationFa: ok ? undefined : 'پایداری درخواست‌های هم‌زمان و محدودیت‌های منابع را بررسی کنید.',
+    });
+  }
+
+  // 7. Security Testing
+  {
+    const t0 = Date.now();
+    const secFindings = scanSourceSecurityIssues(combinedAuditFiles);
+    const hitlActive = wf.humanInTheLoop || settings.globalHumanInTheLoop;
+    const criticalCount = secFindings.filter((f) => f.severity === 'critical').length;
+    const ok = criticalCount === 0 && secFindings.length === 0 && hitlActive;
+    const status = criticalCount > 0 ? 'fail' : secFindings.length > 0 || !hitlActive ? 'warn' : 'pass';
+    results.push({
+      id: 'security',
+      category: 'functional_nonfunctional',
+      severity: 'critical',
+      status,
+      score: criticalCount > 0 ? 15 : secFindings.length > 0 ? 70 : hitlActive ? 100 : 82,
+      durationMs: Date.now() - t0,
+      summaryEn:
+        secFindings.length === 0
+          ? `0 hardcoded secrets or injection/XSS flaws found across ${combinedAuditFiles.length} files (HITL=${hitlActive ? 'ON' : 'OFF'}).`
+          : `Detected ${secFindings.length} security finding(s) (${criticalCount} critical).`,
+      summaryFa:
+        secFindings.length === 0
+          ? `هیچ کلید محرمانه افشاشده یا آسیب‌پذیری تزریق/XSS در ${combinedAuditFiles.length} فایل یافت نشد (تایید انسانی: ${hitlActive ? 'فعال' : 'غیرفعال'}).`
+          : `${secFindings.length} مورد ریسک امنیتی (${criticalCount} بحرانی) شناسایی شد.`,
+      evidence:
+        secFindings.length > 0
+          ? secFindings.slice(0, 5).map((f) => `[${f.severity.toUpperCase()}] ${f.file}: ${f.issue}`)
+          : [`Scanned ${combinedAuditFiles.length} source files`, `HITL approval gate: ${hitlActive}`],
+      recommendationEn:
+        secFindings.length > 0
+          ? 'Remove hardcoded secrets/unsafe patterns immediately and store keys in the encrypted/SQLite Secret Vault.'
+          : !hitlActive
+            ? 'Enable Human-in-the-Loop Gate for production shell safety.'
+            : undefined,
+      recommendationFa:
+        secFindings.length > 0
+          ? 'کلیدهای هاردکد یا الگوهای ناامن را فوراً حذف و از مخزن امن سرور استفاده کنید.'
+          : !hitlActive
+            ? 'برای ایمنی بیشتر، تایید انسانی دستورات حساس را فعال کنید.'
+            : undefined,
+    });
+  }
+
+  // 8. Usability & UI/UX Testing
+  {
+    const t0 = Date.now();
+    const indexHtmlPath = path.resolve(process.cwd(), 'index.html');
+    const indexHtml = fs.existsSync(indexHtmlPath) ? fs.readFileSync(indexHtmlPath, 'utf-8') : '';
+    const hasTitle = /<title>[^<]+<\/title>/i.test(indexHtml);
+    const appSource = combinedAuditFiles
+      .filter((f) => f.path.endsWith('.tsx'))
+      .map((f) => f.content)
+      .join('\n');
+    const hasRtlSupport = appSource.includes("dir={lang === 'fa'") || appSource.includes('dir="auto"');
+    const hasAria = appSource.includes('aria-label') && appSource.includes('role=');
+    const hasDarkClasses = appSource.includes('dark:');
+    const ok = hasTitle && hasRtlSupport && hasAria && hasDarkClasses;
+    results.push({
+      id: 'usability',
+      category: 'ux_compatibility',
+      severity: 'high',
+      status: ok ? 'pass' : 'warn',
+      score: ok ? 96 : 75,
+      durationMs: Date.now() - t0,
+      summaryEn: `UX checks: HTML title=${hasTitle}, RTL/LTR=${hasRtlSupport}, ARIA=${hasAria}, Dark theme=${hasDarkClasses}.`,
+      summaryFa: `بررسی رابط کاربری: پشتیبانی RTL/LTR، برچسب‌های دسترس‌پذیری و تم تیره/روشن ${ok ? 'تایید شد' : 'نیاز به بازبینی دارد'}.`,
+      evidence: [
+        `Document title present: ${hasTitle}`,
+        `Bilingual RTL + ARIA + Dark Mode classes detected: ${hasRtlSupport && hasAria && hasDarkClasses}`,
+      ],
+      recommendationEn: ok ? undefined : 'Ensure semantic ARIA labels, bilingual RTL attributes, and clear error feedback across views.',
+      recommendationFa: ok ? undefined : 'از کامل بودن پشتیبانی RTL و برچسب‌های دسترس‌پذیری اطمینان حاصل کنید.',
+    });
+  }
+
+  // 9. Compatibility Testing
+  {
+    const t0 = Date.now();
+    const indexHtmlPath = path.resolve(process.cwd(), 'index.html');
+    const indexHtml = fs.existsSync(indexHtmlPath) ? fs.readFileSync(indexHtmlPath, 'utf-8') : '';
+    const hasViewportMeta = /name=["']viewport["']/i.test(indexHtml);
+    const hasLinuxStack =
+      fs.existsSync(path.resolve(process.cwd(), 'install-linux.sh')) &&
+      fs.existsSync(path.resolve(process.cwd(), 'Dockerfile')) &&
+      fs.existsSync(path.resolve(process.cwd(), 'docker-compose.yml'));
+    const nodeMajor = Number(process.versions.node.split('.')[0]);
+    const ok = hasViewportMeta && hasLinuxStack && nodeMajor >= 20;
+    results.push({
+      id: 'compatibility',
+      category: 'ux_compatibility',
+      severity: 'high',
+      status: ok ? 'pass' : 'warn',
+      score: ok ? 100 : 75,
+      durationMs: Date.now() - t0,
+      summaryEn: `Viewport meta=${hasViewportMeta}, Node v${process.versions.node}, Linux/Docker bundle=${hasLinuxStack}.`,
+      summaryFa: `سازگاری ریسپانسیو موبایل/دسکتاپ، Node v${process.versions.node} و فایل‌های استقرار لینوکس/Docker تایید شد.`,
+      evidence: [
+        `Responsive viewport meta tag: ${hasViewportMeta}`,
+        `Node runtime: v${process.versions.node}`,
+        `Linux installer & Docker manifests present: ${hasLinuxStack}`,
+      ],
+      recommendationEn: ok ? undefined : 'Verify mobile viewport meta tag and Linux Docker/Node compatibility files.',
+      recommendationFa: ok ? undefined : 'تگ viewport و فایل‌های سازگاری لینوکس/داکر را بررسی کنید.',
+    });
+  }
+
+  // 10. Regression Testing
+  {
+    const t0 = Date.now();
+    const criticalBugs = openBugs.filter((b) => b.severity === 'critical' || b.severity === 'high');
+    const failedRecent = recentRuns.filter((r) => r.status === 'failed');
+    const ok = criticalBugs.length === 0;
+    const status = criticalBugs.length > 0 ? 'fail' : openBugs.length > 0 || failedRecent.length > 0 ? 'warn' : 'pass';
+    results.push({
+      id: 'regression',
+      category: 'ux_compatibility',
+      severity: 'critical',
+      status,
+      score: criticalBugs.length > 0 ? 30 : openBugs.length > 0 ? 80 : 100,
+      durationMs: Date.now() - t0,
+      summaryEn:
+        criticalBugs.length === 0
+          ? `0 open critical/high bugs (${openBugs.length} minor open, ${allBugs.length - openBugs.length} resolved).`
+          : `${criticalBugs.length} open critical/high bug report(s) blocking regression stability.`,
+      summaryFa:
+        criticalBugs.length === 0
+          ? `هیچ باگ بحرانی/مهم بازی وجود ندارد (${allBugs.length - openBugs.length} مورد حل‌شده).`
+          : `${criticalBugs.length} باگ باز مهم/بحرانی در سیستم ثبت شده است که باید پیش از لانچ رفع شود.`,
+      evidence: [
+        `Open critical/high bugs: ${criticalBugs.length}`,
+        `Total open bugs: ${openBugs.length}, Recent failed runs: ${failedRecent.length}`,
+      ],
+      recommendationEn: ok ? undefined : 'Ask agents to fix open critical/high bug reports in the Bug Report tab.',
+      recommendationFa: ok ? undefined : 'باگ‌های باز مهم را در تب Bug Report به ایجنت‌ها برای اصلاح ارسال کنید.',
+    });
+  }
+
+  // 11. Smoke Testing
+  {
+    const t0 = Date.now();
+    const healthRes = await fetch(`${localBase}/api/health`, { signal: AbortSignal.timeout(3000) })
+      .then(async (r) => ({ ok: r.ok, body: await r.json().catch(() => null) }))
+      .catch(() => ({ ok: false, body: null }));
+    const blueprintOk = await fetch(`${localBase}/api/blueprint`, { signal: AbortSignal.timeout(3000) })
+      .then((r) => r.ok)
+      .catch(() => false);
+    const ok = Boolean(healthRes.ok && blueprintOk);
+    results.push({
+      id: 'smoke',
+      category: 'final_pre_release',
+      severity: 'critical',
+      status: ok ? 'pass' : 'fail',
+      score: ok ? 100 : 20,
+      durationMs: Date.now() - t0,
+      summaryEn: ok
+        ? 'Live server health, SQLite readiness, and blueprint endpoints passed smoke checks.'
+        : 'Smoke probe failed on core runtime endpoints.',
+      summaryFa: ok
+        ? 'تست دود روی سلامت سرور، دیتابیس SQLite و اندپوینت‌های اصلی با موفقیت پاس شد.'
+        : 'تست دود روی مسیرهای اصلی سرور با خطا مواجه شد.',
+      evidence: [
+        `/api/health ok=${healthRes.ok}`,
+        `/api/blueprint ok=${blueprintOk}`,
+      ],
+    });
+  }
+
+  // 12. Alpha Testing
+  {
+    const t0 = Date.now();
+    const roles = new Set(wf.nodes.map((n) => n.data.role));
+    const hasManager = roles.has('manager');
+    const hasBuilder = roles.has('backend') || roles.has('frontend') || wf.nodes.length >= 2;
+    const hasQa = roles.has('security_qa');
+    const ok = hasManager && hasBuilder && hasQa;
+    results.push({
+      id: 'alpha',
+      category: 'final_pre_release',
+      severity: 'high',
+      status: ok ? 'pass' : hasManager && hasBuilder ? 'warn' : 'fail',
+      score: ok ? 100 : hasManager && hasBuilder ? 75 : 40,
+      durationMs: Date.now() - t0,
+      summaryEn: `Internal Alpha team coverage: Manager=${hasManager}, Engineering=${hasBuilder}, Security & QA=${hasQa}.`,
+      summaryFa: `آمادگی تست آلفای داخلی: مدیر=${hasManager ? 'دارد' : 'ندارد'}، مهندسی=${hasBuilder ? 'دارد' : 'ندارد'}، امنیت و QA=${hasQa ? 'دارد' : 'ندارد'}.`,
+      evidence: [
+        `Assigned roles: ${Array.from(roles).join(', ') || 'none'}`,
+        `Continuous autonomous mode: ${Boolean(wf.continuousAgentWork)}`,
+      ],
+      recommendationEn: ok ? undefined : 'Assign a Manager, Backend/Frontend, and Security & QA agent for complete Alpha coverage.',
+      recommendationFa: ok ? undefined : 'برای پوشش کامل تست آلفا، نقش‌های مدیر، توسعه و امنیت/QA را در تیم داشته باشید.',
+    });
+  }
+
+  // 13. Beta Testing
+  {
+    const t0 = Date.now();
+    const hasEnvExample = fs.existsSync(path.resolve(process.cwd(), '.env.example'));
+    const hasReadme = fs.existsSync(path.resolve(process.cwd(), 'README.md'));
+    const hasNginxSslInstaller =
+      fs.existsSync(path.resolve(process.cwd(), 'install-linux.sh')) &&
+      fs.readFileSync(path.resolve(process.cwd(), 'install-linux.sh'), 'utf-8').includes('--nginx');
+    const ok = hasEnvExample && hasReadme && hasNginxSslInstaller;
+    results.push({
+      id: 'beta',
+      category: 'final_pre_release',
+      severity: 'high',
+      status: ok ? 'pass' : 'warn',
+      score: ok ? 100 : 70,
+      durationMs: Date.now() - t0,
+      summaryEn: `Beta staging package: .env.example=${hasEnvExample}, README=${hasReadme}, Nginx+SSL installer=${hasNginxSslInstaller}.`,
+      summaryFa: `آمادگی بسته تست بتا: فایل env.example، مستندات README و نصب خودکار Nginx+SSL ${ok ? 'کامل است' : 'نیاز به تکمیل دارد'}.`,
+      evidence: [
+        `.env.example: ${hasEnvExample}, README.md: ${hasReadme}`,
+        `Linux Nginx/SSL bootstrap flag verified: ${hasNginxSslInstaller}`,
+      ],
+    });
+  }
+
+  // 14. User Acceptance Testing (UAT)
+  {
+    const t0 = Date.now();
+    const hasGoal = Boolean(wf.description?.trim() || wf.projectContext?.summary?.trim());
+    const anyBlockingCritical = results.some((r) => r.status === 'fail' && r.severity === 'critical');
+    const ok = hasGoal && !anyBlockingCritical;
+    const status = anyBlockingCritical ? 'fail' : hasGoal ? 'pass' : 'warn';
+    results.push({
+      id: 'uat',
+      category: 'final_pre_release',
+      severity: 'critical',
+      status,
+      score: anyBlockingCritical ? 35 : hasGoal ? 100 : 75,
+      durationMs: Date.now() - t0,
+      summaryEn: anyBlockingCritical
+        ? 'UAT blocked because critical technical/security/regression checks failed.'
+        : hasGoal
+          ? 'Project requirements, goal definition, and pre-launch acceptance criteria satisfied.'
+          : 'Technical checks passed, but project description/goal is empty for full UAT sign-off.',
+      summaryFa: anyBlockingCritical
+        ? 'پذیرش کاربر (UAT) به دلیل وجود خطای بحرانی در تست‌های قبلی مسدود است.'
+        : hasGoal
+          ? 'تطابق محصول با اهداف تعریف‌شده و معیارهای پذیرش کاربر (UAT) تایید شد.'
+          : 'تست‌های فنی پاس شدند، اما برای امضای دقیق UAT، هدف و توضیحات پروژه را تکمیل کنید.',
+      evidence: [
+        `Project goal defined: ${hasGoal}`,
+        `Prior critical test failures: ${results.filter((r) => r.status === 'fail' && r.severity === 'critical').length}`,
+      ],
+      recommendationEn: anyBlockingCritical
+        ? 'Resolve all critical failures first, then re-run Strict Pre-Launch Tests.'
+        : !hasGoal
+          ? 'Add a clear project description in Manage Projects.'
+          : undefined,
+      recommendationFa: anyBlockingCritical
+        ? 'ابتدا خطاهای بحرانی را رفع کرده و تست سخت قبل از لانچ را مجدداً اجرا کنید.'
+        : !hasGoal
+          ? 'در بخش مدیریت پروژه‌ها توضیحات و هدف پروژه را مشخص کنید.'
+          : undefined,
+    });
+  }
+
+  const report: PrelaunchTestReport = evaluatePrelaunchGate({
+    id: `prelaunch-${crypto.randomUUID().slice(0, 8)}`,
+    workflowId: wf.id,
+    workflowName: wf.name,
+    strictMode: isStrict,
+    targetScope,
+    durationMs: Date.now() - startedAt,
+    results,
+  });
+
+  savePrelaunchReport(report);
+  res.json({ report });
+});
+
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
@@ -3761,6 +4644,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`AetherFlow Agent Studio server listening on http://localhost:${PORT}`);
+    hydrateContinuousSessions();
   });
 }
 

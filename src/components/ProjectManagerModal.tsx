@@ -12,7 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import type { ImportedProjectAnalysis, WorkflowConfig } from '../types/workflow';
-import { clampMaxRounds } from '../utils/workflowEngine';
+import { clampContinuousIntervalSec, clampMaxRounds } from '../utils/workflowEngine';
 
 interface ProjectManagerModalProps {
   isOpen: boolean;
@@ -57,6 +57,10 @@ export function ProjectManagerModal({
   const [wfDescription, setWfDescription] = useState(activeWorkflow.description);
   const [wfMaxRounds, setWfMaxRounds] = useState(activeWorkflow.maxRounds);
   const [wfHitl, setWfHitl] = useState(activeWorkflow.humanInTheLoop);
+  const [wfContinuousWork, setWfContinuousWork] = useState(Boolean(activeWorkflow.continuousAgentWork));
+  const [wfContinuousIntervalSec, setWfContinuousIntervalSec] = useState(
+    clampContinuousIntervalSec(activeWorkflow.continuousIntervalSec ?? 30),
+  );
   const [wfRepoName, setWfRepoName] = useState(activeWorkflow.projectContext?.name ?? '');
   const [wfRepoUrl, setWfRepoUrl] = useState(activeWorkflow.projectContext?.sourceUrl ?? '');
   const [wfBranch, setWfBranch] = useState(activeWorkflow.projectContext?.branch ?? '');
@@ -70,7 +74,9 @@ export function ProjectManagerModal({
   const [savingImp, setSavingImp] = useState(false);
 
   const targetWorkflow =
-    workflows.find((w) => w.id === editingWorkflowId) ?? activeWorkflow;
+    editingWorkflowId === activeWorkflow.id
+      ? activeWorkflow
+      : workflows.find((w) => w.id === editingWorkflowId) ?? activeWorkflow;
 
   useEffect(() => {
     if (!isOpen) return;
@@ -79,11 +85,17 @@ export function ProjectManagerModal({
     setWfDescription(activeWorkflow.description);
     setWfMaxRounds(activeWorkflow.maxRounds);
     setWfHitl(activeWorkflow.humanInTheLoop);
+    setWfContinuousWork(Boolean(activeWorkflow.continuousAgentWork));
+    setWfContinuousIntervalSec(
+      clampContinuousIntervalSec(activeWorkflow.continuousIntervalSec ?? 30),
+    );
     setWfRepoName(activeWorkflow.projectContext?.name ?? '');
     setWfRepoUrl(activeWorkflow.projectContext?.sourceUrl ?? '');
     setWfBranch(activeWorkflow.projectContext?.branch ?? '');
     setEditingImportedId(null);
-  }, [isOpen, activeWorkflow]);
+    // Intentionally sync only when modal opens or active workflow ID switches
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, activeWorkflow.id]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -97,14 +109,19 @@ export function ProjectManagerModal({
   if (!isOpen) return null;
 
   const loadWorkflowIntoForm = (wf: WorkflowConfig) => {
-    setEditingWorkflowId(wf.id);
-    setWfName(wf.name);
-    setWfDescription(wf.description);
-    setWfMaxRounds(wf.maxRounds);
-    setWfHitl(wf.humanInTheLoop);
-    setWfRepoName(wf.projectContext?.name ?? '');
-    setWfRepoUrl(wf.projectContext?.sourceUrl ?? '');
-    setWfBranch(wf.projectContext?.branch ?? '');
+    const resolved = wf.id === activeWorkflow.id ? activeWorkflow : wf;
+    setEditingWorkflowId(resolved.id);
+    setWfName(resolved.name);
+    setWfDescription(resolved.description);
+    setWfMaxRounds(resolved.maxRounds);
+    setWfHitl(resolved.humanInTheLoop);
+    setWfContinuousWork(Boolean(resolved.continuousAgentWork));
+    setWfContinuousIntervalSec(
+      clampContinuousIntervalSec(resolved.continuousIntervalSec ?? 30),
+    );
+    setWfRepoName(resolved.projectContext?.name ?? '');
+    setWfRepoUrl(resolved.projectContext?.sourceUrl ?? '');
+    setWfBranch(resolved.projectContext?.branch ?? '');
   };
 
   const handleSaveWorkflowForm = async (e: React.FormEvent) => {
@@ -112,30 +129,34 @@ export function ProjectManagerModal({
     if (!wfName.trim()) return;
     setSavingWf(true);
     try {
+      const latestSource =
+        targetWorkflow.id === activeWorkflow.id ? activeWorkflow : targetWorkflow;
       const hasRepoContext = Boolean(
-        wfRepoName.trim() || wfRepoUrl.trim() || targetWorkflow.projectContext,
+        wfRepoName.trim() || wfRepoUrl.trim() || latestSource.projectContext,
       );
       const updated: WorkflowConfig = {
-        ...targetWorkflow,
+        ...latestSource,
         name: wfName.trim(),
         description: wfDescription.trim() || 'Custom multi-agent project workflow',
         maxRounds: clampMaxRounds(wfMaxRounds),
         humanInTheLoop: wfHitl,
+        continuousAgentWork: wfContinuousWork,
+        continuousIntervalSec: clampContinuousIntervalSec(wfContinuousIntervalSec),
         projectContext: hasRepoContext
           ? {
               projectId:
-                targetWorkflow.projectContext?.projectId || `proj-${targetWorkflow.id}`,
+                latestSource.projectContext?.projectId || `proj-${latestSource.id}`,
               name: wfRepoName.trim() || wfName.trim(),
               sourceType: wfRepoUrl.trim()
                 ? 'github'
-                : targetWorkflow.projectContext?.sourceType ?? 'zip',
+                : latestSource.projectContext?.sourceType ?? 'zip',
               sourceUrl: wfRepoUrl.trim() || undefined,
               branch: wfBranch.trim() || undefined,
               summary:
-                targetWorkflow.projectContext?.summary ||
+                latestSource.projectContext?.summary ||
                 wfDescription.trim() ||
                 'Project workflow context',
-              frameworks: targetWorkflow.projectContext?.frameworks ?? [],
+              frameworks: latestSource.projectContext?.frameworks ?? [],
             }
           : undefined,
         updatedAt: new Date().toISOString(),
@@ -244,7 +265,8 @@ export function ProjectManagerModal({
               </div>
 
               <div className="mt-2.5 space-y-2" data-testid="pm-workflows-list">
-                {workflows.map((wf) => {
+                {workflows.map((wfItem) => {
+                  const wf = wfItem.id === activeWorkflow.id ? activeWorkflow : wfItem;
                   const isEditingThis = wf.id === targetWorkflow.id;
                   const isCurrentActive = wf.id === activeWorkflow.id;
                   return (
@@ -272,6 +294,11 @@ export function ProjectManagerModal({
                             {isCurrentActive && (
                               <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.2 text-[10px] font-semibold text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
                                 {isFa ? 'فعال' : 'Active'}
+                              </span>
+                            )}
+                            {wf.continuousAgentWork && (
+                              <span className="shrink-0 rounded bg-blue-100 px-1.5 py-0.2 text-[10px] font-semibold text-blue-800 dark:bg-blue-950/60 dark:text-blue-300">
+                                {isFa ? 'کار مداوم' : '24/7'}
                               </span>
                             )}
                           </div>
@@ -548,6 +575,48 @@ export function ProjectManagerModal({
                     </span>
                   </label>
                 </div>
+              </div>
+
+              <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-3.5 dark:border-blue-900/60 dark:bg-blue-950/25">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <label className="flex items-center gap-2 text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    <input
+                      type="checkbox"
+                      data-testid="pm-continuous-work-checkbox"
+                      checked={wfContinuousWork}
+                      onChange={(e) => setWfContinuousWork(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-300 accent-blue-600"
+                    />
+                    <span>
+                      {isFa
+                        ? 'امکان کار مداوم و پیوسته ایجنت‌ها روی پروژه (جلوگیری از توقف بعد از چند ساعت)'
+                        : 'Enable Continuous Autonomous Agent Work (Never Stop After Idle / Hours)'}
+                    </span>
+                  </label>
+
+                  <label className="flex items-center gap-2 text-[11px] font-medium text-slate-700 dark:text-slate-300">
+                    <span>{isFa ? 'فاصله هر چرخه:' : 'Cycle Interval:'}</span>
+                    <select
+                      data-testid="pm-continuous-interval-select"
+                      value={wfContinuousIntervalSec}
+                      onChange={(e) =>
+                        setWfContinuousIntervalSec(clampContinuousIntervalSec(Number(e.target.value)))
+                      }
+                      className="rounded border border-slate-200 bg-white px-2 py-1 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    >
+                      <option value={15}>15s</option>
+                      <option value={30}>30s</option>
+                      <option value={60}>1m</option>
+                      <option value={300}>5m</option>
+                      <option value={900}>15m</option>
+                    </select>
+                  </label>
+                </div>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
+                  {isFa
+                    ? 'با فعال‌سازی این گزینه، تیم ایجنت‌ها پس از اتمام هر دور یا خطای موقت شبکه متوقف نمی‌شود و به صورت خودکار و زمان‌بندی‌شده توسعه و تست پروژه را ادامه می‌دهد.'
+                    : 'When enabled, agents automatically resume across multi-hour cycles with error backoff instead of stopping permanently after a single workflow pass.'}
+                </p>
               </div>
 
               <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3.5 dark:border-slate-800 dark:bg-slate-950/60">
