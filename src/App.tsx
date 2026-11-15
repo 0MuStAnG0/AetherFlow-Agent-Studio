@@ -207,6 +207,8 @@ export default function App() {
   const [gitHubPushModal, setGitHubPushModal] = useState<{
     open: boolean;
     initialScope: ExportBundleScope;
+    targetWorkflow?: WorkflowConfig;
+    targetRunId?: string | null;
   }>({ open: false, initialScope: 'project_bundle' });
   const [shareCopied, setShareCopied] = useState(false);
   const [workflowNotice, setWorkflowNotice] = useState<{
@@ -708,16 +710,21 @@ export default function App() {
   const handleDownloadZip = useCallback(
     async (
       scope: ExportBundleScope = 'project_bundle',
+      targetWorkflow?: WorkflowConfig,
+      targetRunId?: string | null,
     ): Promise<{ ok: boolean; error?: string; filename?: string; fileCount?: number }> => {
       setIsDownloadingZip(true);
       try {
+        const effectiveWorkflow = targetWorkflow ?? workflow;
+        const effectiveRunId =
+          targetRunId !== undefined ? (targetRunId ?? undefined) : (activeRunId ?? undefined);
         const res = await fetch('/api/export/zip', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             scope,
-            workflow,
-            runId: activeRunId ?? undefined,
+            workflow: effectiveWorkflow,
+            runId: effectiveRunId,
           }),
         });
         const data = (await res.json().catch(() => ({}))) as {
@@ -2181,6 +2188,7 @@ export default function App() {
           <BlueprintView
             lang={lang}
             workflow={workflow}
+            workflows={workflows}
             activeRunId={activeRunId}
             prelaunchReport={prelaunchReport}
             onPrelaunchReportChange={setPrelaunchReport}
@@ -2207,10 +2215,17 @@ export default function App() {
                 : undefined
             }
             onRunDeployAudit={() => void handleRunTestAndDeploy()}
-            onDownloadZip={() => void handleDownloadZip('full_studio')}
+            onDownloadZip={(scope, targetWorkflow, targetRunId) =>
+              void handleDownloadZip(scope ?? 'project_bundle', targetWorkflow, targetRunId)
+            }
             downloadingZip={isDownloadingZip}
-            onOpenGitHubPush={() =>
-              setGitHubPushModal({ open: true, initialScope: 'full_studio' })
+            onOpenGitHubPush={(scope, targetWorkflow, targetRunId) =>
+              setGitHubPushModal({
+                open: true,
+                initialScope: scope ?? 'project_bundle',
+                targetWorkflow,
+                targetRunId,
+              })
             }
           />
         )}
@@ -2254,12 +2269,16 @@ export default function App() {
         isOpen={gitHubPushModal.open}
         initialScope={gitHubPushModal.initialScope}
         lang={lang}
-        workflow={workflow}
-        activeRunId={activeRunId}
+        workflow={gitHubPushModal.targetWorkflow ?? workflow}
+        activeRunId={
+          gitHubPushModal.targetRunId !== undefined ? gitHubPushModal.targetRunId : activeRunId
+        }
         capabilities={capabilities}
         onCapabilitiesUpdated={setCapabilities}
         onClose={() => setGitHubPushModal((prev) => ({ ...prev, open: false }))}
-        onDownloadZip={handleDownloadZip}
+        onDownloadZip={(scope) =>
+          handleDownloadZip(scope, gitHubPushModal.targetWorkflow, gitHubPushModal.targetRunId)
+        }
       />
 
       <ProjectManagerModal

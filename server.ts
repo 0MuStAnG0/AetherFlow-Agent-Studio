@@ -74,11 +74,14 @@ import {
 import {
   assembleExportBundleFiles,
   buildContentDispositionHeader,
+  computeExportChangeSummary,
   isSafeExportFilePath,
+  mergeSandboxSnapshots,
   slugifyBundleName,
   validateGitHubPushParams,
   type BundleFileEntry,
   type ExportBundleScope,
+  type ExportChangeSummary,
 } from './src/utils/exportBundle.ts';
 import { createZipBufferFromBundle } from './server/zipBundle.ts';
 import {
@@ -3329,17 +3332,33 @@ function listStudioSourceFilesFromDisk(): Array<{ path: string; content: string 
   return collected;
 }
 
+function listSandboxFilesReadOnly(runId: string): SandboxFile[] {
+  const safeId = runId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return [];
+  const runDir = path.join(SANDBOX_BASE, safeId);
+  if (!fs.existsSync(runDir)) return [];
+  return listSandboxFiles(safeId);
+}
+
 function resolveSandboxFilesForExport(workflow: WorkflowConfig, runId?: string): SandboxFile[] {
-  if (runId) {
-    const direct = listSandboxFiles(runId);
+  if (runId && runId !== '__merged_completed__') {
+    const direct = listSandboxFilesReadOnly(runId);
     if (direct.length > 0) return direct;
   }
-  const summaries = listRunSummaries();
-  const matchingRun = summaries.find((r) => r.workflowId === workflow.id);
-  if (matchingRun) {
-    return listSandboxFiles(matchingRun.id);
-  }
-  return [];
+
+  const allRuns = listRunSummaries(60).filter((r) => r.workflowId === workflow.id);
+  const completedRuns = allRuns.filter((r) => r.status === 'completed');
+  const candidateRuns = completedRuns.length > 0 ? completedRuns : allRuns;
+  if (candidateRuns.length === 0) return [];
+
+  // Sort oldest-to-newest so newer agent edits override older runs cleanly
+  const chronological = [...candidateRuns].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+  );
+  const snapshots = chronological
+    .map((r) => listSandboxFilesReadOnly(r.id))
+    .filter((files) => files.length > 0);
+  return mergeSandboxSnapshots(snapshots);
 }
 
 function collectExportBundleForServer(params: {
@@ -3353,6 +3372,7 @@ function collectExportBundleForServer(params: {
   filename: string;
   files: BundleFileEntry[];
   totalBytes: number;
+  changeSummary: ExportChangeSummary;
 } {
   const scope: ExportBundleScope =
     params.scope === 'sandbox_only' || params.scope === 'full_studio'
@@ -3369,7 +3389,7 @@ function collectExportBundleForServer(params: {
 
   const sandboxFiles = resolveSandboxFilesForExport(workflow, params.runId);
   const importedProjectFiles =
-    scope === 'project_bundle'
+    scope === 'project_bundle' || scope === 'sandbox_only'
       ? listImportedProjectFilesFromDisk(workflow.projectContext?.projectId)
       : [];
   const studioSourceFiles = scope === 'full_studio' ? listStudioSourceFilesFromDisk() : [];
@@ -3389,16 +3409,51 @@ function collectExportBundleForServer(params: {
       ? `aetherflow-studio-${workflow.name}`
       : workflow.projectContext?.name || workflow.name,
   );
-  const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+  const changeSummary = computeExportChangeSummary(files);
 
   return {
     scope,
     workflow,
     filename: `${slug}.zip`,
     files,
-    totalBytes,
+    totalBytes: changeSummary.totalBytes,
+    changeSummary,
   };
 }
+
+app.get('/api/export/projects', (_req, res) => {
+  try {
+    const workflowsList = listWorkflows();
+    const runs = listRunSummaries(100);
+    const projects = workflowsList.map((wf) => {
+      const wfRuns = runs
+        .filter((r) => r.workflowId === wf.id)
+        .map((r) => ({
+          ...r,
+          sandboxFileCount: listSandboxFilesReadOnly(r.id).length,
+        }));
+      const completedRuns = wfRuns.filter((r) => r.status === 'completed');
+      const mergedSandboxFiles = resolveSandboxFilesForExport(wf, '__merged_completed__');
+      const importedCount = wf.projectContext?.projectId
+        ? listImportedProjectFilesFromDisk(wf.projectContext.projectId).length
+        : 0;
+      return {
+        workflowId: wf.id,
+        workflowName: wf.name,
+        hasImportedProject: importedCount > 0,
+        importedFileCount: importedCount,
+        completedRunCount: completedRuns.length,
+        totalRunCount: wfRuns.length,
+        mergedAgentFileCount: mergedSandboxFiles.length,
+        runs: wfRuns,
+      };
+    });
+    res.json({ projects });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to list exportable projects.';
+    res.status(500).json({ error: message });
+  }
+});
 
 app.post('/api/export/preview', (req, res) => {
   try {
@@ -3414,7 +3469,12 @@ app.post('/api/export/preview', (req, res) => {
       scope: bundle.scope,
       fileCount: bundle.files.length,
       totalBytes: bundle.totalBytes,
-      files: bundle.files.map((f) => ({ path: f.path, size: f.size })),
+      changeSummary: bundle.changeSummary,
+      files: bundle.files.map((f) => ({
+        path: f.path,
+        size: f.size,
+        changeType: f.changeType ?? 'project',
+      })),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to preview export bundle.';

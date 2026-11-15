@@ -6,7 +6,9 @@ import { createZipBufferFromBundle } from '../../server/zipBundle.ts';
 import {
   assembleExportBundleFiles,
   buildContentDispositionHeader,
+  computeExportChangeSummary,
   isSafeExportFilePath,
+  mergeSandboxSnapshots,
   slugifyBundleName,
   validateGitHubPushParams,
 } from './exportBundle.ts';
@@ -25,7 +27,7 @@ test('isSafeExportFilePath blocks .env secrets, databases, and path traversal wh
   assert.equal(isSafeExportFilePath('node_modules/pkg/index.js'), false);
 });
 
-test('assembleExportBundleFiles merges project and sandbox files and creates valid ZIP buffer', () => {
+test('assembleExportBundleFiles merges project and sandbox files with accurate changeType and creates valid ZIP buffer', () => {
   const wf = DEFAULT_SEED_WORKFLOWS[0];
   const files = assembleExportBundleFiles({
     scope: 'project_bundle',
@@ -59,9 +61,18 @@ test('assembleExportBundleFiles merges project and sandbox files and creates val
   assert.ok(paths.some((p) => p.endsWith('.workflow.json')));
   assert.equal(paths.includes('.env'), false);
 
-  // Verify sandbox file overlaid imported project file
+  // Verify sandbox file overlaid imported project file and marked changeType accurately
   const serviceEntry = files.find((f) => f.path === 'app/service.mjs');
   assert.ok(serviceEntry?.content.includes('updated by Backend Agent'));
+  assert.equal(serviceEntry?.changeType, 'modified');
+  assert.equal(files.find((f) => f.path === 'README.md')?.changeType, 'project');
+  assert.equal(files.find((f) => f.path === 'tests/service.test.mjs')?.changeType, 'added');
+
+  const summary = computeExportChangeSummary(files);
+  assert.equal(summary.modifiedCount, 1);
+  assert.equal(summary.addedCount, 1);
+  assert.equal(summary.projectCount, 1);
+  assert.equal(summary.metadataCount, 2);
 
   // Verify ZIP creation round-trip
   const zipBuf = createZipBufferFromBundle(files);
@@ -69,6 +80,28 @@ test('assembleExportBundleFiles merges project and sandbox files and creates val
   const zipEntries = zip.getEntries().map((e) => e.entryName);
   assert.ok(zipEntries.includes('app/service.mjs'));
   assert.ok(zipEntries.includes('AETHERFLOW_WORKFLOW.md'));
+});
+
+test('mergeSandboxSnapshots merges chronological agent runs with newer edits overriding older ones', () => {
+  const merged = mergeSandboxSnapshots([
+    [
+      { path: 'src/api.ts', content: 'v1', size: 2, updatedAt: '2026-11-14T09:00:00.000Z' },
+      { path: 'src/legacy.ts', content: 'keep', size: 4, updatedAt: '2026-11-14T09:00:00.000Z' },
+    ],
+    [
+      { path: 'src/api.ts', content: 'v2-final', size: 8, updatedAt: '2026-11-14T10:00:00.000Z' },
+      { path: 'src/ui.tsx', content: 'ui', size: 2, updatedAt: '2026-11-14T10:00:00.000Z' },
+    ],
+  ]);
+
+  assert.deepEqual(
+    merged.map((f) => [f.path, f.content]),
+    [
+      ['src/api.ts', 'v2-final'],
+      ['src/legacy.ts', 'keep'],
+      ['src/ui.tsx', 'ui'],
+    ],
+  );
 });
 
 test('assembleExportBundleFiles produces clean minimal ZIP for non-ASCII workflow with no test artifacts', () => {

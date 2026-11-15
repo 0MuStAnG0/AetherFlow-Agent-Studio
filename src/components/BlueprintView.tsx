@@ -2,16 +2,32 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Archive,
   Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Copy,
   FileCode2,
+  FolderGit2,
   FolderTree,
   GitBranch,
+  Layers,
   Link2,
+  RefreshCw,
   ShieldCheck,
   Terminal,
   UploadCloud,
 } from 'lucide-react';
-import type { BlueprintFile, PrelaunchTestReport, WorkflowConfig } from '../types/workflow';
+import type {
+  BlueprintFile,
+  ExecutionRunSummary,
+  PrelaunchTestReport,
+  WorkflowConfig,
+} from '../types/workflow';
+import type {
+  BundleFileChangeType,
+  ExportBundleScope,
+  ExportChangeSummary,
+} from '../utils/exportBundle';
 import {
   DEFAULT_GITHUB_REPO_URL,
   buildLinuxOneLineCommand,
@@ -19,9 +35,34 @@ import {
 } from '../utils/githubDeploy';
 import { PreLaunchTestSuite } from './PreLaunchTestSuite';
 
+interface ExportableRunSummary extends ExecutionRunSummary {
+  sandboxFileCount: number;
+}
+
+interface ExportableProjectInfo {
+  workflowId: string;
+  workflowName: string;
+  hasImportedProject: boolean;
+  importedFileCount: number;
+  completedRunCount: number;
+  totalRunCount: number;
+  mergedAgentFileCount: number;
+  runs: ExportableRunSummary[];
+}
+
+interface ExportPreviewPayload {
+  filename: string;
+  scope: ExportBundleScope;
+  fileCount: number;
+  totalBytes: number;
+  changeSummary?: ExportChangeSummary;
+  files: Array<{ path: string; size: number; changeType?: BundleFileChangeType }>;
+}
+
 interface BlueprintViewProps {
   lang?: 'en' | 'fa';
   workflow: WorkflowConfig;
+  workflows?: WorkflowConfig[];
   activeRunId: string | null;
   prelaunchReport: PrelaunchTestReport | null;
   onPrelaunchReportChange: (report: PrelaunchTestReport | null) => void;
@@ -31,9 +72,17 @@ interface BlueprintViewProps {
   defaultRepoUrl?: string;
   defaultBranch?: string;
   onRunDeployAudit?: () => void;
-  onDownloadZip?: () => void;
+  onDownloadZip?: (
+    scope?: ExportBundleScope,
+    targetWorkflow?: WorkflowConfig,
+    targetRunId?: string | null,
+  ) => void;
   downloadingZip?: boolean;
-  onOpenGitHubPush?: () => void;
+  onOpenGitHubPush?: (
+    scope?: ExportBundleScope,
+    targetWorkflow?: WorkflowConfig,
+    targetRunId?: string | null,
+  ) => void;
 }
 
 const STORAGE_REPO_KEY = 'aetherflow_github_deploy_repo';
@@ -76,6 +125,7 @@ const DIRECTORY_TREE = `aetherflow-agent-studio/
 export function BlueprintView({
   lang = 'en',
   workflow,
+  workflows = [],
   activeRunId,
   prelaunchReport,
   onPrelaunchReportChange,
@@ -89,12 +139,23 @@ export function BlueprintView({
   downloadingZip = false,
   onOpenGitHubPush,
 }: BlueprintViewProps) {
+  const isFa = lang === 'fa';
   const [files, setFiles] = useState<BlueprintFile[]>([]);
   const [selectedPath, setSelectedPath] = useState<string>('install-linux.sh');
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const [copiedOneLiner, setCopiedOneLiner] = useState(false);
   const [copiedGitClone, setCopiedGitClone] = useState(false);
+
+  // Selective project & completed-run export state
+  const [exportProjects, setExportProjects] = useState<ExportableProjectInfo[]>([]);
+  const [exportProjectsLoading, setExportProjectsLoading] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>(workflow.id);
+  const [selectedRunId, setSelectedRunId] = useState<string>('__merged_completed__');
+  const [selectedScope, setSelectedScope] = useState<ExportBundleScope>('project_bundle');
+  const [exportPreview, setExportPreview] = useState<ExportPreviewPayload | null>(null);
+  const [exportPreviewLoading, setExportPreviewLoading] = useState(false);
+  const [showExportFiles, setShowExportFiles] = useState(false);
 
   const [repoInput, setRepoInput] = useState<string>(() => {
     if (defaultRepoUrl?.trim()) return defaultRepoUrl.trim();
@@ -115,6 +176,82 @@ export function BlueprintView({
   const [installDir, setInstallDir] = useState<string>('');
   const [portInput, setPortInput] = useState<string>('3000');
   const [domainInput, setDomainInput] = useState<string>('');
+
+  const availableWorkflows = useMemo(() => {
+    const map = new Map<string, WorkflowConfig>();
+    map.set(workflow.id, workflow);
+    for (const w of workflows) {
+      if (!map.has(w.id)) map.set(w.id, w);
+    }
+    return Array.from(map.values());
+  }, [workflow, workflows]);
+
+  const selectedWorkflow = useMemo(
+    () => availableWorkflows.find((w) => w.id === selectedProjectId) ?? workflow,
+    [availableWorkflows, selectedProjectId, workflow],
+  );
+
+  const selectedProjectMeta = useMemo(
+    () => exportProjects.find((p) => p.workflowId === selectedWorkflow.id) ?? null,
+    [exportProjects, selectedWorkflow.id],
+  );
+
+  const fetchExportProjects = () => {
+    setExportProjectsLoading(true);
+    fetch('/api/export/projects')
+      .then((res) => (res.ok ? res.json() : { projects: [] }))
+      .then((data: { projects?: ExportableProjectInfo[] }) => {
+        if (Array.isArray(data.projects)) {
+          setExportProjects(data.projects);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setExportProjectsLoading(false));
+  };
+
+  useEffect(() => {
+    fetchExportProjects();
+  }, [workflow.id, activeRunId]);
+
+  useEffect(() => {
+    if (!availableWorkflows.some((w) => w.id === selectedProjectId)) {
+      setSelectedProjectId(workflow.id);
+    }
+  }, [availableWorkflows, selectedProjectId, workflow.id]);
+
+  // Reset run selector when switching project
+  useEffect(() => {
+    setSelectedRunId('__merged_completed__');
+  }, [selectedProjectId]);
+
+  // Fetch live export bundle preview (with agent-modified/added counts)
+  useEffect(() => {
+    let active = true;
+    setExportPreviewLoading(true);
+    fetch('/api/export/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scope: selectedScope,
+        workflow: selectedWorkflow,
+        runId: selectedRunId,
+      }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: ExportPreviewPayload | null) => {
+        if (!active) return;
+        if (data && Array.isArray(data.files)) {
+          setExportPreview(data);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setExportPreviewLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedScope, selectedWorkflow, selectedRunId, exportProjects]);
 
   useEffect(() => {
     if (defaultRepoUrl?.trim() && !repoInput.trim()) {
@@ -189,8 +326,17 @@ export function BlueprintView({
     setTimeout(() => setCopiedGitClone(false), 1800);
   };
 
+  const formatByteSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
   return (
-    <section className="mx-auto flex h-full w-full max-w-[1360px] flex-col gap-4 overflow-y-auto p-6">
+    <section
+      dir={isFa ? 'rtl' : 'ltr'}
+      className="mx-auto flex h-full w-full max-w-[1360px] flex-col gap-4 overflow-y-auto p-6"
+    >
       <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-800">
         <div>
           <h1 className="font-display text-xl font-semibold text-slate-900 dark:text-slate-100">
@@ -229,22 +375,22 @@ export function BlueprintView({
               type="button"
               data-testid="blueprint-download-zip-btn"
               disabled={downloadingZip}
-              onClick={onDownloadZip}
+              onClick={() => onDownloadZip(selectedScope, selectedWorkflow, selectedRunId)}
               className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
             >
               <Archive className="h-4 w-4 text-blue-600" />
-              {lang === 'fa' ? 'دانلود فایل ZIP کامل' : 'Download Full ZIP'}
+              {isFa ? 'دانلود ZIP پروژه انتخابی' : 'Download Selected ZIP'}
             </button>
           )}
           {onOpenGitHubPush && (
             <button
               type="button"
               data-testid="blueprint-github-push-btn"
-              onClick={onOpenGitHubPush}
+              onClick={() => onOpenGitHubPush(selectedScope, selectedWorkflow, selectedRunId)}
               className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700"
             >
               <UploadCloud className="h-4 w-4" />
-              {lang === 'fa' ? 'Push در گیت‌هاب' : 'Push to GitHub'}
+              {isFa ? 'Push در گیت‌هاب' : 'Push to GitHub'}
             </button>
           )}
           {onRunDeployAudit && (
@@ -255,7 +401,7 @@ export function BlueprintView({
               className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-emerald-700 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-800"
             >
               <ShieldCheck className="h-4 w-4" />
-              {lang === 'fa'
+              {isFa
                 ? 'تست خودکار و بررسی مدیر پیش از دپلوی'
                 : 'Auto Test & Manager Audit before Deploy'}
             </button>
@@ -263,11 +409,277 @@ export function BlueprintView({
         </div>
       </div>
 
+      {/* Selective Completed Project Export (ZIP & GitHub with Agent Changes Applied) */}
+      <div
+        data-testid="selective-project-export-panel"
+        className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs dark:border-slate-800 dark:bg-slate-900"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 pb-3 dark:border-slate-800">
+          <div>
+            <h2 className="flex items-center gap-2 font-display text-sm font-bold text-slate-900 dark:text-slate-100">
+              <FolderGit2 className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+              <span>
+                {isFa
+                  ? 'خروجی انتخابی پروژه‌های تکمیل‌شده (اعمال خودکار تغییرات تیم ایجنت‌ها روی پروژه)'
+                  : 'Selective Completed Project Export (Apply Agent Team Changes to GitHub / ZIP)'}
+              </span>
+            </h2>
+            <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+              {isFa
+                ? 'پروژه تکمیل‌شده و نسخه خروجی ایجنت‌ها را انتخاب کنید تا تمام فایل‌های ویرایش‌شده و جدید تیم ایجنت‌ها روی کد اصلی پروژه اعمال و در گیت‌هاب یا فایل ZIP ذخیره شود.'
+                : 'Select a completed project and agent run snapshot to merge all agent-modified and created files onto the project before downloading as ZIP or pushing to GitHub.'}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            data-testid="deploy-export-refresh-btn"
+            onClick={fetchExportProjects}
+            disabled={exportProjectsLoading}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${exportProjectsLoading ? 'animate-spin' : ''}`} />
+            <span>{isFa ? 'به‌روزرسانی لیست' : 'Refresh Projects'}</span>
+          </button>
+        </div>
+
+        <div className="mt-3.5 grid grid-cols-1 gap-3 md:grid-cols-12">
+          {/* 1. Select Project */}
+          <label className="flex flex-col gap-1 md:col-span-4">
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+              {isFa ? '۱. انتخاب پروژه تکمیل‌شده' : '1. Select Project / Workflow'}
+            </span>
+            <select
+              data-testid="deploy-export-project-select"
+              value={selectedWorkflow.id}
+              onChange={(e) => setSelectedProjectId(e.target.value)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900 outline-none focus:border-blue-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            >
+              {availableWorkflows.map((wf) => {
+                const meta = exportProjects.find((p) => p.workflowId === wf.id);
+                const completedCount = meta?.completedRunCount ?? 0;
+                const agentFiles = meta?.mergedAgentFileCount ?? 0;
+                const statusSuffix =
+                  completedCount > 0
+                    ? isFa
+                      ? ` — ${completedCount} اجرا تکمیل‌شده (${agentFiles} فایل ایجنت)`
+                      : ` — ${completedCount} completed (${agentFiles} agent files)`
+                    : isFa
+                      ? ' — بدون اجرای تکمیل‌شده'
+                      : ' — No completed runs yet';
+                return (
+                  <option key={wf.id} value={wf.id}>
+                    {wf.name}
+                    {statusSuffix}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+
+          {/* 2. Select Completed Run / Merged Snapshot */}
+          <label className="flex flex-col gap-1 md:col-span-4">
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+              {isFa ? '۲. انتخاب نسخه تغییرات تیم ایجنت‌ها' : '2. Agent Output Snapshot'}
+            </span>
+            <select
+              data-testid="deploy-export-run-select"
+              value={selectedRunId}
+              onChange={(e) => setSelectedRunId(e.target.value)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900 outline-none focus:border-blue-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            >
+              <option value="__merged_completed__">
+                {isFa
+                  ? `ادغام تمام تغییرات تکمیل‌شده (${selectedProjectMeta?.mergedAgentFileCount ?? 0} فایل)`
+                  : `All Completed Agent Changes Merged (${selectedProjectMeta?.mergedAgentFileCount ?? 0} files)`}
+              </option>
+              {(selectedProjectMeta?.runs ?? []).map((run) => {
+                const statusLabel =
+                  run.status === 'completed'
+                    ? isFa
+                      ? 'تکمیل‌شده'
+                      : 'Completed'
+                    : run.status;
+                const dateLabel = new Date(run.completedAt || run.createdAt).toLocaleString();
+                return (
+                  <option key={run.id} value={run.id}>
+                    [{statusLabel}] {run.roundsExecuted} rounds · {run.sandboxFileCount} files · {dateLabel}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+
+          {/* 3. Select Export Scope */}
+          <label className="flex flex-col gap-1 md:col-span-4">
+            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+              {isFa ? '۳. نحوه ترکیب فایل‌ها در خروجی' : '3. Export Bundle Mode'}
+            </span>
+            <select
+              data-testid="deploy-export-scope-select"
+              value={selectedScope}
+              onChange={(e) => setSelectedScope(e.target.value as ExportBundleScope)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900 outline-none focus:border-blue-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            >
+              <option value="project_bundle">
+                {isFa
+                  ? 'پروژه اصلی + اعمال تغییرات ایجنت‌ها (پیشنهادی)'
+                  : 'Project + Agent Changes Applied (Recommended)'}
+              </option>
+              <option value="sandbox_only">
+                {isFa
+                  ? 'فقط فایل‌های تغییریافته / تولیدی تیم ایجنت‌ها'
+                  : 'Agent-Modified & New Files Only'}
+              </option>
+              <option value="full_studio">
+                {isFa
+                  ? 'کل سورس استودیو + نصاب لینوکس + خروجی پروژه'
+                  : 'Full Studio Source + Linux Installer'}
+              </option>
+            </select>
+          </label>
+        </div>
+
+        {/* Live Preview Summary & Action Bar */}
+        <div className="mt-3.5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 dark:border-slate-800 dark:bg-slate-950">
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-slate-900 dark:text-slate-100">
+              <Layers className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+              {exportPreviewLoading
+                ? isFa
+                  ? 'در حال محاسبه فایل‌ها...'
+                  : 'Calculating bundle...'
+                : exportPreview
+                  ? `${exportPreview.filename} (${exportPreview.fileCount} ${isFa ? 'فایل' : 'files'} · ${formatByteSize(exportPreview.totalBytes)})`
+                  : selectedWorkflow.name}
+            </span>
+
+            {exportPreview?.changeSummary && (
+              <div
+                data-testid="deploy-export-change-summary"
+                className="flex flex-wrap items-center gap-2 font-mono text-[11px]"
+              >
+                <span className="inline-flex items-center gap-1 rounded border border-amber-300 bg-amber-50 px-2 py-0.5 font-semibold text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-300">
+                  {isFa
+                    ? `${exportPreview.changeSummary.modifiedCount} ویرایش ایجنت`
+                    : `${exportPreview.changeSummary.modifiedCount} modified`}
+                </span>
+                <span className="inline-flex items-center gap-1 rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 font-semibold text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300">
+                  <CheckCircle2 className="h-3 w-3" />
+                  {isFa
+                    ? `${exportPreview.changeSummary.addedCount} فایل جدید ایجنت`
+                    : `${exportPreview.changeSummary.addedCount} added`}
+                </span>
+                {exportPreview.changeSummary.projectCount > 0 && (
+                  <span className="rounded border border-slate-300 bg-white px-2 py-0.5 text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                    {isFa
+                      ? `${exportPreview.changeSummary.projectCount} فایل اصلی پروژه`
+                      : `${exportPreview.changeSummary.projectCount} base files`}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {exportPreview && exportPreview.files.length > 0 && (
+              <button
+                type="button"
+                data-testid="deploy-export-toggle-files-btn"
+                onClick={() => setShowExportFiles((prev) => !prev)}
+                className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-600 hover:underline dark:text-blue-400"
+              >
+                <span>
+                  {showExportFiles
+                    ? isFa
+                      ? 'بستن لیست فایل‌ها'
+                      : 'Hide file diff'
+                    : isFa
+                      ? 'مشاهده فایل‌های خروجی'
+                      : 'Inspect output files'}
+                </span>
+                {showExportFiles ? (
+                  <ChevronUp className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                )}
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {onDownloadZip && (
+              <button
+                type="button"
+                data-testid="deploy-export-zip-btn"
+                disabled={downloadingZip}
+                onClick={() => onDownloadZip(selectedScope, selectedWorkflow, selectedRunId)}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-60 dark:bg-blue-600 dark:hover:bg-blue-700"
+              >
+                <Archive className="h-3.5 w-3.5" />
+                <span>
+                  {isFa ? 'ذخیره پروژه انتخابی (ZIP)' : 'Download Selected Project (.ZIP)'}
+                </span>
+              </button>
+            )}
+
+            {onOpenGitHubPush && (
+              <button
+                type="button"
+                data-testid="deploy-export-github-btn"
+                onClick={() => onOpenGitHubPush(selectedScope, selectedWorkflow, selectedRunId)}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-800"
+              >
+                <UploadCloud className="h-3.5 w-3.5" />
+                <span>
+                  {isFa ? 'Push پروژه انتخابی در گیت‌هاب' : 'Push Selected Project to GitHub'}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {showExportFiles && exportPreview && (
+          <div
+            data-testid="deploy-export-files-list"
+            dir="ltr"
+            className="mt-2.5 max-h-48 overflow-y-auto rounded-lg border border-slate-200 bg-slate-950 p-3 font-mono text-[11px] text-slate-200 dark:border-slate-800"
+          >
+            {exportPreview.files.map((f) => (
+              <div key={f.path} className="flex items-center justify-between gap-2 py-0.5">
+                <span className="min-w-0 truncate">{f.path}</span>
+                <div className="flex shrink-0 items-center gap-2">
+                  {f.changeType === 'modified' && (
+                    <span className="rounded bg-amber-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-amber-300">
+                      MODIFIED
+                    </span>
+                  )}
+                  {f.changeType === 'added' && (
+                    <span className="rounded bg-emerald-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-emerald-300">
+                      NEW
+                    </span>
+                  )}
+                  {f.changeType === 'project' && (
+                    <span className="rounded bg-slate-800 px-1.5 py-0.2 text-[9px] text-slate-300">
+                      PROJECT
+                    </span>
+                  )}
+                  {f.changeType === 'metadata' && (
+                    <span className="rounded bg-blue-950 px-1.5 py-0.2 text-[9px] text-blue-300">
+                      META
+                    </span>
+                  )}
+                  <span className="text-slate-400">{formatByteSize(f.size)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* Strict Pre-Launch Final Test Gate (4 Categories, 14 Test Types) */}
       <PreLaunchTestSuite
         lang={lang}
-        workflow={workflow}
-        activeRunId={activeRunId}
+        workflow={selectedWorkflow}
+        activeRunId={selectedRunId === '__merged_completed__' ? activeRunId : selectedRunId}
         report={prelaunchReport}
         onReportChange={onPrelaunchReportChange}
         strictMode={strictPrelaunchMode}

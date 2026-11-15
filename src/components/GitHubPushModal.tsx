@@ -14,7 +14,9 @@ import {
 import type { CapabilitiesState, WorkflowConfig } from '../types/workflow';
 import {
   validateGitHubPushParams,
+  type BundleFileChangeType,
   type ExportBundleScope,
+  type ExportChangeSummary,
 } from '../utils/exportBundle';
 import { DEFAULT_GITHUB_REPO_URL } from '../utils/githubDeploy';
 
@@ -37,7 +39,8 @@ interface PreviewSummary {
   scope: ExportBundleScope;
   fileCount: number;
   totalBytes: number;
-  files: Array<{ path: string; size: number }>;
+  changeSummary?: ExportChangeSummary;
+  files: Array<{ path: string; size: number; changeType?: BundleFileChangeType }>;
 }
 
 interface PushResult {
@@ -113,14 +116,14 @@ export function GitHubPushModal({
     setScope(initialScope);
     setError(null);
     setPushResult(null);
-    setCommitMessage(`feat: export ${workflow.name} workflow & project bundle`);
+    setCommitMessage(`feat: apply agent changes & export ${workflow.name}`);
     if (workflow.projectContext?.sourceType === 'github' && workflow.projectContext.sourceUrl) {
       setRepoUrl(workflow.projectContext.sourceUrl);
     }
     if (workflow.projectContext?.branch) {
       setBranch(workflow.projectContext.branch);
     }
-  }, [isOpen, initialScope, workflow.name, workflow.projectContext]);
+  }, [isOpen, initialScope, workflow.id, workflow.name, workflow.projectContext]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -377,6 +380,15 @@ export function GitHubPushModal({
                     <span className="rounded bg-slate-200/80 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-300">
                       {preview.fileCount} {isFa ? 'فایل' : 'files'} · {formatBytes(preview.totalBytes)}
                     </span>
+                    {preview.changeSummary &&
+                      (preview.changeSummary.modifiedCount > 0 ||
+                        preview.changeSummary.addedCount > 0) && (
+                        <span className="rounded bg-emerald-100 px-2 py-0.5 font-mono text-[11px] font-semibold text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+                          {isFa
+                            ? `${preview.changeSummary.modifiedCount} ویرایش + ${preview.changeSummary.addedCount} فایل جدید ایجنت`
+                            : `${preview.changeSummary.modifiedCount} modified + ${preview.changeSummary.addedCount} new by agents`}
+                        </span>
+                      )}
                     <button
                       type="button"
                       onClick={() => setShowFileList((prev) => !prev)}
@@ -415,9 +427,21 @@ export function GitHubPushModal({
             {showFileList && preview && (
               <div className="max-h-36 overflow-y-auto rounded-lg border border-slate-200 bg-slate-950 p-2.5 font-mono text-[11px] text-slate-200 dark:border-slate-800" dir="ltr">
                 {preview.files.map((f) => (
-                  <div key={f.path} className="flex items-center justify-between py-0.5">
-                    <span className="truncate">{f.path}</span>
-                    <span className="ml-3 shrink-0 text-slate-400">{formatBytes(f.size)}</span>
+                  <div key={f.path} className="flex items-center justify-between gap-2 py-0.5">
+                    <span className="min-w-0 truncate">{f.path}</span>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {f.changeType === 'modified' && (
+                        <span className="rounded bg-amber-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-amber-300">
+                          MODIFIED
+                        </span>
+                      )}
+                      {f.changeType === 'added' && (
+                        <span className="rounded bg-emerald-900/60 px-1.5 py-0.2 text-[9px] font-semibold text-emerald-300">
+                          NEW
+                        </span>
+                      )}
+                      <span className="text-slate-400">{formatBytes(f.size)}</span>
+                    </div>
                   </div>
                 ))}
               </div>

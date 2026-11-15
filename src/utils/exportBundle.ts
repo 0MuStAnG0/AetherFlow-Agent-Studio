@@ -4,10 +4,22 @@ import { serializeWorkflowForExport } from './workflowEngine';
 
 export type ExportBundleScope = 'project_bundle' | 'sandbox_only' | 'full_studio';
 
+export type BundleFileChangeType = 'modified' | 'added' | 'project' | 'metadata';
+
 export interface BundleFileEntry {
   path: string;
   content: string;
   size: number;
+  changeType?: BundleFileChangeType;
+}
+
+export interface ExportChangeSummary {
+  totalFiles: number;
+  totalBytes: number;
+  modifiedCount: number;
+  addedCount: number;
+  projectCount: number;
+  metadataCount: number;
 }
 
 export interface BuildExportBundleParams {
@@ -57,6 +69,55 @@ export function buildContentDispositionHeader(filename: string): string {
   const asciiFallback = cleaned.replace(/[^\x20-\x7E]/g, '_') || 'aetherflow-bundle.zip';
   const encoded = encodeURIComponent(cleaned);
   return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
+export function mergeSandboxSnapshots(snapshots: SandboxFile[][]): SandboxFile[] {
+  const merged = new Map<string, SandboxFile>();
+  for (const snapshot of snapshots) {
+    for (const file of snapshot) {
+      const cleanPath = file.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      merged.set(cleanPath, { ...file, path: cleanPath });
+    }
+  }
+  return Array.from(merged.values()).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+export function computeExportChangeSummary(entries: BundleFileEntry[]): ExportChangeSummary {
+  let modifiedCount = 0;
+  let addedCount = 0;
+  let projectCount = 0;
+  let metadataCount = 0;
+  let totalBytes = 0;
+
+  for (const entry of entries) {
+    totalBytes += entry.size;
+    switch (entry.changeType) {
+      case 'modified':
+        modifiedCount += 1;
+        break;
+      case 'added':
+        addedCount += 1;
+        break;
+      case 'project':
+        projectCount += 1;
+        break;
+      case 'metadata':
+        metadataCount += 1;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return {
+    totalFiles: entries.length,
+    totalBytes,
+    modifiedCount,
+    addedCount,
+    projectCount,
+    metadataCount,
+  };
 }
 
 export function buildWorkflowMarkdownSummary(
@@ -121,11 +182,15 @@ export function assembleExportBundleFiles(params: BuildExportBundleParams): Bund
     bugReports = [],
   } = params;
 
-  const fileMap = new Map<string, string>();
-  const addFile = (relPath: string, content: string) => {
+  const fileMap = new Map<string, { content: string; changeType: BundleFileChangeType }>();
+  const addFile = (
+    relPath: string,
+    content: string,
+    changeType: BundleFileChangeType,
+  ) => {
     const cleanPath = relPath.replace(/\\/g, '/').replace(/^\/+/, '').trim();
     if (!isSafeExportFilePath(cleanPath)) return;
-    fileMap.set(cleanPath, content);
+    fileMap.set(cleanPath, { content, changeType });
   };
 
   const wfSlug = slugifyBundleName(workflow.name);
@@ -133,39 +198,52 @@ export function assembleExportBundleFiles(params: BuildExportBundleParams): Bund
 
   if (scope === 'full_studio') {
     for (const f of studioSourceFiles) {
-      addFile(f.path, f.content);
+      addFile(f.path, f.content, 'project');
     }
-    addFile(`workflows/${wfSlug}.workflow.json`, workflowJson);
-    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports));
+    addFile(`workflows/${wfSlug}.workflow.json`, workflowJson, 'metadata');
+    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports), 'metadata');
     for (const sf of sandboxFiles) {
-      addFile(`sandbox_output/${sf.path.replace(/^\/+/, '')}`, sf.content);
+      addFile(`sandbox_output/${sf.path.replace(/^\/+/, '')}`, sf.content, 'added');
     }
   } else if (scope === 'sandbox_only') {
+    const importedPaths = new Set(
+      importedProjectFiles.map((pf) => pf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim()),
+    );
     for (const sf of sandboxFiles) {
-      addFile(sf.path, sf.content);
+      const cleanPath = sf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      addFile(cleanPath, sf.content, importedPaths.has(cleanPath) ? 'modified' : 'added');
     }
-    addFile(`${wfSlug}.workflow.json`, workflowJson);
-    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports));
+    addFile(`${wfSlug}.workflow.json`, workflowJson, 'metadata');
+    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports), 'metadata');
   } else {
     // project_bundle (default): Imported project files + Sandbox files overlaid + workflow metadata
+    const importedContents = new Map<string, string>();
     for (const pf of importedProjectFiles) {
-      addFile(pf.path, pf.content);
+      const cleanPath = pf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      importedContents.set(cleanPath, pf.content);
+      addFile(cleanPath, pf.content, 'project');
     }
     for (const sf of sandboxFiles) {
-      addFile(sf.path, sf.content);
+      const cleanPath = sf.path.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+      if (!isSafeExportFilePath(cleanPath)) continue;
+      const existed = importedContents.has(cleanPath);
+      const changed = existed && importedContents.get(cleanPath) !== sf.content;
+      addFile(cleanPath, sf.content, existed ? (changed ? 'modified' : 'project') : 'added');
     }
-    addFile(`.aetherflow/${wfSlug}.workflow.json`, workflowJson);
-    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports));
+    addFile(`.aetherflow/${wfSlug}.workflow.json`, workflowJson, 'metadata');
+    addFile('AETHERFLOW_WORKFLOW.md', buildWorkflowMarkdownSummary(workflow, bugReports), 'metadata');
     if (bugReports.length > 0) {
-      addFile('.aetherflow/bug-reports.json', JSON.stringify(bugReports, null, 2));
+      addFile('.aetherflow/bug-reports.json', JSON.stringify(bugReports, null, 2), 'metadata');
     }
   }
 
   return Array.from(fileMap.entries())
-    .map(([filePath, content]) => ({
+    .map(([filePath, entry]) => ({
       path: filePath,
-      content,
-      size: textEncoder.encode(content).byteLength,
+      content: entry.content,
+      size: textEncoder.encode(entry.content).byteLength,
+      changeType: entry.changeType,
     }))
     .sort((a, b) => a.path.localeCompare(b.path));
 }
