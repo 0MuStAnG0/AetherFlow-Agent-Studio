@@ -11,8 +11,13 @@ import type {
   ExecutionEvent,
   ExecutionRunSummary,
   ImportedProjectAnalysis,
+  NginxDomainConfig,
+  NginxDomainStatus,
+  NginxSslMode,
   PrelaunchTestReport,
   ProviderSecretStatus,
+  UserProfile,
+  UserRole,
   WorkflowConfig,
 } from '../src/types/workflow.ts';
 import { maskApiKey, normalizeSecretName } from '../src/utils/secretUtils.ts';
@@ -106,6 +111,48 @@ export function getDb(): DatabaseSync {
       overall_score INTEGER NOT NULL,
       report_json TEXT NOT NULL,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      display_name TEXT NOT NULL,
+      job_title TEXT NOT NULL DEFAULT '',
+      bio TEXT NOT NULL DEFAULT '',
+      avatar_color TEXT NOT NULL DEFAULT '#2563eb',
+      role TEXT NOT NULL DEFAULT 'operator',
+      password_hash TEXT NOT NULL,
+      session_version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_login_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_policy (
+      id TEXT PRIMARY KEY,
+      require_auth INTEGER NOT NULL DEFAULT 1,
+      allow_self_registration INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS nginx_domains (
+      id TEXT PRIMARY KEY,
+      domain TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      upstream_port INTEGER NOT NULL DEFAULT 3000,
+      ssl_mode TEXT NOT NULL DEFAULT 'letsencrypt',
+      ssl_email TEXT NOT NULL DEFAULT '',
+      ssl_cert_path TEXT NOT NULL DEFAULT '',
+      ssl_key_path TEXT NOT NULL DEFAULT '',
+      redirect_www INTEGER NOT NULL DEFAULT 0,
+      client_max_body_mb INTEGER NOT NULL DEFAULT 30,
+      enable_websocket INTEGER NOT NULL DEFAULT 1,
+      enable_hsts INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'draft',
+      dns_ips_json TEXT NOT NULL DEFAULT '[]',
+      last_checked_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
   `);
 
@@ -1011,5 +1058,424 @@ export function getLatestPrelaunchReport(workflowId?: string): PrelaunchTestRepo
     return null;
   }
 }
+
+interface RawUserRow {
+  id: string;
+  email: string;
+  username: string;
+  display_name: string;
+  job_title: string;
+  bio: string;
+  avatar_color: string;
+  role: string;
+  password_hash: string;
+  session_version: number;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string | null;
+}
+
+function mapUserRow(row: RawUserRow): UserProfile {
+  const validRole: UserRole =
+    row.role === 'admin' || row.role === 'viewer' ? row.role : 'operator';
+  return {
+    id: row.id,
+    email: row.email,
+    username: row.username,
+    displayName: row.display_name,
+    jobTitle: row.job_title || '',
+    bio: row.bio || '',
+    avatarColor: row.avatar_color || '#2563eb',
+    role: validRole,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.last_login_at ? { lastLoginAt: row.last_login_at } : {}),
+  };
+}
+
+export function countUsers(): number {
+  const db = getDb();
+  const row = db.prepare('SELECT COUNT(*) AS cnt FROM users').get() as { cnt: number };
+  return Number(row?.cnt ?? 0);
+}
+
+export function getAuthPolicy(): { requireAuth: boolean; allowSelfRegistration: boolean } {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT require_auth, allow_self_registration FROM auth_policy WHERE id = ?')
+    .get('default') as { require_auth: number; allow_self_registration: number } | undefined;
+  if (!row) {
+    return { requireAuth: true, allowSelfRegistration: false };
+  }
+  return {
+    requireAuth: Boolean(row.require_auth),
+    allowSelfRegistration: Boolean(row.allow_self_registration),
+  };
+}
+
+export function saveAuthPolicy(patch: {
+  requireAuth?: boolean;
+  allowSelfRegistration?: boolean;
+}): { requireAuth: boolean; allowSelfRegistration: boolean } {
+  const db = getDb();
+  const prev = getAuthPolicy();
+  const next = {
+    requireAuth: patch.requireAuth ?? prev.requireAuth,
+    allowSelfRegistration: patch.allowSelfRegistration ?? prev.allowSelfRegistration,
+  };
+  db.prepare(
+    `
+    INSERT INTO auth_policy (id, require_auth, allow_self_registration, updated_at)
+    VALUES ('default', ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      require_auth = excluded.require_auth,
+      allow_self_registration = excluded.allow_self_registration,
+      updated_at = excluded.updated_at
+  `,
+  ).run(next.requireAuth ? 1 : 0, next.allowSelfRegistration ? 1 : 0, new Date().toISOString());
+  return next;
+}
+
+export function createUserRecord(params: {
+  email: string;
+  username: string;
+  displayName: string;
+  jobTitle?: string;
+  bio?: string;
+  avatarColor?: string;
+  role: UserRole;
+  passwordHash: string;
+}): { user: UserProfile; sessionVersion: number } {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const id = `usr-${crypto.randomUUID()}`;
+  const cleanEmail = params.email.trim().toLowerCase();
+  const cleanUsername = params.username.trim().toLowerCase();
+
+  db.prepare(
+    `
+    INSERT INTO users (
+      id, email, username, display_name, job_title, bio, avatar_color,
+      role, password_hash, session_version, created_at, updated_at, last_login_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+  `,
+  ).run(
+    id,
+    cleanEmail,
+    cleanUsername,
+    params.displayName.trim(),
+    (params.jobTitle || '').trim(),
+    (params.bio || '').trim(),
+    params.avatarColor || '#2563eb',
+    params.role,
+    params.passwordHash,
+    now,
+    now,
+    now,
+  );
+
+  const created = getUserWithAuthById(id)!;
+  return { user: created.user, sessionVersion: created.sessionVersion };
+}
+
+export function getUserWithAuthByIdentifier(identifier: string): {
+  user: UserProfile;
+  passwordHash: string;
+  sessionVersion: number;
+} | null {
+  const db = getDb();
+  const clean = identifier.trim().toLowerCase();
+  if (!clean) return null;
+  const row = db
+    .prepare('SELECT * FROM users WHERE LOWER(email) = ? OR LOWER(username) = ? LIMIT 1')
+    .get(clean, clean) as RawUserRow | undefined;
+  if (!row) return null;
+  return {
+    user: mapUserRow(row),
+    passwordHash: row.password_hash,
+    sessionVersion: Number(row.session_version || 1),
+  };
+}
+
+export function getUserWithAuthById(id: string): {
+  user: UserProfile;
+  passwordHash: string;
+  sessionVersion: number;
+} | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as RawUserRow | undefined;
+  if (!row) return null;
+  return {
+    user: mapUserRow(row),
+    passwordHash: row.password_hash,
+    sessionVersion: Number(row.session_version || 1),
+  };
+}
+
+export function listUserProfiles(): UserProfile[] {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT * FROM users ORDER BY created_at ASC')
+    .all() as unknown as RawUserRow[];
+  return rows.map(mapUserRow);
+}
+
+export function recordUserLogin(id: string): UserProfile | null {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(now, now, id);
+  return getUserWithAuthById(id)?.user ?? null;
+}
+
+export function updateUserProfileRecord(
+  id: string,
+  patch: {
+    displayName?: string;
+    email?: string;
+    username?: string;
+    jobTitle?: string;
+    bio?: string;
+    avatarColor?: string;
+    role?: UserRole;
+  },
+): UserProfile | null {
+  const db = getDb();
+  const existing = getUserWithAuthById(id);
+  if (!existing) return null;
+  const now = new Date().toISOString();
+  const nextDisplayName = (patch.displayName ?? existing.user.displayName).trim() || existing.user.displayName;
+  const nextEmail = (patch.email ?? existing.user.email).trim().toLowerCase();
+  const nextUsername = (patch.username ?? existing.user.username).trim().toLowerCase();
+  const nextJobTitle = (patch.jobTitle ?? existing.user.jobTitle ?? '').trim();
+  const nextBio = (patch.bio ?? existing.user.bio ?? '').trim();
+  const nextAvatarColor = patch.avatarColor ?? existing.user.avatarColor ?? '#2563eb';
+  const nextRole = patch.role ?? existing.user.role;
+
+  db.prepare(
+    `
+    UPDATE users
+    SET display_name = ?, email = ?, username = ?, job_title = ?, bio = ?,
+        avatar_color = ?, role = ?, updated_at = ?
+    WHERE id = ?
+  `,
+  ).run(
+    nextDisplayName,
+    nextEmail,
+    nextUsername,
+    nextJobTitle,
+    nextBio,
+    nextAvatarColor,
+    nextRole,
+    now,
+    id,
+  );
+  return getUserWithAuthById(id)?.user ?? null;
+}
+
+export function updateUserPasswordRecord(
+  id: string,
+  passwordHash: string,
+): { user: UserProfile; sessionVersion: number } | null {
+  const db = getDb();
+  const existing = getUserWithAuthById(id);
+  if (!existing) return null;
+  const now = new Date().toISOString();
+  const nextVersion = existing.sessionVersion + 1;
+  db.prepare(
+    'UPDATE users SET password_hash = ?, session_version = ?, updated_at = ? WHERE id = ?',
+  ).run(passwordHash, nextVersion, now, id);
+  const updated = getUserWithAuthById(id);
+  if (!updated) return null;
+  return { user: updated.user, sessionVersion: updated.sessionVersion };
+}
+
+export function bumpUserSessionVersion(id: string): number {
+  const db = getDb();
+  const existing = getUserWithAuthById(id);
+  if (!existing) return 1;
+  const nextVersion = existing.sessionVersion + 1;
+  db.prepare('UPDATE users SET session_version = ?, updated_at = ? WHERE id = ?').run(
+    nextVersion,
+    new Date().toISOString(),
+    id,
+  );
+  return nextVersion;
+}
+
+export function deleteUserRecord(id: string): boolean {
+  const db = getDb();
+  const res = db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  return res.changes > 0;
+}
+
+interface RawNginxDomainRow {
+  id: string;
+  domain: string;
+  upstream_port: number;
+  ssl_mode: string;
+  ssl_email: string;
+  ssl_cert_path: string;
+  ssl_key_path: string;
+  redirect_www: number;
+  client_max_body_mb: number;
+  enable_websocket: number;
+  enable_hsts: number;
+  status: string;
+  dns_ips_json: string;
+  last_checked_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapNginxDomainRow(row: RawNginxDomainRow): NginxDomainConfig {
+  let ips: string[] = [];
+  try {
+    const parsed = JSON.parse(row.dns_ips_json || '[]');
+    if (Array.isArray(parsed)) ips = parsed.map((v) => String(v));
+  } catch {
+    ips = [];
+  }
+  const sslMode: NginxSslMode =
+    row.ssl_mode === 'http_only' || row.ssl_mode === 'custom_cert'
+      ? row.ssl_mode
+      : 'letsencrypt';
+  const status: NginxDomainStatus =
+    row.status === 'dns_verified' || row.status === 'active' ? row.status : 'draft';
+  return {
+    id: row.id,
+    domain: row.domain,
+    upstreamPort: Number(row.upstream_port || 3000),
+    sslMode,
+    ...(row.ssl_email ? { sslEmail: row.ssl_email } : {}),
+    ...(row.ssl_cert_path ? { sslCertPath: row.ssl_cert_path } : {}),
+    ...(row.ssl_key_path ? { sslKeyPath: row.ssl_key_path } : {}),
+    redirectWww: Boolean(row.redirect_www),
+    clientMaxBodyMb: Number(row.client_max_body_mb || 30),
+    enableWebsocket: Boolean(row.enable_websocket),
+    enableHsts: Boolean(row.enable_hsts),
+    status,
+    dnsResolvedIps: ips,
+    ...(row.last_checked_at ? { lastCheckedAt: row.last_checked_at } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function listNginxDomains(): NginxDomainConfig[] {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT * FROM nginx_domains ORDER BY updated_at DESC')
+    .all() as unknown as RawNginxDomainRow[];
+  return rows.map(mapNginxDomainRow);
+}
+
+export function getNginxDomainById(id: string): NginxDomainConfig | null {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT * FROM nginx_domains WHERE id = ?')
+    .get(id) as RawNginxDomainRow | undefined;
+  return row ? mapNginxDomainRow(row) : null;
+}
+
+export function upsertNginxDomain(input: {
+  id?: string;
+  domain: string;
+  upstreamPort: number;
+  sslMode: NginxSslMode;
+  sslEmail?: string;
+  sslCertPath?: string;
+  sslKeyPath?: string;
+  redirectWww: boolean;
+  clientMaxBodyMb: number;
+  enableWebsocket: boolean;
+  enableHsts: boolean;
+  status?: NginxDomainStatus;
+}): NginxDomainConfig {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const cleanDomain = input.domain.trim().toLowerCase();
+  const byDomain = db
+    .prepare('SELECT * FROM nginx_domains WHERE LOWER(domain) = ? LIMIT 1')
+    .get(cleanDomain) as RawNginxDomainRow | undefined;
+  const existing = (input.id ? getNginxDomainById(input.id) : null) || (byDomain ? mapNginxDomainRow(byDomain) : null);
+  const id = existing?.id || input.id || `dom-${crypto.randomUUID()}`;
+  const createdAt = existing?.createdAt || now;
+
+  db.prepare(
+    `
+    INSERT INTO nginx_domains (
+      id, domain, upstream_port, ssl_mode, ssl_email, ssl_cert_path, ssl_key_path,
+      redirect_www, client_max_body_mb, enable_websocket, enable_hsts, status,
+      dns_ips_json, last_checked_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      domain = excluded.domain,
+      upstream_port = excluded.upstream_port,
+      ssl_mode = excluded.ssl_mode,
+      ssl_email = excluded.ssl_email,
+      ssl_cert_path = excluded.ssl_cert_path,
+      ssl_key_path = excluded.ssl_key_path,
+      redirect_www = excluded.redirect_www,
+      client_max_body_mb = excluded.client_max_body_mb,
+      enable_websocket = excluded.enable_websocket,
+      enable_hsts = excluded.enable_hsts,
+      status = excluded.status,
+      updated_at = excluded.updated_at
+  `,
+  ).run(
+    id,
+    cleanDomain,
+    input.upstreamPort,
+    input.sslMode,
+    (input.sslEmail || '').trim(),
+    (input.sslCertPath || '').trim(),
+    (input.sslKeyPath || '').trim(),
+    input.redirectWww ? 1 : 0,
+    input.clientMaxBodyMb,
+    input.enableWebsocket ? 1 : 0,
+    input.enableHsts ? 1 : 0,
+    input.status ?? existing?.status ?? 'draft',
+    JSON.stringify(existing?.dnsResolvedIps ?? []),
+    existing?.lastCheckedAt ?? null,
+    createdAt,
+    now,
+  );
+  return getNginxDomainById(id)!;
+}
+
+export function updateNginxDomainCheck(
+  id: string,
+  patch: {
+    status: NginxDomainStatus;
+    dnsResolvedIps?: string[];
+    lastCheckedAt?: string;
+  },
+): NginxDomainConfig | null {
+  const db = getDb();
+  const existing = getNginxDomainById(id);
+  if (!existing) return null;
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE nginx_domains
+    SET status = ?, dns_ips_json = ?, last_checked_at = ?, updated_at = ?
+    WHERE id = ?
+  `,
+  ).run(
+    patch.status,
+    JSON.stringify(patch.dnsResolvedIps ?? existing.dnsResolvedIps ?? []),
+    patch.lastCheckedAt ?? existing.lastCheckedAt ?? now,
+    now,
+    id,
+  );
+  return getNginxDomainById(id);
+}
+
+export function deleteNginxDomain(id: string): boolean {
+  const db = getDb();
+  const res = db.prepare('DELETE FROM nginx_domains WHERE id = ?').run(id);
+  return res.changes > 0;
+}
+
 
 

@@ -41,6 +41,7 @@ import type {
   AgentNodeData,
   AgentRole,
   AppSettings,
+  AuthStatusPayload,
   BugReportItem,
   BugReportStatus,
   CapabilitiesState,
@@ -87,6 +88,7 @@ import { AuthLockScreen } from './components/AuthLockScreen';
 import { BlueprintView } from './components/BlueprintView';
 import { ExecutionConsole } from './components/ExecutionConsole';
 import { GitHubPushModal } from './components/GitHubPushModal';
+import { ProfileModal, getUserInitials } from './components/ProfileModal';
 import { ProjectImportModal } from './components/ProjectImportModal';
 import { ProjectManagerModal } from './components/ProjectManagerModal';
 import { RunHistoryView } from './components/RunHistoryView';
@@ -188,6 +190,8 @@ export default function App() {
   const [validationError, setValidationError] = useState<string | null>(null);
 
   const [authState, setAuthState] = useState<'checking' | 'locked' | 'ready'>('checking');
+  const [authStatus, setAuthStatus] = useState<AuthStatusPayload | null>(null);
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [events, setEvents] = useState<ExecutionEvent[]>([]);
@@ -338,6 +342,7 @@ export default function App() {
           opencodeConfigured: Boolean(cap.opencodeConfigured),
           ollamaBaseUrl: cap.ollamaBaseUrl,
           authEnabled: Boolean(cap.authEnabled),
+          hasUsers: Boolean(cap.hasUsers),
           vaultEncrypted: cap.vaultEncrypted !== false,
           dockerSandbox: Boolean(cap.dockerSandbox),
           secrets: cap.secrets ?? {},
@@ -381,11 +386,18 @@ export default function App() {
           setAuthState('locked');
           return;
         }
-        const statusData = (await res.json().catch(() => ({}))) as {
-          authEnabled?: boolean;
-          authenticated?: boolean;
+        const statusData = (await res.json().catch(() => ({}))) as Partial<AuthStatusPayload>;
+        const normalized: AuthStatusPayload = {
+          authEnabled: Boolean(statusData.authEnabled),
+          authenticated: Boolean(statusData.authenticated),
+          hasUsers: Boolean(statusData.hasUsers),
+          requireAuth: Boolean(statusData.requireAuth),
+          allowSelfRegistration: Boolean(statusData.allowSelfRegistration),
+          operatorTokenEnabled: Boolean(statusData.operatorTokenEnabled),
+          user: statusData.user ?? null,
         };
-        if (statusData.authEnabled && !statusData.authenticated) {
+        setAuthStatus(normalized);
+        if (normalized.authEnabled && !normalized.authenticated) {
           setAuthState('locked');
           return;
         }
@@ -1749,7 +1761,25 @@ export default function App() {
     return (
       <AuthLockScreen
         lang={lang}
-        onAuthenticated={() => {
+        hasUsers={Boolean(authStatus?.hasUsers)}
+        allowSelfRegistration={Boolean(authStatus?.allowSelfRegistration)}
+        operatorTokenEnabled={Boolean(authStatus?.operatorTokenEnabled)}
+        onAuthenticated={async (partial) => {
+          const res = await fetch('/api/auth/status').catch(() => null);
+          const fresh = res
+            ? ((await res.json().catch(() => null)) as AuthStatusPayload | null)
+            : null;
+          setAuthStatus(
+            fresh ?? {
+              authEnabled: true,
+              authenticated: true,
+              hasUsers: partial?.hasUsers ?? Boolean(authStatus?.hasUsers),
+              requireAuth: partial?.requireAuth ?? Boolean(authStatus?.requireAuth),
+              allowSelfRegistration: Boolean(authStatus?.allowSelfRegistration),
+              operatorTokenEnabled: Boolean(authStatus?.operatorTokenEnabled),
+              user: partial?.user ?? null,
+            },
+          );
           setAuthState('ready');
           bootstrapStudioData();
         }}
@@ -1822,7 +1852,37 @@ export default function App() {
           </button>
         </nav>
 
-        <div className="flex items-center shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            data-testid="header-profile-btn"
+            onClick={() => setIsProfileModalOpen(true)}
+            title={
+              authStatus?.user
+                ? `${authStatus.user.displayName} (${authStatus.user.role})`
+                : lang === 'fa'
+                  ? 'ورود و مدیریت پروفایل'
+                  : 'Sign In & Profile'
+            }
+            className="inline-flex items-center gap-2 whitespace-nowrap shrink-0 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            {authStatus?.user ? (
+              <>
+                <span
+                  className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[10px] font-bold text-white"
+                  style={{ backgroundColor: authStatus.user.avatarColor || '#2563eb' }}
+                >
+                  {getUserInitials(authStatus.user.displayName)}
+                </span>
+                <span className="hidden max-w-[110px] truncate md:inline">
+                  {authStatus.user.displayName}
+                </span>
+              </>
+            ) : (
+              <span>{lang === 'fa' ? 'ورود / پروفایل' : 'Sign In / Profile'}</span>
+            )}
+          </button>
+
           <button
             type="button"
             onClick={handleSaveWorkflow}
@@ -2687,6 +2747,8 @@ export default function App() {
           <SettingsView
             settings={appSettings}
             capabilities={capabilities}
+            currentUser={authStatus?.user ?? null}
+            onOpenProfile={() => setIsProfileModalOpen(true)}
             onCapabilitiesUpdated={setCapabilities}
             onSaveSettings={handleSaveSettings}
           />
@@ -2753,6 +2815,28 @@ export default function App() {
         onUpdateImportedProject={handleUpdateImportedProject}
         onDeleteImportedProject={handleDeleteImportedProject}
         onOpenImportModal={() => setIsProjectModalOpen(true)}
+      />
+
+      <ProfileModal
+        isOpen={isProfileModalOpen}
+        lang={lang}
+        authStatus={authStatus}
+        onClose={() => setIsProfileModalOpen(false)}
+        onAuthUpdated={(next) => {
+          setAuthStatus(next);
+          setCapabilities((prev) => ({
+            ...prev,
+            authEnabled: next.authEnabled,
+            hasUsers: next.hasUsers,
+          }));
+        }}
+        onSignedOut={(next) => {
+          setAuthStatus(next);
+          setIsProfileModalOpen(false);
+          if (next.authEnabled && !next.authenticated) {
+            setAuthState('locked');
+          }
+        }}
       />
     </div>
   );

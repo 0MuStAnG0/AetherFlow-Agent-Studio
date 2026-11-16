@@ -38,6 +38,7 @@ import {
   type LinuxInstallMode,
 } from '../utils/githubDeploy';
 import { CodeDiffViewer } from './CodeDiffViewer';
+import { NginxDomainPanel } from './NginxDomainPanel';
 import { PreLaunchTestSuite } from './PreLaunchTestSuite';
 
 interface ExportableRunSummary extends ExecutionRunSummary {
@@ -998,6 +999,16 @@ export function BlueprintView({
           </p>
         )}
       </div>
+
+      {/* Custom Domain & Nginx SSL Reverse Proxy Manager */}
+      <NginxDomainPanel
+        lang={lang}
+        onDomainSelected={(selectedDomain) => {
+          if (!domainInput.trim()) {
+            setDomainInput(selectedDomain);
+          }
+        }}
+      />
 
       {/* GitHub One-Line Linux Command Builder */}
       <div

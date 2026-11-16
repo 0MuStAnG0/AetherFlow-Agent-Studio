@@ -391,6 +391,56 @@ export interface CapabilitiesState {
   ollamaBaseUrl?: string;
   secrets?: Record<string, ProviderSecretStatus>;
   authEnabled?: boolean;
+  hasUsers?: boolean;
   vaultEncrypted?: boolean;
   dockerSandbox?: boolean;
 }
+
+export type UserRole = 'admin' | 'operator' | 'viewer';
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  username: string;
+  displayName: string;
+  jobTitle?: string;
+  bio?: string;
+  avatarColor?: string;
+  role: UserRole;
+  createdAt: string;
+  updatedAt: string;
+  lastLoginAt?: string;
+}
+
+export interface AuthStatusPayload {
+  authEnabled: boolean;
+  authenticated: boolean;
+  hasUsers: boolean;
+  requireAuth: boolean;
+  allowSelfRegistration: boolean;
+  operatorTokenEnabled: boolean;
+  user: UserProfile | null;
+}
+
+export type NginxSslMode = 'letsencrypt' | 'http_only' | 'custom_cert';
+export type NginxDomainStatus = 'draft' | 'dns_verified' | 'active';
+
+export interface NginxDomainConfig {
+  id: string;
+  domain: string;
+  upstreamPort: number;
+  sslMode: NginxSslMode;
+  sslEmail?: string;
+  sslCertPath?: string;
+  sslKeyPath?: string;
+  redirectWww: boolean;
+  clientMaxBodyMb: number;
+  enableWebsocket: boolean;
+  enableHsts: boolean;
+  status: NginxDomainStatus;
+  dnsResolvedIps?: string[];
+  lastCheckedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+

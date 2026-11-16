@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { exec } from 'node:child_process';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -11,36 +12,53 @@ import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
+  bumpUserSessionVersion,
   clearWorkflowRunsMemory,
+  countUsers,
   createBugReport,
   createRunRecord,
+  createUserRecord,
   deleteBugReport,
   deleteImportedProject,
+  deleteNginxDomain,
   deleteProviderSecret,
   deleteRunRecord,
+  deleteUserRecord,
   deleteWorkflow,
   getAppSettings,
+  getAuthPolicy,
   getContinuousSession,
   getDb,
   getImportedProjectById,
+  getNginxDomainById,
   getRunEvents,
   getRunSummaryById,
+  getUserWithAuthById,
+  getUserWithAuthByIdentifier,
   getWorkflowById,
   listActiveContinuousSessions,
   listBugReports,
   listImportedProjects,
+  listNginxDomains,
   listProviderSecretStatuses,
   listRecentWorkflowRunsWithSummary,
   listRunSummaries,
+  listUserProfiles,
   listWorkflows,
+  recordUserLogin,
   resolveServerSecret,
   saveAppSettings,
+  saveAuthPolicy,
   saveImportedProject,
   setProviderSecret,
   updateBugReportStatus,
   updateImportedProject,
+  updateNginxDomainCheck,
   updateRunRecord,
+  updateUserPasswordRecord,
+  updateUserProfileRecord,
   upsertContinuousSession,
+  upsertNginxDomain,
   upsertWorkflow,
 } from './server/db.ts';
 import type {
@@ -51,10 +69,12 @@ import type {
   ContinuousWorkSession,
   ExecutionEvent,
   ImportedProjectAnalysis,
+  NginxSslMode,
   RecommendedAgentSpec,
   SandboxFile,
   TokenUsage,
   ToolCallLog,
+  UserRole,
   WorkflowConfig,
   WorkflowNode,
 } from './src/types/workflow.ts';
@@ -119,12 +139,32 @@ import {
 import { getLatestPrelaunchReport, runPrelaunchTestSuite } from './server/prelaunchRunner.ts';
 import { cleanupStaleSandboxDirs, pruneBufferedRunEvents } from './server/sandboxCleanup.ts';
 import {
+  clampMaxBodyMb,
+  clampUpstreamPort,
+  generateNginxApplyScript,
+  generateNginxServerBlock,
+  validateDomainHostname,
+} from './src/utils/nginxConfig.ts';
+import {
+  createUserSessionCookieValue,
+  hashUserPassword,
+  normalizeUsernameInput,
+  parseAndVerifyUserSessionCookie,
+  validateEmailAddress,
+  validatePasswordStrength,
+  verifyUserPassword,
+} from './server/authUtils.ts';
+import {
   createIpRateLimiter,
   createSignedSessionToken,
+  getAuthenticatedUserIdFromRequest,
   getConfiguredOperatorAuthToken,
+  getMasterEncryptionKey,
   getSessionCookieName,
+  getUserSessionCookieName,
   isOperatorAuthEnabled,
   isRequestAuthorized,
+  registerUserSessionResolver,
   requireOperatorAuth,
   safeEqualSecret,
   safeResolveSandboxPath,
@@ -138,8 +178,23 @@ const SANDBOX_BASE = path.resolve('/tmp/aetherflow_sandboxes');
 const PROJECTS_BASE = path.resolve('/tmp/aetherflow_projects');
 const PROJECTS_ORIGINALS_BASE = path.resolve('/tmp/aetherflow_projects_originals');
 
-// Initialize SQLite database on boot
+// Initialize SQLite database on boot and wire persistent user sessions
 getDb();
+registerUserSessionResolver({
+  isUserAuthRequired: () => countUsers() > 0 && getAuthPolicy().requireAuth,
+  verifyUserCookie: (cookieVal: string) => {
+    const parsed = parseAndVerifyUserSessionCookie({
+      cookieValue: cookieVal,
+      signingKey: getMasterEncryptionKey(),
+    });
+    if (!parsed.valid || !parsed.userId) return { valid: false };
+    const found = getUserWithAuthById(parsed.userId);
+    if (!found || found.sessionVersion !== parsed.sessionVersion) {
+      return { valid: false };
+    }
+    return { valid: true, userId: found.user.id, role: found.user.role };
+  },
+});
 
 const app = express();
 app.use(securityHeadersMiddleware);
@@ -186,7 +241,8 @@ function buildCapabilitiesPayload() {
       process.env.OLLAMA_BASE_URL ||
       'http://host.docker.internal:11434',
     secrets,
-    authEnabled: isOperatorAuthEnabled(),
+    authEnabled: isOperatorAuthEnabled() || (countUsers() > 0 && getAuthPolicy().requireAuth),
+    hasUsers: countUsers() > 0,
     vaultEncrypted: true,
     dockerSandbox: process.env.AETHERFLOW_DOCKER_SANDBOX === '1',
   };
@@ -213,7 +269,7 @@ function broadcastEvent(runId: string, event: ExecutionEvent): void {
 }
 
 wss.on('connection', (ws, req) => {
-  if (isOperatorAuthEnabled() && !isRequestAuthorized(req)) {
+  if (!isRequestAuthorized(req)) {
     ws.close(4401, 'Unauthorized');
     return;
   }
@@ -2045,45 +2101,642 @@ async function executeWorkflowRun(params: {
 }
 
 // REST API Routes
+function getCurrentUserFromReq(req: express.Request) {
+  const sessionInfo = getAuthenticatedUserIdFromRequest(req);
+  if (!sessionInfo) return null;
+  return getUserWithAuthById(sessionInfo.userId)?.user ?? null;
+}
+
+function isSecureRequest(req: express.Request): boolean {
+  return Boolean(req.secure || req.headers['x-forwarded-proto'] === 'https');
+}
+
+function setUserSessionCookie(
+  req: express.Request,
+  res: express.Response,
+  userId: string,
+  sessionVersion: number,
+): void {
+  const cookieVal = createUserSessionCookieValue({
+    userId,
+    sessionVersion,
+    signingKey: getMasterEncryptionKey(),
+  });
+  const secureFlag = isSecureRequest(req) ? '; Secure' : '';
+  res.setHeader(
+    'Set-Cookie',
+    `${getUserSessionCookieName()}=${encodeURIComponent(cookieVal)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secureFlag}`,
+  );
+}
+
+function buildAuthStatusPayload(req: express.Request) {
+  const totalUsers = countUsers();
+  const policy = getAuthPolicy();
+  const operatorTokenEnabled = isOperatorAuthEnabled();
+  const authEnabled = operatorTokenEnabled || (totalUsers > 0 && policy.requireAuth);
+  const currentUser = getCurrentUserFromReq(req);
+  const authenticated = isRequestAuthorized(req);
+
+  return {
+    authEnabled,
+    authenticated,
+    hasUsers: totalUsers > 0,
+    requireAuth: policy.requireAuth,
+    allowSelfRegistration: policy.allowSelfRegistration,
+    operatorTokenEnabled,
+    user: currentUser,
+  };
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', sqlite: true });
 });
 
 app.get('/api/auth/status', (req, res) => {
-  res.json({
-    authEnabled: isOperatorAuthEnabled(),
-    authenticated: isRequestAuthorized(req),
+  res.json(buildAuthStatusPayload(req));
+});
+
+app.post('/api/auth/register', authLoginLimiter, (req, res) => {
+  const { email, username, displayName, password, jobTitle, bio, avatarColor } = (req.body ?? {}) as {
+    email?: string;
+    username?: string;
+    displayName?: string;
+    password?: string;
+    jobTitle?: string;
+    bio?: string;
+    avatarColor?: string;
+  };
+
+  const totalUsers = countUsers();
+  const policy = getAuthPolicy();
+  const currentUser = getCurrentUserFromReq(req);
+  if (totalUsers > 0 && !policy.allowSelfRegistration && currentUser?.role !== 'admin') {
+    res.status(403).json({
+      error: 'New account registration is restricted by the studio administrator.',
+    });
+    return;
+  }
+
+  const emailCheck = validateEmailAddress(email || '');
+  if (!emailCheck.valid) {
+    res.status(400).json({ error: emailCheck.error });
+    return;
+  }
+
+  const cleanName = (displayName || '').trim();
+  if (cleanName.length < 2) {
+    res.status(400).json({ error: 'Display name must be at least 2 characters.' });
+    return;
+  }
+
+  const passCheck = validatePasswordStrength(password || '');
+  if (!passCheck.valid) {
+    res.status(400).json({ error: passCheck.error });
+    return;
+  }
+
+  let cleanUsername = normalizeUsernameInput(username || '', emailCheck.email);
+  if (cleanUsername.length < 3) cleanUsername = `user_${Date.now().toString(36)}`;
+
+  if (getUserWithAuthByIdentifier(emailCheck.email)) {
+    res.status(409).json({ error: 'An account with this email already exists.' });
+    return;
+  }
+  if (getUserWithAuthByIdentifier(cleanUsername)) {
+    cleanUsername = `${cleanUsername.slice(0, 22)}_${Math.floor(100 + Math.random() * 900)}`;
+  }
+
+  const role: UserRole = totalUsers === 0 ? 'admin' : 'operator';
+  const passwordHash = hashUserPassword(password!);
+  const created = createUserRecord({
+    email: emailCheck.email,
+    username: cleanUsername,
+    displayName: cleanName,
+    jobTitle,
+    bio,
+    avatarColor,
+    role,
+    passwordHash,
+  });
+
+  if (totalUsers === 0) {
+    saveAuthPolicy({ requireAuth: true });
+  }
+
+  setUserSessionCookie(req, res, created.user.id, created.sessionVersion);
+  res.status(201).json({
+    authenticated: true,
+    user: created.user,
+    status: {
+      ...buildAuthStatusPayload(req),
+      authenticated: true,
+      hasUsers: true,
+      authEnabled: true,
+      user: created.user,
+    },
   });
 });
 
 app.post('/api/auth/login', authLoginLimiter, (req, res) => {
-  const expected = getConfiguredOperatorAuthToken();
-  if (!expected) {
-    res.json({ authenticated: true, authEnabled: false });
+  const { token, identifier, password } = (req.body ?? {}) as {
+    token?: string;
+    identifier?: string;
+    password?: string;
+  };
+
+  // Option A: Static Operator Access Token
+  if (token !== undefined) {
+    const expected = getConfiguredOperatorAuthToken();
+    if (!expected) {
+      res.status(400).json({
+        authenticated: false,
+        error: 'Operator token authentication is not configured on this server.',
+      });
+      return;
+    }
+    if (!token || !safeEqualSecret(token.trim(), expected)) {
+      res.status(401).json({
+        authenticated: false,
+        error: 'Invalid operator access token.',
+      });
+      return;
+    }
+    const signed = createSignedSessionToken(expected);
+    const secureFlag = isSecureRequest(req) ? '; Secure' : '';
+    res.setHeader(
+      'Set-Cookie',
+      `${getSessionCookieName()}=${encodeURIComponent(signed)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secureFlag}`,
+    );
+    res.json({ authenticated: true, authEnabled: true, user: null });
     return;
   }
-  const { token } = (req.body ?? {}) as { token?: string };
-  if (!token || !safeEqualSecret(token.trim(), expected)) {
-    res.status(401).json({
+
+  // Option B: Email / Username + Password
+  const cleanIdentifier = String(identifier || '').trim();
+  const cleanPassword = String(password || '');
+  if (!cleanIdentifier || !cleanPassword) {
+    res.status(400).json({
       authenticated: false,
-      error: 'Invalid operator access token.',
+      error: 'Email/username and password are required.',
     });
     return;
   }
-  const signed = createSignedSessionToken(expected);
-  res.setHeader(
-    'Set-Cookie',
-    `${getSessionCookieName()}=${encodeURIComponent(signed)}; Path=/; HttpOnly; SameSite=Lax`,
-  );
-  res.json({ authenticated: true, authEnabled: true });
+
+  const found = getUserWithAuthByIdentifier(cleanIdentifier);
+  if (!found || !verifyUserPassword(cleanPassword, found.passwordHash)) {
+    res.status(401).json({
+      authenticated: false,
+      error: 'Invalid email/username or password.',
+    });
+    return;
+  }
+
+  const updatedUser = recordUserLogin(found.user.id) ?? found.user;
+  setUserSessionCookie(req, res, updatedUser.id, found.sessionVersion);
+  res.json({
+    authenticated: true,
+    authEnabled: true,
+    user: updatedUser,
+  });
 });
 
-app.post('/api/auth/logout', (_req, res) => {
-  res.setHeader(
-    'Set-Cookie',
-    `${getSessionCookieName()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
-  );
+app.post('/api/auth/logout', (req, res) => {
+  const secureFlag = isSecureRequest(req) ? '; Secure' : '';
+  res.setHeader('Set-Cookie', [
+    `${getSessionCookieName()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`,
+    `${getUserSessionCookieName()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureFlag}`,
+  ]);
   res.json({ authenticated: false });
+});
+
+// User Profile, Security & Team Accounts API
+app.get('/api/profile', (req, res) => {
+  const user = getCurrentUserFromReq(req);
+  const policy = getAuthPolicy();
+  const totalUsers = countUsers();
+  res.json({
+    user,
+    hasUsers: totalUsers > 0,
+    requireAuth: policy.requireAuth,
+    allowSelfRegistration: policy.allowSelfRegistration,
+    operatorTokenEnabled: isOperatorAuthEnabled(),
+    users: user?.role === 'admin' || totalUsers === 0 ? listUserProfiles() : user ? [user] : [],
+  });
+});
+
+app.put('/api/profile', (req, res) => {
+  const user = getCurrentUserFromReq(req);
+  if (!user) {
+    res.status(401).json({ error: 'Sign in with a user account first.' });
+    return;
+  }
+  const { displayName, email, jobTitle, bio, avatarColor } = (req.body ?? {}) as {
+    displayName?: string;
+    email?: string;
+    jobTitle?: string;
+    bio?: string;
+    avatarColor?: string;
+  };
+
+  if (email !== undefined) {
+    const emailCheck = validateEmailAddress(email);
+    if (!emailCheck.valid) {
+      res.status(400).json({ error: emailCheck.error });
+      return;
+    }
+    const existingByEmail = getUserWithAuthByIdentifier(emailCheck.email);
+    if (existingByEmail && existingByEmail.user.id !== user.id) {
+      res.status(409).json({ error: 'Another account already uses that email.' });
+      return;
+    }
+  }
+
+  const safeColor =
+    avatarColor && /^#[0-9a-f]{6}$/i.test(avatarColor.trim()) ? avatarColor.trim() : undefined;
+
+  const updated = updateUserProfileRecord(user.id, {
+    ...(displayName !== undefined && displayName.trim().length >= 2 ? { displayName } : {}),
+    ...(email !== undefined ? { email } : {}),
+    ...(jobTitle !== undefined ? { jobTitle } : {}),
+    ...(bio !== undefined ? { bio } : {}),
+    ...(safeColor ? { avatarColor: safeColor } : {}),
+  });
+
+  res.json({ user: updated });
+});
+
+app.put('/api/profile/password', (req, res) => {
+  const user = getCurrentUserFromReq(req);
+  if (!user) {
+    res.status(401).json({ error: 'Sign in with a user account first.' });
+    return;
+  }
+  const { currentPassword, newPassword } = (req.body ?? {}) as {
+    currentPassword?: string;
+    newPassword?: string;
+  };
+  const authRecord = getUserWithAuthById(user.id);
+  if (!authRecord || !verifyUserPassword(currentPassword || '', authRecord.passwordHash)) {
+    res.status(400).json({ error: 'Current password is incorrect.' });
+    return;
+  }
+  const passCheck = validatePasswordStrength(newPassword || '');
+  if (!passCheck.valid) {
+    res.status(400).json({ error: passCheck.error });
+    return;
+  }
+  const updated = updateUserPasswordRecord(user.id, hashUserPassword(newPassword!));
+  if (!updated) {
+    res.status(500).json({ error: 'Failed to update password.' });
+    return;
+  }
+  setUserSessionCookie(req, res, updated.user.id, updated.sessionVersion);
+  res.json({ updated: true, user: updated.user });
+});
+
+app.put('/api/profile/security', (req, res) => {
+  const user = getCurrentUserFromReq(req);
+  const totalUsers = countUsers();
+  if (totalUsers > 0 && user?.role !== 'admin') {
+    res.status(403).json({ error: 'Only an administrator can modify studio security policy.' });
+    return;
+  }
+  const { requireAuth, allowSelfRegistration } = (req.body ?? {}) as {
+    requireAuth?: boolean;
+    allowSelfRegistration?: boolean;
+  };
+  const next = saveAuthPolicy({
+    ...(typeof requireAuth === 'boolean' ? { requireAuth } : {}),
+    ...(typeof allowSelfRegistration === 'boolean' ? { allowSelfRegistration } : {}),
+  });
+  res.json(next);
+});
+
+app.post('/api/profile/revoke-sessions', (req, res) => {
+  const user = getCurrentUserFromReq(req);
+  if (!user) {
+    res.status(401).json({ error: 'Sign in with a user account first.' });
+    return;
+  }
+  const nextVersion = bumpUserSessionVersion(user.id);
+  setUserSessionCookie(req, res, user.id, nextVersion);
+  res.json({ revoked: true, sessionVersion: nextVersion });
+});
+
+app.post('/api/profile/users', (req, res) => {
+  const currentUser = getCurrentUserFromReq(req);
+  if (currentUser?.role !== 'admin') {
+    res.status(403).json({ error: 'Only administrators can add team accounts.' });
+    return;
+  }
+  const { email, username, displayName, password, role, jobTitle } = (req.body ?? {}) as {
+    email?: string;
+    username?: string;
+    displayName?: string;
+    password?: string;
+    role?: UserRole;
+    jobTitle?: string;
+  };
+  const emailCheck = validateEmailAddress(email || '');
+  if (!emailCheck.valid) {
+    res.status(400).json({ error: emailCheck.error });
+    return;
+  }
+  if (!displayName || displayName.trim().length < 2) {
+    res.status(400).json({ error: 'Display name must be at least 2 characters.' });
+    return;
+  }
+  const passCheck = validatePasswordStrength(password || '');
+  if (!passCheck.valid) {
+    res.status(400).json({ error: passCheck.error });
+    return;
+  }
+  if (getUserWithAuthByIdentifier(emailCheck.email)) {
+    res.status(409).json({ error: 'An account with this email already exists.' });
+    return;
+  }
+  let cleanUsername = normalizeUsernameInput(username || '', emailCheck.email);
+  if (getUserWithAuthByIdentifier(cleanUsername)) {
+    cleanUsername = `${cleanUsername.slice(0, 22)}_${Math.floor(100 + Math.random() * 900)}`;
+  }
+  const safeRole: UserRole = role === 'admin' || role === 'viewer' ? role : 'operator';
+  const created = createUserRecord({
+    email: emailCheck.email,
+    username: cleanUsername,
+    displayName: displayName.trim(),
+    jobTitle,
+    role: safeRole,
+    passwordHash: hashUserPassword(password!),
+  });
+  res.status(201).json({ user: created.user, users: listUserProfiles() });
+});
+
+app.delete('/api/profile/users/:id', (req, res) => {
+  const currentUser = getCurrentUserFromReq(req);
+  if (currentUser?.role !== 'admin') {
+    res.status(403).json({ error: 'Only administrators can remove team accounts.' });
+    return;
+  }
+  if (req.params.id === currentUser.id) {
+    res.status(400).json({ error: 'You cannot delete your own active admin account.' });
+    return;
+  }
+  const deleted = deleteUserRecord(req.params.id);
+  if (!deleted) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+  res.json({ deleted: true, users: listUserProfiles() });
+});
+
+// Nginx Reverse Proxy & Custom Domain Binding API
+async function checkCommandExists(bin: string): Promise<boolean> {
+  try {
+    await execAsync(`command -v ${bin}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+app.get('/api/nginx/domains', async (_req, res) => {
+  const [nginxInstalled, certbotInstalled] = await Promise.all([
+    checkCommandExists('nginx'),
+    checkCommandExists('certbot'),
+  ]);
+  const domains = listNginxDomains().map((d) => ({
+    ...d,
+    nginxConf: generateNginxServerBlock(d),
+    setupScript: generateNginxApplyScript(d),
+  }));
+  res.json({
+    domains,
+    environment: {
+      nginxInstalled,
+      certbotInstalled,
+      isRoot: typeof process.getuid === 'function' ? process.getuid() === 0 : false,
+      appPort: PORT,
+    },
+  });
+});
+
+app.post('/api/nginx/domains', (req, res) => {
+  const {
+    id,
+    domain,
+    upstreamPort,
+    sslMode,
+    sslEmail,
+    sslCertPath,
+    sslKeyPath,
+    redirectWww,
+    clientMaxBodyMb,
+    enableWebsocket,
+    enableHsts,
+  } = (req.body ?? {}) as {
+    id?: string;
+    domain?: string;
+    upstreamPort?: number;
+    sslMode?: NginxSslMode;
+    sslEmail?: string;
+    sslCertPath?: string;
+    sslKeyPath?: string;
+    redirectWww?: boolean;
+    clientMaxBodyMb?: number;
+    enableWebsocket?: boolean;
+    enableHsts?: boolean;
+  };
+
+  const domainCheck = validateDomainHostname(domain || '');
+  if (!domainCheck.valid) {
+    res.status(400).json({ error: domainCheck.error });
+    return;
+  }
+
+  const validSslMode: NginxSslMode =
+    sslMode === 'http_only' || sslMode === 'custom_cert' ? sslMode : 'letsencrypt';
+
+  const saved = upsertNginxDomain({
+    id,
+    domain: domainCheck.domain,
+    upstreamPort: clampUpstreamPort(upstreamPort ?? PORT),
+    sslMode: validSslMode,
+    sslEmail: sslEmail?.trim(),
+    sslCertPath: sslCertPath?.trim(),
+    sslKeyPath: sslKeyPath?.trim(),
+    redirectWww: Boolean(redirectWww),
+    clientMaxBodyMb: clampMaxBodyMb(clientMaxBodyMb ?? 30),
+    enableWebsocket: enableWebsocket !== false,
+    enableHsts: enableHsts !== false,
+  });
+
+  res.status(201).json({
+    domain: {
+      ...saved,
+      nginxConf: generateNginxServerBlock(saved),
+      setupScript: generateNginxApplyScript(saved),
+    },
+  });
+});
+
+app.post('/api/nginx/domains/:id/verify-dns', async (req, res) => {
+  const record = getNginxDomainById(req.params.id);
+  if (!record) {
+    res.status(404).json({ error: 'Domain configuration not found.' });
+    return;
+  }
+
+  const resolvedIps: string[] = [];
+  let dnsError: string | null = null;
+  try {
+    const v4 = await dns.resolve4(record.domain).catch(() => []);
+    const v6 = await dns.resolve6(record.domain).catch(() => []);
+    resolvedIps.push(...v4, ...v6);
+    if (resolvedIps.length === 0) {
+      dnsError = `No A or AAAA DNS records found yet for ${record.domain}.`;
+    }
+  } catch (err) {
+    dnsError = err instanceof Error ? err.message : 'DNS resolution failed';
+  }
+
+  const nextStatus = resolvedIps.length > 0 ? 'dns_verified' : 'draft';
+  const updated =
+    updateNginxDomainCheck(record.id, {
+      status: record.status === 'active' && resolvedIps.length > 0 ? 'active' : nextStatus,
+      dnsResolvedIps: resolvedIps,
+      lastCheckedAt: new Date().toISOString(),
+    }) ?? record;
+
+  res.json({
+    verified: resolvedIps.length > 0,
+    resolvedIps,
+    error: dnsError,
+    domain: {
+      ...updated,
+      nginxConf: generateNginxServerBlock(updated),
+      setupScript: generateNginxApplyScript(updated),
+    },
+  });
+});
+
+app.post('/api/nginx/domains/:id/apply', async (req, res) => {
+  const record = getNginxDomainById(req.params.id);
+  if (!record) {
+    res.status(404).json({ error: 'Domain configuration not found.' });
+    return;
+  }
+
+  const nginxConf = generateNginxServerBlock(record);
+  const setupScript = generateNginxApplyScript(record);
+  const hasNginx = await checkCommandExists('nginx');
+  const isRoot = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+
+  if (!hasNginx || !isRoot) {
+    res.json({
+      applied: false,
+      needsServerPrivilege: true,
+      message: !hasNginx
+        ? 'Nginx is not installed in this runtime container. Run the generated setup script on your Linux VPS as root/sudo.'
+        : 'Server process does not have root privileges to write /etc/nginx. Run the generated setup script with sudo on your VPS.',
+      nginxConf,
+      setupScript,
+    });
+    return;
+  }
+
+  const slug = record.domain.replace(/[^a-z0-9.-]/g, '_');
+  const siteName = `aetherflow-${slug}`;
+  const confPath = fs.existsSync('/etc/nginx/sites-available')
+    ? `/etc/nginx/sites-available/${siteName}`
+    : `/etc/nginx/conf.d/${siteName}.conf`;
+
+  try {
+    fs.mkdirSync(path.dirname(confPath), { recursive: true });
+    fs.writeFileSync(confPath, nginxConf, 'utf-8');
+    if (fs.existsSync('/etc/nginx/sites-enabled')) {
+      const enabledLink = `/etc/nginx/sites-enabled/${siteName}`;
+      try {
+        fs.unlinkSync(enabledLink);
+      } catch {
+        // ignore missing link
+      }
+      fs.symlinkSync(confPath, enabledLink);
+    }
+
+    await execAsync('nginx -t');
+    await execAsync('systemctl reload nginx || nginx -s reload');
+
+    let sslApplied = false;
+    let sslNote = '';
+    if (record.sslMode === 'letsencrypt' && (await checkCommandExists('certbot'))) {
+      const emailFlag = record.sslEmail
+        ? `--email ${record.sslEmail}`
+        : '--register-unsafely-without-email';
+      const domainFlags =
+        record.redirectWww && !record.domain.startsWith('www.')
+          ? `-d ${record.domain} -d www.${record.domain}`
+          : `-d ${record.domain}`;
+      try {
+        await execAsync(
+          `certbot --nginx ${domainFlags} --non-interactive --agree-tos --redirect ${emailFlag}`,
+          { timeout: 60000 },
+        );
+        sslApplied = true;
+      } catch (certErr) {
+        sslNote = certErr instanceof Error ? certErr.message : 'Certbot issuance failed';
+      }
+    }
+
+    const updated =
+      updateNginxDomainCheck(record.id, {
+        status: 'active',
+        lastCheckedAt: new Date().toISOString(),
+      }) ?? record;
+
+    res.json({
+      applied: true,
+      sslApplied,
+      message: sslApplied
+        ? `Nginx reverse proxy + HTTPS SSL active for ${record.domain}.`
+        : `Nginx virtual host applied for ${record.domain}${sslNote ? ` (SSL note: ${sslNote})` : ''}.`,
+      nginxConf,
+      setupScript,
+      domain: {
+        ...updated,
+        nginxConf,
+        setupScript,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      applied: false,
+      error: err instanceof Error ? err.message : 'Failed to apply Nginx configuration.',
+      nginxConf,
+      setupScript,
+    });
+  }
+});
+
+app.get('/api/nginx/domains/:id/download-conf', (req, res) => {
+  const record = getNginxDomainById(req.params.id);
+  if (!record) {
+    res.status(404).json({ error: 'Domain configuration not found.' });
+    return;
+  }
+  const conf = generateNginxServerBlock(record);
+  const safeName = `${record.domain.replace(/[^a-z0-9.-]/g, '_')}.nginx.conf`;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', buildContentDispositionHeader(safeName));
+  res.send(conf);
+});
+
+app.delete('/api/nginx/domains/:id', (req, res) => {
+  const ok = deleteNginxDomain(req.params.id);
+  if (!ok) {
+    res.status(404).json({ error: 'Domain configuration not found.' });
+    return;
+  }
+  res.json({ deleted: true });
 });
 
 app.get('/api/capabilities', (_req, res) => {

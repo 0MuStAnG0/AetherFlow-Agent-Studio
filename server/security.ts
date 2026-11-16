@@ -112,6 +112,26 @@ export function isOperatorAuthEnabled(): boolean {
 }
 
 const SESSION_COOKIE_NAME = 'aetherflow_session';
+const USER_SESSION_COOKIE_NAME = 'aetherflow_user_session';
+
+export interface AuthSessionResolver {
+  isUserAuthRequired: () => boolean;
+  verifyUserCookie: (cookieVal: string) => {
+    valid: boolean;
+    userId?: string;
+    role?: string;
+  };
+}
+
+let registeredUserResolver: AuthSessionResolver | null = null;
+
+export function registerUserSessionResolver(resolver: AuthSessionResolver | null): void {
+  registeredUserResolver = resolver;
+}
+
+export function getUserSessionCookieName(): string {
+  return USER_SESSION_COOKIE_NAME;
+}
 
 export function createSignedSessionToken(authToken: string): string {
   const key = getMasterEncryptionKey();
@@ -156,21 +176,41 @@ export function parseCookies(cookieHeader: string | undefined): Record<string, s
   return out;
 }
 
+export function getAuthenticatedUserIdFromRequest(req: {
+  headers: { cookie?: string };
+}): { userId: string; role?: string } | null {
+  if (!registeredUserResolver) return null;
+  const cookies = parseCookies(req.headers.cookie);
+  const userCookie = cookies[USER_SESSION_COOKIE_NAME];
+  if (!userCookie) return null;
+  const verified = registeredUserResolver.verifyUserCookie(userCookie);
+  if (!verified.valid || !verified.userId) return null;
+  return { userId: verified.userId, role: verified.role };
+}
+
 export function isRequestAuthorized(req: {
   headers: { authorization?: string; cookie?: string };
 }): boolean {
   const expected = getConfiguredOperatorAuthToken();
-  if (!expected) return true;
+  const userAuthRequired = registeredUserResolver?.isUserAuthRequired() ?? false;
+
+  if (!expected && !userAuthRequired) return true;
 
   const authHeader = req.headers.authorization || '';
-  if (authHeader.toLowerCase().startsWith('bearer ')) {
+  if (expected && authHeader.toLowerCase().startsWith('bearer ')) {
     const token = authHeader.slice(7).trim();
     if (safeEqualSecret(token, expected)) return true;
   }
 
   const cookies = parseCookies(req.headers.cookie);
-  const sessionToken = cookies[SESSION_COOKIE_NAME];
-  if (sessionToken && verifySignedSessionToken(sessionToken, expected)) {
+  if (expected) {
+    const sessionToken = cookies[SESSION_COOKIE_NAME];
+    if (sessionToken && verifySignedSessionToken(sessionToken, expected)) {
+      return true;
+    }
+  }
+
+  if (getAuthenticatedUserIdFromRequest(req)) {
     return true;
   }
 
@@ -182,16 +222,18 @@ export function getSessionCookieName(): string {
 }
 
 export function requireOperatorAuth(req: Request, res: Response, next: NextFunction): void {
-  if (!isOperatorAuthEnabled()) {
+  const userAuthRequired = registeredUserResolver?.isUserAuthRequired() ?? false;
+  if (!isOperatorAuthEnabled() && !userAuthRequired) {
     next();
     return;
   }
 
-  // Public routes that remain accessible without operator login:
+  // Public routes that remain accessible without sign-in:
   if (
     req.path === '/health' ||
     req.path === '/auth/status' ||
     req.path === '/auth/login' ||
+    req.path === '/auth/register' ||
     req.path === '/auth/logout' ||
     /^\/webhooks\/[^/]+(\/trigger)?$/.test(req.path)
   ) {
@@ -201,7 +243,7 @@ export function requireOperatorAuth(req: Request, res: Response, next: NextFunct
 
   if (!isRequestAuthorized(req)) {
     res.status(401).json({
-      error: 'Authentication required. Sign in with the configured AETHERFLOW_AUTH_TOKEN.',
+      error: 'Authentication required. Please sign in to continue.',
       authRequired: true,
     });
     return;

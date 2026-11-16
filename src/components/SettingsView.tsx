@@ -22,6 +22,7 @@ import type {
   CapabilitiesState,
   LLMProvider,
   ProviderSecretStatus,
+  UserProfile,
 } from '../types/workflow';
 import {
   addProviderModel,
@@ -36,6 +37,8 @@ import { DEFAULT_APP_SETTINGS } from '../utils/workflowEngine';
 interface SettingsViewProps {
   settings: AppSettings;
   capabilities: CapabilitiesState;
+  currentUser?: UserProfile | null;
+  onOpenProfile?: () => void;
   onCapabilitiesUpdated?: (next: CapabilitiesState) => void;
   onSaveSettings: (next: AppSettings) => Promise<void>;
 }
@@ -82,6 +85,8 @@ const SETTINGS_COPY = {
 export function SettingsView({
   settings,
   capabilities,
+  currentUser,
+  onOpenProfile,
   onCapabilitiesUpdated,
   onSaveSettings,
 }: SettingsViewProps) {
@@ -1206,16 +1211,40 @@ export function SettingsView({
               </div>
             </div>
 
-            <div className="flex items-center gap-2.5 text-xs">
-              <Lock className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
-              <div>
-                <div className="font-semibold text-slate-800 dark:text-slate-200">
-                  {draft.language === 'fa' ? 'احراز هویت پنل اپراتور' : 'Operator Panel Auth'}
-                </div>
-                <div className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
-                  {capabilities.authEnabled ? 'AETHERFLOW_AUTH_TOKEN Enforced' : 'Optional (Unlocked)'}
+            <div className="flex items-center justify-between gap-2.5 text-xs">
+              <div className="flex items-center gap-2.5">
+                <Lock className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                <div>
+                  <div className="font-semibold text-slate-800 dark:text-slate-200">
+                    {draft.language === 'fa' ? 'حساب کاربری و قفل امنیتی' : 'User Auth & Login Gate'}
+                  </div>
+                  <div className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
+                    {currentUser
+                      ? `${currentUser.displayName} (${currentUser.role})`
+                      : capabilities.authEnabled
+                        ? 'Login Enforced'
+                        : capabilities.hasUsers
+                          ? 'Users Configured (Optional)'
+                          : 'No Admin Account Yet'}
+                  </div>
                 </div>
               </div>
+              {onOpenProfile && (
+                <button
+                  type="button"
+                  data-testid="settings-open-profile-btn"
+                  onClick={onOpenProfile}
+                  className="shrink-0 rounded-md border border-blue-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-50 dark:border-blue-800 dark:bg-slate-900 dark:text-blue-300"
+                >
+                  {currentUser
+                    ? draft.language === 'fa'
+                      ? 'پروفایل'
+                      : 'Profile'
+                    : draft.language === 'fa'
+                      ? 'تنظیم ورود'
+                      : 'Setup Auth'}
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-2.5 text-xs">
