@@ -8,6 +8,9 @@ set -euo pipefail
 # Quick One-Line Install on a fresh Linux server:
 #   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash
 #
+# Quick One-Line Update (no prompts, preserves .env, SQLite DB, and SSL):
+#   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --update
+#
 # Systemd Service Install (auto-installs Git, Python 3, Node.js 22+):
 #   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
 #
@@ -46,6 +49,9 @@ Default Repo: https://github.com/0MuStAnG0/AetherFlow-Agent-Studio
 
 One-Line Remote Install (prompts for domain to enable Nginx + HTTPS SSL):
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash
+
+One-Line Remote Update (non-interactive; preserves .env, SQLite DB & SSL):
+  curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --update
 
 With Systemd Background Service:
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
@@ -208,6 +214,12 @@ prompt_domain_for_https() {
     fi
     SSL_DOMAIN="$norm"
     ENABLE_NGINX=true
+    SKIP_DOMAIN_PROMPT=true
+    return 0
+  fi
+
+  if [[ "$UPDATE_ONLY" == true ]]; then
+    NON_INTERACTIVE=true
     SKIP_DOMAIN_PROMPT=true
     return 0
   fi
@@ -462,6 +474,10 @@ if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
   if [[ -z "$TARGET_DIR" ]]; then
     if [[ "$LOCAL_MODE" == true && -n "$APP_DIR" ]]; then
       TARGET_DIR="$APP_DIR"
+    elif [[ "$UPDATE_ONLY" == true && -d "/opt/aetherflow-studio/.git" ]]; then
+      TARGET_DIR="/opt/aetherflow-studio"
+    elif [[ "$UPDATE_ONLY" == true && -d "$HOME/aetherflow-studio/.git" ]]; then
+      TARGET_DIR="$HOME/aetherflow-studio"
     elif [[ "$EUID" -eq 0 ]]; then
       TARGET_DIR="/opt/aetherflow-studio"
     else
@@ -491,6 +507,9 @@ if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
   fi
 
   FORWARD_ARGS=()
+  if [[ "$UPDATE_ONLY" == true ]]; then
+    FORWARD_ARGS+=(--update)
+  fi
   if [[ "$MODE" == "docker" ]]; then
     FORWARD_ARGS+=(--docker)
   elif [[ "$INSTALL_SYSTEMD" == true ]]; then
@@ -572,7 +591,12 @@ ensure_env_file() {
 }
 
 if [[ "$MODE" == "auto" ]]; then
-  if has_docker_compose; then
+  if [[ -f /etc/systemd/system/aetherflow-studio.service ]] && command -v systemctl >/dev/null 2>&1; then
+    MODE="native"
+    INSTALL_SYSTEMD=true
+  elif has_docker_compose && { [[ "$UPDATE_ONLY" != true ]] || docker compose -f "$APP_DIR/docker-compose.yml" ps --services --filter "status=running" 2>/dev/null | grep -q .; }; then
+    MODE="docker"
+  elif has_docker_compose && [[ "$UPDATE_ONLY" != true ]]; then
     MODE="docker"
   else
     MODE="native"

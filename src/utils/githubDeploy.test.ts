@@ -91,4 +91,20 @@ test('buildLinuxOneLineCommand uses concise curl | bash without redundant --repo
     sslCmd.oneLineCurlCommand,
     'curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --nginx --domain studio.example.com'
   );
+  assert.equal(
+    sslCmd.updateCurlCommand,
+    'curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --update'
+  );
+  assert.equal(sslCmd.localUpdateCommand, './install-linux.sh --update');
+
+  const customUpdateCmd = buildLinuxOneLineCommand({
+    repoInput: 'https://github.com/ali-dev/aetherflow-studio',
+    branch: 'prod',
+    installDir: '/opt/aetherflow',
+    domain: 'ignored-on-update.example.com',
+  });
+  assert.equal(
+    customUpdateCmd.updateCurlCommand,
+    'curl -fsSL https://raw.githubusercontent.com/ali-dev/aetherflow-studio/prod/install-linux.sh | bash -s -- --repo https://github.com/ali-dev/aetherflow-studio.git --branch prod --dir /opt/aetherflow --update'
+  );
 });

@@ -156,6 +156,7 @@ export function BlueprintView({
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const [copiedOneLiner, setCopiedOneLiner] = useState(false);
+  const [copiedUpdateCmd, setCopiedUpdateCmd] = useState(false);
   const [copiedGitClone, setCopiedGitClone] = useState(false);
   const [copiedWebhookCurl, setCopiedWebhookCurl] = useState(false);
   const [webhookEnabledInput, setWebhookEnabledInput] = useState<boolean>(
@@ -388,6 +389,12 @@ export function BlueprintView({
     await navigator.clipboard.writeText(generated.oneLineCurlCommand);
     setCopiedOneLiner(true);
     setTimeout(() => setCopiedOneLiner(false), 1800);
+  };
+
+  const handleCopyUpdateCmd = async () => {
+    await navigator.clipboard.writeText(generated.updateCurlCommand);
+    setCopiedUpdateCmd(true);
+    setTimeout(() => setCopiedUpdateCmd(false), 1800);
   };
 
   const handleCopyGitClone = async () => {
@@ -1158,8 +1165,50 @@ export function BlueprintView({
                   : 'Copied'
                 : lang === 'fa'
                   ? 'کپی دستور نصب'
-                  : 'Copy One-Liner'}
+                  : 'Copy Install'}
             </button>
+          </div>
+
+          <div className="rounded-lg border border-blue-200/80 bg-blue-50/50 p-2.5 dark:border-blue-900/50 dark:bg-blue-950/20">
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-xs font-semibold text-blue-950 dark:text-blue-200">
+                <RefreshCw className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                {lang === 'fa'
+                  ? 'دستور آپدیت سریع (بدون درخواست مشخصات — حفظ دیتابیس، .env و SSL):'
+                  : 'One-Line Silent Update (No Prompts — Preserves DB, .env & SSL):'}
+              </span>
+              <span className="font-mono text-[11px] text-slate-600 dark:text-slate-400" dir="ltr">
+                {generated.localUpdateCommand}
+              </span>
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <pre
+                dir="ltr"
+                data-testid="github-update-cmd"
+                className="min-w-0 flex-1 overflow-x-auto rounded-lg bg-slate-950 px-3.5 py-2.5 font-mono text-xs text-sky-300"
+              >
+                <code>{generated.updateCurlCommand}</code>
+              </pre>
+              <button
+                type="button"
+                data-testid="copy-update-cmd-btn"
+                onClick={handleCopyUpdateCmd}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-blue-300 bg-white px-3.5 py-2.5 text-xs font-semibold text-blue-900 transition-colors hover:bg-blue-50 dark:border-blue-800 dark:bg-slate-900 dark:text-blue-200 dark:hover:bg-slate-800"
+              >
+                {copiedUpdateCmd ? (
+                  <Check className="h-3.5 w-3.5 text-emerald-500" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" />
+                )}
+                {copiedUpdateCmd
+                  ? lang === 'fa'
+                    ? 'کپی شد'
+                    : 'Copied'
+                  : lang === 'fa'
+                    ? 'کپی دستور آپدیت'
+                    : 'Copy Update'}
+              </button>
+            </div>
           </div>
 
           <div className="flex flex-col gap-2 pt-1 sm:flex-row sm:items-center">

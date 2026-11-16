@@ -4,7 +4,7 @@
 
 ---
 
-## نصب فوری با یک دستور روی سرور لینوکس (همراه با نصب خودکار پیش‌نیازها)
+## ۱. لینک نصب فوری با یک دستور روی سرور لینوکس (نصب اولیه)
 
 اسکریپت نصب به‌طور خودکار تمام پیش‌نیازهای لازم شامل `git`، `curl`، `python3` و بسته به روش انتخابی **Node.js 22 LTS** یا **Docker Engine + Compose** را نصب کرده و پروژه را از مخزن رسمی کلون، بیلد و اجرا می‌کند:
 
@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/m
 ```
 
 ### نصب و اتصال خودکار دامنه + گواهی HTTPS (Nginx + Let's Encrypt):
-اسکریپت نصب هنگام اجرا به‌صورت خودکار **نام دامنه (و ایمیل اختیاری)** را از شما می‌پرسد تا **Nginx Reverse Proxy** و گواهی رایگان **HTTPS SSL** را تنظیم و فعال کند (برای رد کردن این مرحله کافیست کلید Enter را بزنید یا فلگ `--no-domain` را بدهید):
+اسکریپت نصب هنگام نصب اولیه به‌صورت خودکار **نام دامنه (و ایمیل اختیاری)** را از شما می‌پرسد تا **Nginx Reverse Proxy** و گواهی رایگان **HTTPS SSL** را تنظیم و فعال کند (برای رد کردن این مرحله کافیست کلید Enter را بزنید یا فلگ `--no-domain` را بدهید):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
 ```
@@ -40,6 +40,23 @@ curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/m
 
 ---
 
+## ۲. لینک آپدیت سریع (بدون درخواست مشخصات و بدون تغییر تنظیمات قبلی)
+
+اگر نرم‌افزار قبلاً روی سرور نصب شده و می‌خواهید **فقط آخرین تغییرات را از گیت‌هاب بگیرید و آپدیت کنید** (بدون پرسیدن دوباره دامنه، ایمیل، پورت یا تنظیمات، و با حفظ کامل فایل `.env`، دیتابیس SQLite، کلیدهای API، پروژه‌های آفلاین و گواهی SSL):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --update
+```
+
+یا از داخل پوشه پروژه روی سرور:
+```bash
+./install-linux.sh --update
+```
+
+این دستور به‌صورت خودکار حالت نصب فعلی (`systemd` یا `Docker`) و مسیر نصب قبلی را تشخیص می‌دهد، آخرین نسخه کدها را دریافت و بیلد می‌کند و سرویس را بدون هیچ سوالی ری‌استارت می‌نماید.
+
+---
+
 ## پیش‌نیازهای نصب (تامین‌شده توسط اسکریپت)
 - **سیستم‌عامل‌های پشتیبانی‌شده:** Ubuntu 20.04/22.04/24.04، Debian 11/12، Rocky/Alma/RHEL/Fedora، و Alpine Linux
 - **ابزارهای پایه:** `git`، `curl`، `ca-certificates`، `python3`، `python3-pip` و کامپایلر `build-essential`
@@ -47,16 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/m
 
 ---
 
-## آپدیت و مدیریت روی سرور لینوکس
-
-برای دریافت آخرین تغییرات از گیت‌هاب بدون حذف دیتابیس SQLite و تنظیمات `.env`:
-```bash
-curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
-```
-یا از داخل پوشه پروژه:
-```bash
-./install-linux.sh --update --systemd
-```
+## مدیریت سرویس روی سرور لینوکس
 
 مدیریت سرویس `systemd`:
 ```bash

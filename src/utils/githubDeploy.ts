@@ -29,6 +29,8 @@ export interface GeneratedLinuxInstallCommands {
   valid: boolean;
   target: ParsedGitHubDeployTarget;
   oneLineCurlCommand: string;
+  updateCurlCommand: string;
+  localUpdateCommand: string;
   gitCloneCommand: string;
   rawScriptUrl: string;
 }
@@ -238,10 +240,27 @@ export function buildLinuxOneLineCommand(
   const targetDirName = dir ? shellQuoteIfNeeded(dir) : effectiveRepo;
   const gitCloneCommand = `git clone${cloneBranchFlag} ${cloneUrl} ${targetDirName} && cd ${targetDirName} && chmod +x install-linux.sh && ./install-linux.sh${localFlagSuffix}`;
 
+  const updateFlags: string[] = [];
+  if (!isBuiltinDefaultRepo) {
+    updateFlags.push('--repo', cloneUrl);
+  }
+  if (effectiveBranch !== 'main') {
+    updateFlags.push('--branch', effectiveBranch);
+  }
+  if (dir) {
+    updateFlags.push('--dir', shellQuoteIfNeeded(dir));
+  }
+  updateFlags.push('--update');
+
+  const updateCurlCommand = `curl -fsSL ${rawScriptUrl} | bash -s -- ${updateFlags.join(' ')}`;
+  const localUpdateCommand = './install-linux.sh --update';
+
   return {
     valid: target.valid,
     target,
     oneLineCurlCommand,
+    updateCurlCommand,
+    localUpdateCommand,
     gitCloneCommand,
     rawScriptUrl,
   };
