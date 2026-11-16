@@ -17,6 +17,21 @@ export function normalizeSecretName(raw: string): string {
 export function maskApiKey(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as { type?: string; project_id?: string };
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.type === 'service_account') {
+          return parsed.project_id ? `SA:${parsed.project_id}` : 'SA:json••••';
+        }
+        if (parsed.type === 'authorized_user') {
+          return 'ADC:json••••';
+        }
+      }
+    } catch {
+      // fall back to generic masking
+    }
+  }
   if (trimmed.length <= 8) {
     return '••••••';
   }
@@ -44,6 +59,85 @@ export function validateApiKeyValue(raw: string): {
     return { valid: false, cleaned: '', error: 'API key cannot contain newline characters.' };
   }
   return { valid: true, cleaned };
+}
+
+export function validateProviderCredentialValue(raw: string): {
+  valid: boolean;
+  cleaned: string;
+  kind: 'api_key' | 'google_service_account' | 'google_authorized_user';
+  error?: string;
+} {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        type?: string;
+        project_id?: string;
+        client_email?: string;
+        private_key?: string;
+        client_id?: string;
+        client_secret?: string;
+        refresh_token?: string;
+      };
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (parsed.type === 'service_account') {
+          if (
+            typeof parsed.project_id === 'string' &&
+            parsed.project_id.trim() &&
+            typeof parsed.client_email === 'string' &&
+            parsed.client_email.includes('@') &&
+            typeof parsed.private_key === 'string' &&
+            parsed.private_key.includes('PRIVATE KEY')
+          ) {
+            return {
+              valid: true,
+              cleaned: JSON.stringify(parsed),
+              kind: 'google_service_account',
+            };
+          }
+          return {
+            valid: false,
+            cleaned: '',
+            kind: 'google_service_account',
+            error:
+              'Invalid Google Service Account JSON: requires project_id, client_email, and PEM private_key.',
+          };
+        }
+        if (parsed.type === 'authorized_user') {
+          if (
+            typeof parsed.client_id === 'string' &&
+            parsed.client_id.trim() &&
+            typeof parsed.client_secret === 'string' &&
+            parsed.client_secret.trim() &&
+            typeof parsed.refresh_token === 'string' &&
+            parsed.refresh_token.trim()
+          ) {
+            return {
+              valid: true,
+              cleaned: JSON.stringify(parsed),
+              kind: 'google_authorized_user',
+            };
+          }
+          return {
+            valid: false,
+            cleaned: '',
+            kind: 'google_authorized_user',
+            error:
+              'Invalid Google Authorized User JSON: requires client_id, client_secret, and refresh_token.',
+          };
+        }
+      }
+    } catch {
+      return {
+        valid: false,
+        cleaned: '',
+        kind: 'api_key',
+        error: 'Malformed JSON credential pasted.',
+      };
+    }
+  }
+  const keyCheck = validateApiKeyValue(raw);
+  return { ...keyCheck, kind: 'api_key' };
 }
 
 export type GeminiApiVersion = 'v1' | 'v1beta' | 'v1alpha' | 'v1beta1';

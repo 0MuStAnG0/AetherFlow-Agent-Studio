@@ -69,6 +69,7 @@ import type {
   ContinuousWorkSession,
   ExecutionEvent,
   ImportedProjectAnalysis,
+  LLMProvider,
   NginxSslMode,
   RecommendedAgentSpec,
   SandboxFile,
@@ -90,8 +91,14 @@ import {
   normalizeSecretName,
   parseGeminiBaseUrl,
   validateApiKeyValue,
+  validateProviderCredentialValue,
   type GeminiApiVersion,
 } from './src/utils/secretUtils.ts';
+import {
+  applyProviderJsonPatches,
+  parseGoogleJsonCredential,
+  parseProviderJsonSync,
+} from './src/utils/providerJsonSync.ts';
 import {
   assembleExportBundleFiles,
   buildContentDispositionHeader,
@@ -2777,14 +2784,15 @@ app.put('/api/provider-keys', (req, res) => {
     });
     return;
   }
-  const check = validateApiKeyValue(apiKey || '');
+  const check = validateProviderCredentialValue(apiKey || '');
   if (!check.valid) {
-    res.status(400).json({ error: check.error || 'Invalid API key.' });
+    res.status(400).json({ error: check.error || 'Invalid API key or JSON credential.' });
     return;
   }
   const status = setProviderSecret(normalized, check.cleaned);
   res.json({
     saved: true,
+    kind: check.kind,
     secret: status,
     capabilities: buildCapabilitiesPayload(),
   });
@@ -2803,34 +2811,33 @@ app.delete('/api/provider-keys/:secretName', (req, res) => {
   });
 });
 
-app.post('/api/provider-keys/test', providerTestLimiter, async (req, res) => {
-  const { provider, secretName, baseUrl, apiKey, model, language } = req.body as {
-    provider?: WorkflowNode['data']['provider'];
-    secretName?: string;
-    baseUrl?: string;
-    apiKey?: string;
-    model?: string;
-    language?: 'en' | 'fa';
-  };
+async function runSingleProviderConnectionCheck(params: {
+  provider: LLMProvider;
+  secretName?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  language?: 'en' | 'fa';
+}): Promise<{ ok: boolean; status: number; code?: string; model?: string; message: string }> {
   const settings = getAppSettings();
-  const lang: 'en' | 'fa' = language === 'fa' || language === 'en' ? language : settings.language;
+  const lang: 'en' | 'fa' =
+    params.language === 'fa' || params.language === 'en' ? params.language : settings.language;
   const isFa = lang === 'fa';
-  const targetProvider = provider || 'gemini';
+  const targetProvider = params.provider || 'gemini';
   const ref =
-    normalizeSecretName(secretName || '') ||
+    normalizeSecretName(params.secretName || '') ||
     settings.providers[targetProvider]?.envVarName ||
     'GEMINI_API_KEY';
 
   let inlineKey: string | undefined;
-  if (typeof apiKey === 'string' && apiKey.trim()) {
-    const check = validateApiKeyValue(apiKey);
+  if (typeof params.apiKey === 'string' && params.apiKey.trim()) {
+    const check = validateProviderCredentialValue(params.apiKey);
     if (!check.valid) {
-      res.status(400).json({
+      return {
         ok: false,
         status: 400,
-        message: check.error || 'Invalid API key.',
-      });
-      return;
+        message: check.error || 'Invalid API key or JSON credential.',
+      };
     }
     inlineKey = check.cleaned;
   }
@@ -2841,191 +2848,319 @@ app.post('/api/provider-keys/test', providerTestLimiter, async (req, res) => {
       ? resolveServerSecret('GEMINI_API_KEY').value
       : null;
   const keyToTest = inlineKey ?? resolved.value ?? fallbackGemini;
-  const effectiveBase = (baseUrl ?? settings.providers[targetProvider]?.baseUrl ?? '')
+  const effectiveBase = (params.baseUrl ?? settings.providers[targetProvider]?.baseUrl ?? '')
     .trim()
     .replace(/\/+$/, '');
 
   if (targetProvider !== 'ollama' && targetProvider !== 'opencode' && !keyToTest) {
-    res.status(400).json({
+    return {
       ok: false,
       status: 400,
       message: isFa
-        ? `کلیدی برای ${ref} ذخیره یا وارد نشده است. ابتدا کلید API را وارد کنید.`
-        : `No key found for ${ref}. Enter or save an API key first.`,
-    });
-    return;
+        ? `کلیدی برای ${ref} ذخیره یا وارد نشده است. ابتدا کلید API یا فایل JSON را وارد کنید.`
+        : `No key found for ${ref}. Enter or save an API key or JSON credential first.`,
+    };
   }
 
-  try {
-    if (targetProvider === 'gemini') {
-      const parsedBase = parseGeminiBaseUrl(effectiveBase);
-      if (parsedBase.error) {
-        res.status(400).json({
-          ok: false,
-          status: 400,
-          message: parsedBase.error,
-        });
-        return;
-      }
+  if (targetProvider === 'gemini') {
+    const googleJsonCred = keyToTest ? parseGoogleJsonCredential(keyToTest) : null;
+    const isVertexBase = /^https?:\/\/([a-z0-9-]+-)?aiplatform\.googleapis\.com/i.test(effectiveBase);
+    const parsedBase = googleJsonCred || isVertexBase ? {} : parseGeminiBaseUrl(effectiveBase);
+    if (parsedBase.error) {
+      return {
+        ok: false,
+        status: 400,
+        message: parsedBase.error,
+      };
+    }
 
-      const candidateModels = Array.from(
-        new Set(
-          [
-            model?.trim(),
-            settings.providers.gemini?.defaultModel,
-            'gemini-3.1-flash-lite',
-            'gemini-4-hydrogen',
-            'gemini-4-argon',
-          ].filter((m): m is string => Boolean(m && m.startsWith('gemini-'))),
-        ),
-      );
+    const candidateModels = Array.from(
+      new Set(
+        [
+          params.model?.trim(),
+          settings.providers.gemini?.defaultModel,
+          'gemini-3.1-flash-lite',
+          'gemini-4-hydrogen',
+          'gemini-4-argon',
+        ].filter((m): m is string => Boolean(m && m.startsWith('gemini-'))),
+      ),
+    );
 
-      const attemptConfigs: Array<{ apiVersion?: GeminiApiVersion; vertexai?: boolean }> = [
-        { apiVersion: parsedBase.apiVersion },
-      ];
-      if (!parsedBase.apiVersion) {
-        attemptConfigs.push({ apiVersion: 'v1beta' });
-      }
-      if (keyToTest && keyToTest.startsWith('AQ.') && !parsedBase.baseUrl) {
-        attemptConfigs.push({ vertexai: true });
-      }
+    const attemptConfigs: Array<{ apiVersion?: GeminiApiVersion; vertexai?: boolean }> = googleJsonCred
+      ? [{ vertexai: true }]
+      : [{ apiVersion: parsedBase.apiVersion }];
+    if (!googleJsonCred && !parsedBase.apiVersion) {
+      attemptConfigs.push({ apiVersion: 'v1beta' });
+    }
+    if (!googleJsonCred && keyToTest && keyToTest.startsWith('AQ.') && !parsedBase.baseUrl) {
+      attemptConfigs.push({ vertexai: true });
+    }
 
-      let lastErr: unknown = null;
-      let sawOnlyNotFound = true;
+    let lastErr: unknown = null;
+    let sawOnlyNotFound = true;
 
-      for (const cfg of attemptConfigs) {
-        const client = getAiClient(ref, {
-          baseUrl: effectiveBase,
-          apiKey: keyToTest || undefined,
-          apiVersion: cfg.apiVersion,
-          vertexai: cfg.vertexai,
-        });
-        if (!client) continue;
+    for (const cfg of attemptConfigs) {
+      const client = getAiClient(ref, {
+        baseUrl: effectiveBase,
+        apiKey: keyToTest || undefined,
+        apiVersion: cfg.apiVersion,
+        vertexai: cfg.vertexai,
+      });
+      if (!client) continue;
 
-        for (const candidateModel of candidateModels) {
-          try {
-            const resp = await client.models.generateContent({
-              model: candidateModel,
-              contents: 'Reply with OK',
-              config: { httpOptions: { timeout: 12000 } },
-            });
-            const replyPreview = (resp.text || 'OK').trim().slice(0, 32);
-            const unsavedNote = inlineKey
-              ? isFa
-                ? ' (برای ذخیره دائمی دکمه Save Key را بزنید)'
-                : ' (click Save Key to store it)'
-              : '';
-            res.json({
-              ok: true,
-              status: 200,
-              model: candidateModel,
-              message: isFa
-                ? `اتصال Gemini با موفقیت برقرار شد (${candidateModel}: ${replyPreview})${unsavedNote}`
-                : `Gemini connected (${candidateModel}: ${replyPreview})${unsavedNote}`,
-            });
-            return;
-          } catch (err) {
-            lastErr = err;
-            const formatted = formatGeminiApiError(err, lang);
-            if (formatted.status !== 404) {
-              sawOnlyNotFound = false;
-            }
-            // Invalid key or geo/permission 403 won't be fixed by trying other models on same transport
-            if (
-              formatted.code === 'API_KEY_INVALID' ||
-              formatted.code === 'GEO_OR_ENDPOINT_FORBIDDEN' ||
-              formatted.code === 'LOCATION_NOT_SUPPORTED'
-            ) {
-              break;
-            }
+      for (const candidateModel of candidateModels) {
+        try {
+          const resp = await client.models.generateContent({
+            model: candidateModel,
+            contents: 'Reply with OK',
+            config: { httpOptions: { timeout: 12000 } },
+          });
+          const replyPreview = (resp.text || 'OK').trim().slice(0, 32);
+          const unsavedNote = inlineKey
+            ? isFa
+              ? ' (برای ذخیره دائمی دکمه Save Key را بزنید)'
+              : ' (click Save Key to store it)'
+            : '';
+          const modeLabel = googleJsonCred ? `Vertex SA:${googleJsonCred.projectId}` : 'Gemini';
+          return {
+            ok: true,
+            status: 200,
+            model: candidateModel,
+            message: isFa
+              ? `اتصال ${modeLabel} با موفقیت برقرار شد (${candidateModel}: ${replyPreview})${unsavedNote}`
+              : `${modeLabel} connected (${candidateModel}: ${replyPreview})${unsavedNote}`,
+          };
+        } catch (err) {
+          lastErr = err;
+          const formatted = formatGeminiApiError(err, lang);
+          if (formatted.status !== 404) {
+            sawOnlyNotFound = false;
+          }
+          if (
+            formatted.code === 'API_KEY_INVALID' ||
+            formatted.code === 'GEO_OR_ENDPOINT_FORBIDDEN' ||
+            formatted.code === 'LOCATION_NOT_SUPPORTED'
+          ) {
+            break;
           }
         }
-        if (!sawOnlyNotFound && !(keyToTest && keyToTest.startsWith('AQ.'))) {
-          break;
-        }
       }
+      if (!sawOnlyNotFound && !(keyToTest && keyToTest.startsWith('AQ.'))) {
+        break;
+      }
+    }
 
-      const formatted = formatGeminiApiError(lastErr, lang);
-      res.json({
+    const formatted = formatGeminiApiError(lastErr, lang);
+    return {
+      ok: false,
+      status: formatted.status,
+      code: formatted.code,
+      message: formatted.message,
+    };
+  }
+
+  if (targetProvider === 'openai' || targetProvider === 'opencode') {
+    const headers: Record<string, string> = {};
+    if (keyToTest) headers.Authorization = `Bearer ${keyToTest}`;
+    const r = await fetch(`${effectiveBase}/models`, {
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      const cleanBody = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      return {
         ok: false,
-        status: formatted.status,
-        code: formatted.code,
-        message: formatted.message,
-      });
-      return;
-    }
-
-    if (targetProvider === 'openai' || targetProvider === 'opencode') {
-      const headers: Record<string, string> = {};
-      if (keyToTest) headers.Authorization = `Bearer ${keyToTest}`;
-      const r = await fetch(`${effectiveBase}/models`, {
-        headers,
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        const cleanBody = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        res.json({
-          ok: false,
-          status: r.status,
-          message: `HTTP ${r.status}: ${cleanBody.slice(0, 140) || 'Authentication failed'}`,
-        });
-        return;
-      }
-      res.json({
-        ok: true,
         status: r.status,
-        message: `${targetProvider} endpoint reachable (HTTP ${r.status})`,
-      });
-      return;
+        message: `HTTP ${r.status}: ${cleanBody.slice(0, 140) || 'Authentication failed'}`,
+      };
     }
+    return {
+      ok: true,
+      status: r.status,
+      message: `${targetProvider} endpoint reachable (HTTP ${r.status})`,
+    };
+  }
 
-    if (targetProvider === 'anthropic') {
-      const r = await fetch(`${effectiveBase}/v1/models`, {
-        headers: {
-          'x-api-key': keyToTest || '',
-          'anthropic-version': '2023-06-01',
-        },
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        const cleanBody = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        res.json({
-          ok: false,
-          status: r.status,
-          message: `HTTP ${r.status}: ${cleanBody.slice(0, 140) || 'Authentication failed'}`,
-        });
-        return;
-      }
-      res.json({
-        ok: true,
+  if (targetProvider === 'anthropic') {
+    const r = await fetch(`${effectiveBase}/v1/models`, {
+      headers: {
+        'x-api-key': keyToTest || '',
+        'anthropic-version': '2023-06-01',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      const cleanBody = body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      return {
+        ok: false,
         status: r.status,
-        message: `Anthropic endpoint reachable (HTTP ${r.status})`,
-      });
-      return;
+        message: `HTTP ${r.status}: ${cleanBody.slice(0, 140) || 'Authentication failed'}`,
+      };
     }
+    return {
+      ok: true,
+      status: r.status,
+      message: `Anthropic endpoint reachable (HTTP ${r.status})`,
+    };
+  }
 
-    // ollama
+  if (targetProvider === 'ollama') {
     const headers: Record<string, string> = {};
     if (keyToTest) headers.Authorization = `Bearer ${keyToTest}`;
     const r = await fetch(`${effectiveBase}/api/tags`, {
       headers,
       signal: AbortSignal.timeout(5000),
     });
-    res.json({
-      ok: r.ok,
+    if (!r.ok) {
+      return {
+        ok: false,
+        status: r.status,
+        message: `Ollama returned HTTP ${r.status}`,
+      };
+    }
+    return {
+      ok: true,
       status: r.status,
-      message: r.ok ? `Ollama reachable at ${effectiveBase}` : `Ollama returned HTTP ${r.status}`,
+      message: `Ollama reachable at ${effectiveBase}`,
+    };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    message: `Unsupported provider: ${targetProvider}`,
+  };
+}
+
+app.post('/api/provider-keys/test', providerTestLimiter, async (req, res) => {
+  const { provider, secretName, baseUrl, apiKey, model, language } = req.body as {
+    provider?: WorkflowNode['data']['provider'];
+    secretName?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    model?: string;
+    language?: 'en' | 'fa';
+  };
+  try {
+    const result = await runSingleProviderConnectionCheck({
+      provider: provider || 'gemini',
+      secretName,
+      baseUrl,
+      apiKey,
+      model,
+      language,
     });
+    if (result.status === 400 && !result.ok) {
+      res.status(400).json(result);
+      return;
+    }
+    res.json(result);
   } catch (err) {
-    const formatted = formatGeminiApiError(err, lang);
     res.json({
       ok: false,
-      status: formatted.status,
-      message: formatted.message,
+      status: 500,
+      message: err instanceof Error ? err.message : 'Connection test failed',
     });
   }
+});
+
+app.post('/api/providers/json-sync', async (req, res) => {
+  const { rawJson, targetProvider, testConnections, language } = req.body as {
+    rawJson?: string;
+    targetProvider?: LLMProvider;
+    testConnections?: boolean;
+    language?: 'en' | 'fa';
+  };
+
+  if (typeof rawJson !== 'string' || !rawJson.trim()) {
+    res.status(400).json({ ok: false, error: 'JSON payload is required.' });
+    return;
+  }
+
+  const parsed = parseProviderJsonSync(rawJson, targetProvider);
+  if (!parsed.valid) {
+    res.status(400).json({
+      ok: false,
+      detectedFormat: parsed.detectedFormat,
+      error: parsed.error || 'Failed to parse provider JSON configuration.',
+    });
+    return;
+  }
+
+  const currentSettings = getAppSettings();
+  const nextProviders = applyProviderJsonPatches(currentSettings.providers, parsed.providerPatches);
+  const updatedSettings = saveAppSettings({
+    ...currentSettings,
+    providers: nextProviders,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const storedSecrets: string[] = [];
+  for (const patch of parsed.providerPatches) {
+    if (patch.secretName && patch.secretValue) {
+      const normalized = normalizeSecretName(patch.secretName);
+      if (normalized) {
+        setProviderSecret(normalized, patch.secretValue);
+        storedSecrets.push(normalized);
+      }
+    }
+  }
+  for (const extra of parsed.extraSecrets) {
+    const normalized = normalizeSecretName(extra.secretName);
+    if (normalized && extra.secretValue) {
+      setProviderSecret(normalized, extra.secretValue);
+      storedSecrets.push(normalized);
+    }
+  }
+
+  const connectionTests: Partial<
+    Record<LLMProvider, { ok: boolean; status: number; message: string }>
+  > = {};
+
+  if (testConnections) {
+    for (const patch of parsed.providerPatches) {
+      try {
+        const check = await runSingleProviderConnectionCheck({
+          provider: patch.provider,
+          secretName: patch.secretName || updatedSettings.providers[patch.provider]?.envVarName,
+          baseUrl: updatedSettings.providers[patch.provider]?.baseUrl,
+          model: updatedSettings.providers[patch.provider]?.defaultModel,
+          language,
+        });
+        connectionTests[patch.provider] = {
+          ok: check.ok,
+          status: check.status,
+          message: check.message,
+        };
+      } catch (err) {
+        connectionTests[patch.provider] = {
+          ok: false,
+          status: 500,
+          message: err instanceof Error ? err.message : 'Connection test failed',
+        };
+      }
+    }
+  }
+
+  res.json({
+    ok: true,
+    detectedFormat: parsed.detectedFormat,
+    warnings: parsed.warnings,
+    appliedProviders: parsed.providerPatches.map((p) => ({
+      provider: p.provider,
+      modelsAdded: p.modelsToAdd.length,
+      baseUrlUpdated: Boolean(p.baseUrl),
+      defaultModelUpdated: Boolean(p.defaultModel),
+      secretStored: Boolean(p.secretName && p.secretValue),
+      credentialLabel: p.credentialLabel,
+    })),
+    storedSecrets: Array.from(new Set(storedSecrets)),
+    connectionTests,
+    settings: updatedSettings,
+    capabilities: buildCapabilitiesPayload(),
+  });
 });
 
 app.get('/api/opencode/free-models', async (req, res) => {

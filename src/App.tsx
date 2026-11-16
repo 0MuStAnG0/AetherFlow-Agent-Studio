@@ -2750,6 +2750,7 @@ export default function App() {
             currentUser={authStatus?.user ?? null}
             onOpenProfile={() => setIsProfileModalOpen(true)}
             onCapabilitiesUpdated={setCapabilities}
+            onSettingsSynced={(next) => setAppSettings(next)}
             onSaveSettings={handleSaveSettings}
           />
         )}

@@ -12,6 +12,7 @@ import {
   normalizeSecretName,
   parseGeminiBaseUrl,
 } from '../src/utils/secretUtils.ts';
+import { parseGoogleJsonCredential } from '../src/utils/providerJsonSync.ts';
 import {
   buildCompactSystemPrompt,
   compactConversationHistory,
@@ -106,6 +107,43 @@ export function getAiClient(
     settings.providers.gemini?.baseUrl?.trim() ||
     process.env.GOOGLE_GEMINI_BASE_URL?.trim() ||
     '';
+
+  const googleJsonCred = parseGoogleJsonCredential(resolved);
+  if (googleJsonCred) {
+    const regionMatch = rawBase.match(/^https?:\/\/([a-z0-9-]+)-aiplatform\.googleapis\.com/i);
+    const location = regionMatch?.[1] || googleJsonCred.location || 'us-central1';
+    const isStandardGoogleHost =
+      !rawBase ||
+      /^https?:\/\/(generativelanguage|([a-z0-9-]+-)?aiplatform)\.googleapis\.com/i.test(rawBase);
+    const parsedProxyBase = isStandardGoogleHost ? {} : parseGeminiBaseUrl(rawBase);
+
+    const httpOptions: {
+      baseUrl?: string;
+      apiVersion?: string;
+      headers: Record<string, string>;
+    } = {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    };
+    if (parsedProxyBase.baseUrl) {
+      httpOptions.baseUrl = parsedProxyBase.baseUrl;
+    }
+    if (options?.apiVersion || parsedProxyBase.apiVersion) {
+      httpOptions.apiVersion = options?.apiVersion || parsedProxyBase.apiVersion;
+    }
+
+    return new GoogleGenAI({
+      vertexai: true,
+      ...(googleJsonCred.projectId ? { project: googleJsonCred.projectId } : {}),
+      location,
+      googleAuthOptions: {
+        credentials: JSON.parse(googleJsonCred.compactedJson) as Record<string, unknown>,
+      },
+      httpOptions,
+    });
+  }
+
   const parsedBase = options?.vertexai ? {} : parseGeminiBaseUrl(rawBase);
 
   const httpOptions: {

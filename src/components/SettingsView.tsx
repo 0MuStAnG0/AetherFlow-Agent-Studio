@@ -12,6 +12,7 @@ import {
   RotateCcw,
   ShieldCheck,
   Trash2,
+  Upload,
   X,
   Zap,
 } from 'lucide-react';
@@ -33,6 +34,7 @@ import {
 } from '../utils/catalogUtils';
 import { normalizeSecretName } from '../utils/secretUtils';
 import { DEFAULT_APP_SETTINGS } from '../utils/workflowEngine';
+import { ProviderJsonSyncPanel } from './ProviderJsonSyncPanel';
 
 interface SettingsViewProps {
   settings: AppSettings;
@@ -40,6 +42,7 @@ interface SettingsViewProps {
   currentUser?: UserProfile | null;
   onOpenProfile?: () => void;
   onCapabilitiesUpdated?: (next: CapabilitiesState) => void;
+  onSettingsSynced?: (next: AppSettings) => void;
   onSaveSettings: (next: AppSettings) => Promise<void>;
 }
 
@@ -88,6 +91,7 @@ export function SettingsView({
   currentUser,
   onOpenProfile,
   onCapabilitiesUpdated,
+  onSettingsSynced,
   onSaveSettings,
 }: SettingsViewProps) {
   const [draft, setDraft] = useState<AppSettings>(settings);
@@ -149,6 +153,7 @@ export function SettingsView({
   const [openCodeSyncMessage, setOpenCodeSyncMessage] = useState<string | null>(null);
   const [showGeminiProxyGuide, setShowGeminiProxyGuide] = useState(false);
   const [copiedWorkerSnippet, setCopiedWorkerSnippet] = useState(false);
+  const [showJsonSyncPanel, setShowJsonSyncPanel] = useState(false);
 
   const CLOUDFLARE_WORKER_RELAY = `export default {
   async fetch(request) {
@@ -285,6 +290,68 @@ export function SettingsView({
       setKeyFeedback((prev) => ({
         ...prev,
         [provider]: { ok: false, text: 'Failed to remove key.' },
+      }));
+    } finally {
+      setKeyBusy((prev) => ({ ...prev, [provider]: false }));
+    }
+  };
+
+  const handleQuickProviderJsonFile = async (provider: LLMProvider, file?: File) => {
+    if (!file) return;
+    setKeyBusy((prev) => ({ ...prev, [provider]: true }));
+    try {
+      const rawJson = await file.text();
+      const res = await fetch('/api/providers/json-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rawJson,
+          targetProvider: provider,
+          testConnections: false,
+          language: draft.language,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        detectedFormat?: string;
+        settings?: AppSettings;
+        capabilities?: CapabilitiesState;
+      };
+      if (!res.ok || !data.ok || !data.settings || !data.capabilities) {
+        setKeyFeedback((prev) => ({
+          ...prev,
+          [provider]: {
+            ok: false,
+            text: data.error || (isFa ? 'فایل JSON نامعتبر است.' : 'Invalid provider JSON file.'),
+          },
+        }));
+        return;
+      }
+      const nextSettings: AppSettings = {
+        ...draft,
+        providers: data.settings.providers,
+        updatedAt: data.settings.updatedAt,
+      };
+      setDraft(nextSettings);
+      onSettingsSynced?.(nextSettings);
+      onCapabilitiesUpdated?.(data.capabilities);
+      setKeyFeedback((prev) => ({
+        ...prev,
+        [provider]: {
+          ok: true,
+          text: isFa
+            ? `فایل JSON (${data.detectedFormat ?? 'json'}) با موفقیت سینک و متصل شد.`
+            : `Synced & connected ${file.name} (${data.detectedFormat ?? 'json'}).`,
+        },
+      }));
+    } catch {
+      setKeyFeedback((prev) => ({
+        ...prev,
+        [provider]: {
+          ok: false,
+          text: isFa ? 'خطا در خواندن یا ارسال فایل JSON.' : 'Failed to import JSON file.',
+        },
       }));
     } finally {
       setKeyBusy((prev) => ({ ...prev, [provider]: false }));
@@ -577,6 +644,23 @@ export function SettingsView({
             {t.sectionProvidersDesc}
           </p>
 
+          <ProviderJsonSyncPanel
+            isOpen={showJsonSyncPanel}
+            onToggleOpen={() => setShowJsonSyncPanel((prev) => !prev)}
+            isFa={isFa}
+            providers={draft.providers}
+            onSynced={({ settings: syncedSettings, capabilities: nextCaps }) => {
+              const merged: AppSettings = {
+                ...draft,
+                providers: syncedSettings.providers,
+                updatedAt: syncedSettings.updatedAt,
+              };
+              setDraft(merged);
+              onSettingsSynced?.(merged);
+              onCapabilitiesUpdated?.(nextCaps);
+            }}
+          />
+
           <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
             {PROVIDER_ORDER.map((provider) => {
               const meta = PROVIDER_MODELS[provider];
@@ -612,7 +696,7 @@ export function SettingsView({
                   <div className="mt-3 space-y-3" dir="ltr">
                     {/* API Key Input & Actions */}
                     <div className="rounded-md border border-slate-200 bg-white p-2.5 dark:border-slate-800 dark:bg-slate-900">
-                      <div className="flex items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
                         <label
                           htmlFor={`api-key-input-${provider}`}
                           className="flex items-center gap-1.5 text-xs font-semibold text-slate-800 dark:text-slate-200"
@@ -622,17 +706,39 @@ export function SettingsView({
                             API Key (<span className="font-mono">{secretName}</span>)
                           </span>
                         </label>
-                        {secretStatus?.source === 'vault' && (
-                          <button
-                            type="button"
-                            data-testid={`delete-api-key-${provider}`}
-                            disabled={keyBusy[provider]}
-                            onClick={() => void handleDeleteProviderKey(provider)}
-                            className="text-[11px] font-medium text-red-600 hover:underline dark:text-red-400"
+                        <div className="flex items-center gap-2">
+                          <label
+                            htmlFor={`quick-json-upload-${provider}`}
+                            data-testid={`import-provider-json-${provider}`}
+                            className="inline-flex cursor-pointer items-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800"
                           >
-                            Clear Vault Key
-                          </button>
-                        )}
+                            <Upload className="h-3 w-3 text-blue-600" />
+                            <span>Import .json</span>
+                            <input
+                              id={`quick-json-upload-${provider}`}
+                              type="file"
+                              accept=".json,application/json"
+                              disabled={keyBusy[provider]}
+                              className="sr-only"
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                void handleQuickProviderJsonFile(provider, f);
+                                e.target.value = '';
+                              }}
+                            />
+                          </label>
+                          {secretStatus?.source === 'vault' && (
+                            <button
+                              type="button"
+                              data-testid={`delete-api-key-${provider}`}
+                              disabled={keyBusy[provider]}
+                              onClick={() => void handleDeleteProviderKey(provider)}
+                              className="text-[11px] font-medium text-red-600 hover:underline dark:text-red-400"
+                            >
+                              Clear Vault Key
+                            </button>
+                          )}
+                        </div>
                       </div>
 
                       <div className="mt-1.5 flex items-center gap-1.5">
