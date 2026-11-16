@@ -16,6 +16,7 @@ import type {
   NginxSslMode,
   PrelaunchTestReport,
   ProviderSecretStatus,
+  RunChangeReport,
   UserProfile,
   UserRole,
   WorkflowConfig,
@@ -155,6 +156,17 @@ export function getDb(): DatabaseSync {
       updated_at TEXT NOT NULL
     );
   `);
+
+  const runCols = dbInstance
+    .prepare('PRAGMA table_info(execution_runs)')
+    .all() as Array<{ name: string }>;
+  const runColNames = new Set(runCols.map((c) => c.name));
+  if (!runColNames.has('chat_language')) {
+    dbInstance.exec('ALTER TABLE execution_runs ADD COLUMN chat_language TEXT;');
+  }
+  if (!runColNames.has('change_report_json')) {
+    dbInstance.exec('ALTER TABLE execution_runs ADD COLUMN change_report_json TEXT;');
+  }
 
   const countRow = dbInstance.prepare('SELECT COUNT(*) AS cnt FROM workflows').get() as { cnt: number };
   if (countRow.cnt === 0) {
@@ -350,13 +362,16 @@ export function createRunRecord(params: {
   taskPrompt: string;
   mode: 'live' | 'dry_run';
   maxRounds: number;
+  chatLanguage?: 'en' | 'fa';
 }): void {
   const db = getDb();
   const createdAt = new Date().toISOString();
+  const detectedLang: 'en' | 'fa' =
+    params.chatLanguage ?? (/[\u0600-\u06FF]/.test(params.taskPrompt) ? 'fa' : 'en');
   db.prepare(
     `
-    INSERT INTO execution_runs (id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, events_json, created_at)
-    VALUES (?, ?, ?, ?, ?, 'running', 0, ?, '[]', ?)
+    INSERT INTO execution_runs (id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, events_json, chat_language, created_at)
+    VALUES (?, ?, ?, ?, ?, 'running', 0, ?, '[]', ?, ?)
   `,
   ).run(
     params.id,
@@ -365,6 +380,7 @@ export function createRunRecord(params: {
     params.taskPrompt,
     params.mode,
     params.maxRounds,
+    detectedLang,
     createdAt,
   );
 }
@@ -375,22 +391,41 @@ export function updateRunRecord(params: {
   roundsExecuted: number;
   events: ExecutionEvent[];
   completed?: boolean;
+  chatLanguage?: 'en' | 'fa';
+  changeReport?: RunChangeReport;
 }): void {
   const db = getDb();
   const completedAt = params.completed ? new Date().toISOString() : null;
+  const reportJson = params.changeReport ? JSON.stringify(params.changeReport) : null;
   db.prepare(
     `
     UPDATE execution_runs
-    SET status = ?, rounds_executed = ?, events_json = ?, completed_at = COALESCE(?, completed_at)
+    SET status = ?,
+        rounds_executed = ?,
+        events_json = ?,
+        chat_language = COALESCE(?, chat_language),
+        change_report_json = COALESCE(?, change_report_json),
+        completed_at = COALESCE(?, completed_at)
     WHERE id = ?
   `,
   ).run(
     params.status,
     params.roundsExecuted,
     JSON.stringify(params.events),
+    params.chatLanguage ?? null,
+    reportJson,
     completedAt,
     params.id,
   );
+}
+
+function parseChangeReportSafe(raw: string | null): RunChangeReport | undefined {
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as RunChangeReport;
+  } catch {
+    return undefined;
+  }
 }
 
 export function listRunSummaries(limit = 20): ExecutionRunSummary[] {
@@ -398,7 +433,7 @@ export function listRunSummaries(limit = 20): ExecutionRunSummary[] {
   const rows = db
     .prepare(
       `
-      SELECT id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, created_at, completed_at
+      SELECT id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, chat_language, change_report_json, created_at, completed_at
       FROM execution_runs
       ORDER BY created_at DESC
       LIMIT ?
@@ -413,6 +448,8 @@ export function listRunSummaries(limit = 20): ExecutionRunSummary[] {
     status: ExecutionRunSummary['status'];
     rounds_executed: number;
     max_rounds: number;
+    chat_language: string | null;
+    change_report_json: string | null;
     created_at: string;
     completed_at: string | null;
   }>;
@@ -422,6 +459,13 @@ export function listRunSummaries(limit = 20): ExecutionRunSummary[] {
       row.completed_at && row.created_at
         ? Math.max(0, new Date(row.completed_at).getTime() - new Date(row.created_at).getTime())
         : undefined;
+    const chatLanguage: 'en' | 'fa' | undefined =
+      row.chat_language === 'fa' || row.chat_language === 'en'
+        ? row.chat_language
+        : /[\u0600-\u06FF]/.test(row.task_prompt)
+          ? 'fa'
+          : 'en';
+    const changeReport = parseChangeReportSafe(row.change_report_json);
     return {
       id: row.id,
       workflowId: row.workflow_id,
@@ -432,6 +476,8 @@ export function listRunSummaries(limit = 20): ExecutionRunSummary[] {
       roundsExecuted: row.rounds_executed,
       maxRounds: row.max_rounds,
       durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
+      chatLanguage,
+      ...(changeReport ? { changeReport } : {}),
       createdAt: row.created_at,
       completedAt: row.completed_at ?? undefined,
     };
@@ -452,7 +498,7 @@ export function getRunSummaryById(runId: string): ExecutionRunSummary | null {
   const row = db
     .prepare(
       `
-      SELECT id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, created_at, completed_at
+      SELECT id, workflow_id, workflow_name, task_prompt, mode, status, rounds_executed, max_rounds, chat_language, change_report_json, created_at, completed_at
       FROM execution_runs
       WHERE id = ?
     `,
@@ -467,6 +513,8 @@ export function getRunSummaryById(runId: string): ExecutionRunSummary | null {
         status: ExecutionRunSummary['status'];
         rounds_executed: number;
         max_rounds: number;
+        chat_language: string | null;
+        change_report_json: string | null;
         created_at: string;
         completed_at: string | null;
       }
@@ -476,6 +524,13 @@ export function getRunSummaryById(runId: string): ExecutionRunSummary | null {
     row.completed_at && row.created_at
       ? Math.max(0, new Date(row.completed_at).getTime() - new Date(row.created_at).getTime())
       : undefined;
+  const chatLanguage: 'en' | 'fa' | undefined =
+    row.chat_language === 'fa' || row.chat_language === 'en'
+      ? row.chat_language
+      : /[\u0600-\u06FF]/.test(row.task_prompt)
+        ? 'fa'
+        : 'en';
+  const changeReport = parseChangeReportSafe(row.change_report_json);
   return {
     id: row.id,
     workflowId: row.workflow_id,
@@ -486,6 +541,8 @@ export function getRunSummaryById(runId: string): ExecutionRunSummary | null {
     roundsExecuted: row.rounds_executed,
     maxRounds: row.max_rounds,
     durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
+    chatLanguage,
+    ...(changeReport ? { changeReport } : {}),
     createdAt: row.created_at,
     completedAt: row.completed_at ?? undefined,
   };
@@ -493,6 +550,7 @@ export function getRunSummaryById(runId: string): ExecutionRunSummary | null {
 
 export function deleteRunRecord(runId: string): boolean {
   const db = getDb();
+  db.prepare('DELETE FROM bug_reports WHERE run_id = ?').run(runId);
   const res = db.prepare('DELETE FROM execution_runs WHERE id = ?').run(runId);
   return Number(res.changes) > 0;
 }
@@ -563,6 +621,9 @@ export function listRecentWorkflowRunsWithSummary(
 
 export function clearWorkflowRunsMemory(workflowId: string): number {
   const db = getDb();
+  db.prepare(
+    "DELETE FROM bug_reports WHERE run_id IN (SELECT id FROM execution_runs WHERE workflow_id = ? AND status IN ('completed', 'failed', 'cancelled'))",
+  ).run(workflowId);
   const res = db
     .prepare("DELETE FROM execution_runs WHERE workflow_id = ? AND status IN ('completed', 'failed', 'cancelled')")
     .run(workflowId);

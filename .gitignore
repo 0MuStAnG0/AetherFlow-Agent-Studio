@@ -9,4 +9,9 @@ coverage/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/projects/
+data/projects_originals/
+data/projects_archives/
+data/.master_key
 .playwright-cli/
+*.zip

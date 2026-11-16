@@ -39,7 +39,7 @@ export interface GitHubPushRequestValidation {
   error?: string;
 }
 
-const FORBIDDEN_EXPORT_PATHS = /(^|\/)(\.env(\..+)?|.*\.db|.*\.sqlite.*|node_modules|dist|\.git|\.playwright-cli)(\/|$)/i;
+const FORBIDDEN_EXPORT_PATHS = /(^|\/)(\.env(\..+)?|.*\.db|.*\.sqlite.*|.*\.zip|node_modules|dist|\.git|\.playwright-cli)(\/|$)/i;
 const CHANGELOG_START = '<!-- aetherflow-changelog:start -->';
 const CHANGELOG_END = '<!-- aetherflow-changelog:end -->';
 const CHANGELOG_BLOCK_REGEX = /\n*<!-- aetherflow-changelog:start -->[\s\S]*?<!-- aetherflow-changelog:end -->\n*/g;

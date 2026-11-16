@@ -72,6 +72,7 @@ import type {
   LLMProvider,
   NginxSslMode,
   RecommendedAgentSpec,
+  RunChangeReport,
   SandboxFile,
   TokenUsage,
   ToolCallLog,
@@ -114,6 +115,7 @@ import {
 } from './src/utils/exportBundle.ts';
 import { createZipBufferFromBundle } from './server/zipBundle.ts';
 import { buildProjectDiffEntries } from './src/utils/diffUtils.ts';
+import { buildRunChangeReport, detectConversationLanguage } from './src/utils/runReportUtils.ts';
 import { compactSandboxOutput, truncateMiddle } from './src/utils/promptOptimizer.ts';
 import {
   buildManagerInspectionContext,
@@ -182,8 +184,12 @@ import {
 const execAsync = promisify(exec);
 const PORT = Number(process.env.PORT || 3000);
 const SANDBOX_BASE = path.resolve('/tmp/aetherflow_sandboxes');
-const PROJECTS_BASE = path.resolve('/tmp/aetherflow_projects');
-const PROJECTS_ORIGINALS_BASE = path.resolve('/tmp/aetherflow_projects_originals');
+const PROJECTS_BASE = path.resolve(process.cwd(), 'data', 'projects');
+const PROJECTS_ORIGINALS_BASE = path.resolve(process.cwd(), 'data', 'projects_originals');
+const PROJECTS_ARCHIVES_BASE = path.resolve(process.cwd(), 'data', 'projects_archives');
+const LEGACY_PROJECTS_BASE = path.resolve('/tmp/aetherflow_projects');
+const LEGACY_PROJECTS_ORIGINALS_BASE = path.resolve('/tmp/aetherflow_projects_originals');
+const runBaselineSnapshots = new Map<string, Array<{ path: string; content: string }>>();
 
 // Initialize SQLite database on boot and wire persistent user sessions
 getDb();
@@ -365,6 +371,11 @@ function safeSandboxPath(runDir: string, relPath: string): string {
   return safeResolveSandboxPath(runDir, relPath);
 }
 
+function isProbablyBinaryBuffer(buf: Buffer): boolean {
+  const sample = buf.subarray(0, 1024);
+  return sample.includes(0);
+}
+
 function listSandboxFiles(runId: string): SandboxFile[] {
   const runDir = getSandboxDir(runId);
   const files: SandboxFile[] = [];
@@ -374,15 +385,23 @@ function listSandboxFiles(runId: string): SandboxFile[] {
     for (const entry of entries) {
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === '.git') continue;
         walk(fullPath);
       } else if (entry.isFile()) {
-        const stat = fs.statSync(fullPath);
-        files.push({
-          path: path.relative(runDir, fullPath).replace(/\\/g, '/'),
-          content: fs.readFileSync(fullPath, 'utf-8'),
-          size: stat.size,
-          updatedAt: stat.mtime.toISOString(),
-        });
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > 1024 * 1024) continue;
+          const raw = fs.readFileSync(fullPath);
+          if (isProbablyBinaryBuffer(raw)) continue;
+          files.push({
+            path: path.relative(runDir, fullPath).replace(/\\/g, '/'),
+            content: raw.toString('utf-8'),
+            size: stat.size,
+            updatedAt: stat.mtime.toISOString(),
+          });
+        } catch {
+          // ignore unreadable file
+        }
       }
     }
   }
@@ -391,8 +410,38 @@ function listSandboxFiles(runId: string): SandboxFile[] {
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
+function copyDirTreeRecursive(srcDir: string, destDir: string): void {
+  if (!fs.existsSync(srcDir)) return;
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const src = path.join(srcDir, entry.name);
+    const dest = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirTreeRecursive(src, dest);
+    } else if (entry.isFile()) {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(src, dest);
+    }
+  }
+}
+
+function migrateLegacyProjectIfNeeded(safeId: string): void {
+  if (!safeId) return;
+  const persistentDir = path.join(PROJECTS_BASE, safeId);
+  const legacyDir = path.join(LEGACY_PROJECTS_BASE, safeId);
+  if (!fs.existsSync(persistentDir) && fs.existsSync(legacyDir)) {
+    copyDirTreeRecursive(legacyDir, persistentDir);
+  }
+  const persistentOrig = path.join(PROJECTS_ORIGINALS_BASE, safeId);
+  const legacyOrig = path.join(LEGACY_PROJECTS_ORIGINALS_BASE, safeId);
+  if (!fs.existsSync(persistentOrig) && fs.existsSync(legacyOrig)) {
+    copyDirTreeRecursive(legacyOrig, persistentOrig);
+  }
+}
+
 function getProjectDir(projectId: string): string {
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  migrateLegacyProjectIfNeeded(safeId);
   const dir = path.join(PROJECTS_BASE, safeId);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
@@ -400,14 +449,22 @@ function getProjectDir(projectId: string): string {
 
 function getProjectOriginalsDir(projectId: string): string {
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  migrateLegacyProjectIfNeeded(safeId);
   const dir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
+function getProjectArchivePath(projectId: string): string {
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  fs.mkdirSync(PROJECTS_ARCHIVES_BASE, { recursive: true });
+  return path.join(PROJECTS_ARCHIVES_BASE, `${safeId}.zip`);
+}
+
 function ensureProjectOriginalsSnapshot(projectId: string): void {
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
   if (!safeId) return;
+  migrateLegacyProjectIfNeeded(safeId);
   const projDir = path.join(PROJECTS_BASE, safeId);
   const origDir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
   if (!fs.existsSync(projDir) || fs.existsSync(origDir)) return;
@@ -434,11 +491,19 @@ function extractProjectFilesFromZip(
   zipBuffer: Buffer,
   projectId: string,
   forceStripCommonRoot?: boolean,
-): ScannedProjectFile[] {
+): { files: ScannedProjectFile[]; totalStoredFiles: number } {
   const zip = new AdmZip(zipBuffer);
   const rawEntries = zip.getEntries().filter((e) => !e.isDirectory);
   if (rawEntries.length === 0) {
     throw new Error('The ZIP archive contains no readable files.');
+  }
+
+  // Persist raw archive offline on server for full offline recovery
+  try {
+    const archivePath = getProjectArchivePath(projectId);
+    fs.writeFileSync(archivePath, zipBuffer);
+  } catch {
+    // Non-fatal if archive mirror cannot be written
   }
 
   // Detect whether all entries live inside a single top-level folder (like GitHub zipballs)
@@ -458,43 +523,50 @@ function extractProjectFilesFromZip(
   const projectDir = getProjectDir(projectId);
   const originalsDir = getProjectOriginalsDir(projectId);
   const scanned: ScannedProjectFile[] = [];
+  let totalStoredFiles = 0;
 
   for (const entry of rawEntries) {
-    if (scanned.length >= 400) break;
-    const relPath = sanitizeArchiveEntryPath(entry.entryName, stripRoot);
-    if (!relPath) continue;
+    const relPath = sanitizeArchiveEntryPath(entry.entryName, stripRoot, true);
+    if (!relPath || !isSafeExportFilePath(relPath)) continue;
 
     const rawBuf = entry.getData();
-    // Skip very large files or binary NUL buffers
-    if (rawBuf.length > 512 * 1024) continue;
-    if (rawBuf.subarray(0, 512).includes(0)) continue;
+    // Allow storing full source files & assets up to 10 MB per file completely offline
+    if (rawBuf.length > 10 * 1024 * 1024) continue;
 
-    const text = rawBuf.toString('utf-8');
     const target = safeSandboxPath(projectDir, relPath);
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, text, 'utf-8');
+    fs.writeFileSync(target, rawBuf);
 
     const origTarget = safeSandboxPath(originalsDir, relPath);
     fs.mkdirSync(path.dirname(origTarget), { recursive: true });
-    fs.writeFileSync(origTarget, text, 'utf-8');
+    fs.writeFileSync(origTarget, rawBuf);
 
-    scanned.push({
-      path: relPath,
-      content: text.slice(0, 12000),
-      size: rawBuf.length,
-    });
+    totalStoredFiles += 1;
+
+    if (rawBuf.length <= 1024 * 1024 && !isProbablyBinaryBuffer(rawBuf) && scanned.length < 2000) {
+      const text = rawBuf.toString('utf-8');
+      scanned.push({
+        path: relPath,
+        content: text.slice(0, 12000),
+        size: rawBuf.length,
+      });
+    }
   }
 
-  if (scanned.length === 0) {
-    throw new Error('No readable source or configuration files were found in the archive.');
+  if (totalStoredFiles === 0) {
+    throw new Error('No readable files were found in the archive.');
   }
 
-  return scanned.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    files: scanned.sort((a, b) => a.path.localeCompare(b.path)),
+    totalStoredFiles,
+  };
 }
 
 function seedSandboxFromProject(runId: string, projectId?: string): void {
   if (!projectId) return;
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  migrateLegacyProjectIfNeeded(safeId);
   const srcDir = path.join(PROJECTS_BASE, safeId);
   if (!fs.existsSync(srcDir)) return;
   ensureProjectOriginalsSnapshot(safeId);
@@ -504,9 +576,9 @@ function seedSandboxFromProject(runId: string, projectId?: string): void {
 
   let copied = 0;
   function walkCopy(curr: string) {
-    if (copied >= 400) return;
+    if (copied >= 5000) return;
     for (const entry of fs.readdirSync(curr, { withFileTypes: true })) {
-      if (copied >= 400) return;
+      if (copied >= 5000) return;
       const full = path.join(curr, entry.name);
       const rel = path.relative(srcDir, full).replace(/\\/g, '/');
       if (!isSafeExportFilePath(rel)) continue;
@@ -522,6 +594,82 @@ function seedSandboxFromProject(runId: string, projectId?: string): void {
     }
   }
   walkCopy(srcDir);
+}
+
+function captureRunBaseline(runId: string, projectId?: string): void {
+  if (runBaselineSnapshots.has(runId)) return;
+  const existing = listSandboxFilesReadOnly(runId);
+  if (existing.length > 0) {
+    runBaselineSnapshots.set(
+      runId,
+      existing.map((f) => ({ path: f.path, content: f.content })),
+    );
+    return;
+  }
+  if (projectId) {
+    const projectFiles = listImportedProjectFilesFromDisk(projectId, false);
+    runBaselineSnapshots.set(
+      runId,
+      projectFiles.map((f) => ({ path: f.path, content: f.content })),
+    );
+    return;
+  }
+  runBaselineSnapshots.set(runId, []);
+}
+
+function computeDiffsForRun(runId: string, workflow?: WorkflowConfig | null) {
+  const current = listSandboxFilesReadOnly(runId);
+  const baseline = runBaselineSnapshots.get(runId);
+  if (baseline) {
+    return buildProjectDiffEntries({ originals: baseline, current });
+  }
+  const originals = workflow?.projectContext?.projectId
+    ? listImportedProjectFilesFromDisk(workflow.projectContext.projectId, true)
+    : [];
+  return buildProjectDiffEntries({ originals, current });
+}
+
+function finalizeRunWithReport(params: {
+  runId: string;
+  workflow: WorkflowConfig;
+  workflowNameOverride?: string;
+  taskPrompt: string;
+  status: 'completed' | 'failed' | 'cancelled';
+  roundsExecuted: number;
+  events: ExecutionEvent[];
+}): RunChangeReport {
+  const { runId, workflow, workflowNameOverride, taskPrompt, status, roundsExecuted, events } = params;
+  const summary = getRunSummaryById(runId);
+  const createdMs = summary?.createdAt ? new Date(summary.createdAt).getTime() : NaN;
+  const durationMs = Number.isFinite(createdMs) ? Math.max(0, Date.now() - createdMs) : summary?.durationMs;
+  const diffs = computeDiffsForRun(runId, workflow);
+  const bugReports = listBugReports({ runId });
+  const fallbackLanguage = getAppSettings().language;
+  const changeReport = buildRunChangeReport({
+    runId,
+    workflowName: workflowNameOverride || summary?.workflowName || workflow.name,
+    taskPrompt: summary?.taskPrompt || taskPrompt,
+    status,
+    roundsExecuted,
+    durationMs,
+    events,
+    diffs,
+    bugReports,
+    fallbackLanguage,
+  });
+
+  updateRunRecord({
+    id: runId,
+    status,
+    roundsExecuted,
+    events,
+    completed: true,
+    chatLanguage: changeReport.language,
+    changeReport,
+  });
+
+  runBaselineSnapshots.delete(runId);
+  return changeReport;
 }
 
 function syncWriteToImportedProject(
@@ -1296,15 +1444,46 @@ async function processAgentTools(params: {
     }
     for (const relPath of reads) {
       try {
-        const target = safeSandboxPath(runDir, relPath);
-        const content = fs.readFileSync(target, 'utf-8');
-        logs.push({
-          id: crypto.randomUUID(),
-          tool: 'read_file',
-          target: relPath,
-          result: content.slice(0, 1200),
-          exitCode: 0,
-        });
+        let target: string | null = null;
+        try {
+          const candidate = safeSandboxPath(runDir, relPath);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+            target = candidate;
+          }
+        } catch {
+          // check offline project fallback below
+        }
+        if (!target && workflow.projectContext?.projectId) {
+          const safeProjId = workflow.projectContext.projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+          if (safeProjId) {
+            const projTarget = safeSandboxPath(getProjectDir(safeProjId), relPath);
+            if (fs.existsSync(projTarget) && fs.statSync(projTarget).isFile()) {
+              target = projTarget;
+            }
+          }
+        }
+        if (!target) {
+          throw new Error(`File not found: ${relPath}`);
+        }
+        const raw = fs.readFileSync(target);
+        if (isProbablyBinaryBuffer(raw)) {
+          logs.push({
+            id: crypto.randomUUID(),
+            tool: 'read_file',
+            target: relPath,
+            result: `[Binary file ${relPath}, ${raw.length} bytes]`,
+            exitCode: 0,
+          });
+        } else {
+          const content = raw.toString('utf-8');
+          logs.push({
+            id: crypto.randomUUID(),
+            tool: 'read_file',
+            target: relPath,
+            result: content.slice(0, 6000),
+            exitCode: 0,
+          });
+        }
       } catch (err) {
         logs.push({
           id: crypto.randomUUID(),
@@ -1502,6 +1681,7 @@ async function executeWorkflowRun(params: {
   runAbortControllers.set(runId, abortController);
 
   seedSandboxFromProject(runId, workflow.projectContext?.projectId);
+  captureRunBaseline(runId, workflow.projectContext?.projectId);
 
   if (mode === 'live' && !canWorkflowRunLive(ordered, bootSettings)) {
     const errEvt: ExecutionEvent = {
@@ -1514,12 +1694,13 @@ async function executeWorkflowRun(params: {
       timestamp: new Date().toISOString(),
     };
     broadcastEvent(runId, errEvt);
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt,
       status: 'failed',
       roundsExecuted: 0,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
     runAbortControllers.delete(runId);
     return;
@@ -1964,12 +2145,13 @@ async function executeWorkflowRun(params: {
           timestamp: new Date().toISOString(),
         });
       }
-      updateRunRecord({
-        id: runId,
+      finalizeRunWithReport({
+        runId,
+        workflow,
+        taskPrompt,
         status: 'cancelled',
         roundsExecuted,
         events: runEventBuffers.get(runId) ?? [],
-        completed: true,
       });
       return;
     }
@@ -2077,12 +2259,13 @@ async function executeWorkflowRun(params: {
       timestamp: new Date().toISOString(),
     });
 
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt,
       status: 'completed',
       roundsExecuted,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
   } catch (err) {
     if (abortController.signal.aborted) {
@@ -2097,12 +2280,13 @@ async function executeWorkflowRun(params: {
           timestamp: new Date().toISOString(),
         });
       }
-      updateRunRecord({
-        id: runId,
+      finalizeRunWithReport({
+        runId,
+        workflow,
+        taskPrompt,
         status: 'cancelled',
         roundsExecuted,
         events: runEventBuffers.get(runId) ?? [],
-        completed: true,
       });
       return;
     }
@@ -2117,12 +2301,13 @@ async function executeWorkflowRun(params: {
       content: `Agent execution error: ${message}`,
       timestamp: new Date().toISOString(),
     });
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt,
       status: 'failed',
       roundsExecuted,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
   } finally {
     runAbortControllers.delete(runId);
@@ -3253,6 +3438,155 @@ app.get('/api/projects/:id', (req, res) => {
   res.json(proj);
 });
 
+function listAllProjectFilesMetaFromDisk(projectId: string): {
+  files: Array<{ path: string; size: number; isBinary: boolean; updatedAt: string }>;
+  totalBytes: number;
+  hasSourceZip: boolean;
+  storageDir: string;
+} {
+  const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) {
+    return { files: [], totalBytes: 0, hasSourceZip: false, storageDir: '' };
+  }
+  migrateLegacyProjectIfNeeded(safeId);
+  const dir = path.join(PROJECTS_BASE, safeId);
+  const archivePath = getProjectArchivePath(safeId);
+  const hasSourceZip = fs.existsSync(archivePath);
+  const storageDir = `data/projects/${safeId}`;
+  if (!fs.existsSync(dir)) {
+    return { files: [], totalBytes: 0, hasSourceZip, storageDir };
+  }
+
+  const files: Array<{ path: string; size: number; isBinary: boolean; updatedAt: string }> = [];
+  let totalBytes = 0;
+
+  function walk(curr: string) {
+    for (const entry of fs.readdirSync(curr, { withFileTypes: true })) {
+      const full = path.join(curr, entry.name);
+      const rel = path.relative(dir, full).replace(/\\/g, '/');
+      if (!isSafeExportFilePath(rel)) continue;
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        try {
+          const stat = fs.statSync(full);
+          const fd = fs.openSync(full, 'r');
+          const probe = Buffer.alloc(Math.min(1024, stat.size));
+          if (probe.length > 0) {
+            fs.readSync(fd, probe, 0, probe.length, 0);
+          }
+          fs.closeSync(fd);
+          const isBinary = probe.includes(0);
+          totalBytes += stat.size;
+          files.push({
+            path: rel,
+            size: stat.size,
+            isBinary,
+            updatedAt: stat.mtime.toISOString(),
+          });
+        } catch {
+          // ignore unreadable entry
+        }
+      }
+    }
+  }
+
+  walk(dir);
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return { files, totalBytes, hasSourceZip, storageDir };
+}
+
+app.get('/api/projects/:id/files', (req, res) => {
+  const proj = getImportedProjectById(req.params.id);
+  const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
+  const projDir = safeId ? path.join(PROJECTS_BASE, safeId) : '';
+  if (!proj && (!projDir || !fs.existsSync(projDir))) {
+    res.status(404).json({ error: 'Imported project not found' });
+    return;
+  }
+  const meta = listAllProjectFilesMetaFromDisk(req.params.id);
+  res.json({
+    projectId: req.params.id,
+    storageDir: meta.storageDir,
+    hasSourceZip: meta.hasSourceZip,
+    totalFiles: meta.files.length,
+    totalBytes: meta.totalBytes,
+    files: meta.files,
+  });
+});
+
+app.get('/api/projects/:id/file', (req, res) => {
+  const relPath = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+  if (!relPath || !isSafeExportFilePath(relPath)) {
+    res.status(400).json({ error: 'Valid file path query parameter is required.' });
+    return;
+  }
+  const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) {
+    res.status(400).json({ error: 'Invalid project ID.' });
+    return;
+  }
+  const projDir = getProjectDir(safeId);
+  try {
+    const target = safeSandboxPath(projDir, relPath);
+    if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+      res.status(404).json({ error: 'File not found in offline repository.' });
+      return;
+    }
+    const stat = fs.statSync(target);
+    const raw = fs.readFileSync(target);
+    const isBinary = isProbablyBinaryBuffer(raw);
+    res.json({
+      path: relPath,
+      size: stat.size,
+      isBinary,
+      updatedAt: stat.mtime.toISOString(),
+      content: isBinary ? '' : raw.toString('utf-8'),
+    });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to read file.' });
+  }
+});
+
+app.put('/api/projects/:id/file', (req, res) => {
+  const { path: rawPath, content } = (req.body ?? {}) as { path?: string; content?: string };
+  const relPath = (rawPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+  if (!relPath || !isSafeExportFilePath(relPath)) {
+    res.status(400).json({ error: 'Invalid or forbidden project file path.' });
+    return;
+  }
+  if (typeof content !== 'string') {
+    res.status(400).json({ error: 'File content string is required.' });
+    return;
+  }
+  const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) {
+    res.status(400).json({ error: 'Invalid project ID.' });
+    return;
+  }
+  const proj = getImportedProjectById(req.params.id);
+  const projDir = getProjectDir(safeId);
+  if (!proj && !fs.existsSync(projDir)) {
+    res.status(404).json({ error: 'Imported project not found.' });
+    return;
+  }
+  try {
+    ensureProjectOriginalsSnapshot(safeId);
+    const target = safeSandboxPath(projDir, relPath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content, 'utf-8');
+    const stat = fs.statSync(target);
+    res.json({
+      ok: true,
+      path: relPath,
+      size: stat.size,
+      updatedAt: stat.mtime.toISOString(),
+    });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to write file.' });
+  }
+});
+
 app.get('/api/projects/:id/diff', (req, res) => {
   const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
   const proj = getImportedProjectById(req.params.id);
@@ -3286,13 +3620,20 @@ app.delete('/api/projects/:id', (req, res) => {
   try {
     const safeId = req.params.id.replace(/[^a-zA-Z0-9_-]/g, '');
     if (safeId) {
-      const projDir = path.join(PROJECTS_BASE, safeId);
-      if (fs.existsSync(projDir)) {
-        fs.rmSync(projDir, { recursive: true, force: true });
+      for (const baseDir of [
+        PROJECTS_BASE,
+        PROJECTS_ORIGINALS_BASE,
+        LEGACY_PROJECTS_BASE,
+        LEGACY_PROJECTS_ORIGINALS_BASE,
+      ]) {
+        const dir = path.join(baseDir, safeId);
+        if (fs.existsSync(dir)) {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
       }
-      const origDir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
-      if (fs.existsSync(origDir)) {
-        fs.rmSync(origDir, { recursive: true, force: true });
+      const archivePath = path.join(PROJECTS_ARCHIVES_BASE, `${safeId}.zip`);
+      if (fs.existsSync(archivePath)) {
+        fs.rmSync(archivePath, { force: true });
       }
     }
   } catch {
@@ -3371,7 +3712,8 @@ app.post('/api/projects/import/github', async (req, res) => {
     const projectId = `proj-${parsed.owner}-${parsed.repo}-${Date.now().toString(36)}`
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, '-');
-    const files = extractProjectFilesFromZip(Buffer.from(arrayBuf), projectId, true);
+    const extracted = extractProjectFilesFromZip(Buffer.from(arrayBuf), projectId, true);
+    const files = extracted.files;
 
     const baseAnalysis = analyzeProjectFiles({
       id: projectId,
@@ -3383,6 +3725,7 @@ app.post('/api/projects/import/github', async (req, res) => {
       appSettings: getAppSettings(),
       language: language === 'fa' ? 'fa' : 'en',
     });
+    baseAnalysis.totalFiles = Math.max(baseAnalysis.totalFiles, extracted.totalStoredFiles);
 
     const analyzed = await refineProjectAnalysisWithManagerAI({
       baseAnalysis,
@@ -3430,7 +3773,8 @@ app.post('/api/projects/import/zip', async (req, res) => {
       'Uploaded Project';
 
     const projectId = `proj-zip-${Date.now().toString(36)}`;
-    const files = extractProjectFilesFromZip(zipBuffer, projectId);
+    const extracted = extractProjectFilesFromZip(zipBuffer, projectId);
+    const files = extracted.files;
 
     const baseAnalysis = analyzeProjectFiles({
       id: projectId,
@@ -3440,6 +3784,7 @@ app.post('/api/projects/import/zip', async (req, res) => {
       appSettings: getAppSettings(),
       language: language === 'fa' ? 'fa' : 'en',
     });
+    baseAnalysis.totalFiles = Math.max(baseAnalysis.totalFiles, extracted.totalStoredFiles);
 
     const analyzed = await refineProjectAnalysisWithManagerAI({
       baseAnalysis,
@@ -3474,12 +3819,44 @@ app.get('/api/runs/:id/diff', (req, res) => {
   const runId = req.params.id;
   const summary = getRunSummaryById(runId);
   const wf = summary ? getWorkflowById(summary.workflowId) : null;
-  const originals = wf?.projectContext?.projectId
-    ? listImportedProjectFilesFromDisk(wf.projectContext.projectId, true)
-    : [];
-  const current = listSandboxFilesReadOnly(runId);
-  const diffs = buildProjectDiffEntries({ originals, current });
+  const diffs = computeDiffsForRun(runId, wf);
   res.json({ runId, diffs });
+});
+
+app.get('/api/runs/:id/report', (req, res) => {
+  const runId = req.params.id;
+  const summary = getRunSummaryById(runId);
+  if (!summary) {
+    res.status(404).json({ error: 'Execution run not found.' });
+    return;
+  }
+  const wf = getWorkflowById(summary.workflowId);
+  const events = runEventBuffers.get(runId) ?? getRunEvents(runId);
+  const diffs = computeDiffsForRun(runId, wf);
+  const bugReports = listBugReports({ runId });
+  const fallbackLanguage = getAppSettings().language;
+
+  const changeReport =
+    summary.changeReport ??
+    buildRunChangeReport({
+      runId,
+      workflowName: summary.workflowName,
+      taskPrompt: summary.taskPrompt,
+      status: summary.status,
+      roundsExecuted: summary.roundsExecuted,
+      durationMs: summary.durationMs,
+      events,
+      diffs,
+      bugReports,
+      fallbackLanguage,
+    });
+
+  res.json({
+    run: summary,
+    changeReport,
+    events,
+    diffs,
+  });
 });
 
 app.post('/api/runs', runStartLimiter, (req, res) => {
@@ -3511,6 +3888,8 @@ app.post('/api/runs', runStartLimiter, (req, res) => {
 
   const runId = crypto.randomUUID();
   runEventBuffers.set(runId, []);
+  seedSandboxFromProject(runId, workflow.projectContext?.projectId);
+  captureRunBaseline(runId, workflow.projectContext?.projectId);
   createRunRecord({
     id: runId,
     workflowId: workflow.id,
@@ -3518,6 +3897,10 @@ app.post('/api/runs', runStartLimiter, (req, res) => {
     taskPrompt: taskPrompt!.trim(),
     mode: resolvedMode,
     maxRounds: clampMaxRounds(workflow.maxRounds),
+    chatLanguage: detectConversationLanguage({
+      taskPrompt: taskPrompt!.trim(),
+      fallbackLanguage: getAppSettings().language,
+    }),
   });
 
   void executeWorkflowRun({
@@ -3564,6 +3947,8 @@ app.post('/api/deploy/verify', (req, res) => {
 
   const runId = crypto.randomUUID();
   runEventBuffers.set(runId, []);
+  seedSandboxFromProject(runId, workflow.projectContext?.projectId);
+  captureRunBaseline(runId, workflow.projectContext?.projectId);
   createRunRecord({
     id: runId,
     workflowId: workflow.id,
@@ -3571,6 +3956,7 @@ app.post('/api/deploy/verify', (req, res) => {
     taskPrompt,
     mode: resolvedMode,
     maxRounds: clampMaxRounds(Math.max(workflow.maxRounds, 6)),
+    chatLanguage: language === 'fa' ? 'fa' : 'en',
   });
 
   void executeWorkflowRun({
@@ -3641,13 +4027,26 @@ app.post('/api/runs/:id/stop', (req, res) => {
     });
   }
 
-  updateRunRecord({
-    id: runId,
-    status: 'cancelled',
-    roundsExecuted,
-    events: runEventBuffers.get(runId) ?? buffered,
-    completed: true,
-  });
+  const stopEvents = runEventBuffers.get(runId) ?? buffered;
+  const stopWf = summary ? getWorkflowById(summary.workflowId) : null;
+  if (stopWf && summary) {
+    finalizeRunWithReport({
+      runId,
+      workflow: stopWf,
+      taskPrompt: summary.taskPrompt,
+      status: 'cancelled',
+      roundsExecuted,
+      events: stopEvents,
+    });
+  } else {
+    updateRunRecord({
+      id: runId,
+      status: 'cancelled',
+      roundsExecuted,
+      events: stopEvents,
+      completed: true,
+    });
+  }
 
   res.json({ ok: true, runId, status: 'cancelled' });
 });
@@ -3755,6 +4154,8 @@ app.post('/api/webhooks/:workflowId', webhookLimiter, (req, res) => {
 
   const runId = crypto.randomUUID();
   runEventBuffers.set(runId, []);
+  seedSandboxFromProject(runId, wf.projectContext?.projectId);
+  captureRunBaseline(runId, wf.projectContext?.projectId);
   createRunRecord({
     id: runId,
     workflowId: wf.id,
@@ -3762,6 +4163,10 @@ app.post('/api/webhooks/:workflowId', webhookLimiter, (req, res) => {
     taskPrompt: rawPrompt,
     mode: resolvedMode,
     maxRounds: clampMaxRounds(wf.maxRounds),
+    chatLanguage: detectConversationLanguage({
+      taskPrompt: rawPrompt,
+      fallbackLanguage: getAppSettings().language,
+    }),
   });
 
   void executeWorkflowRun({
@@ -3865,12 +4270,13 @@ async function executeDirectAgentTurn(params: {
         `No API key configured for ${targetNode.data.label} (${targetNode.data.provider}). Add the API key in Settings or switch to Sandbox Dry-Run.`,
       timestamp: new Date().toISOString(),
     });
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt: userMessage,
       status: 'failed',
       roundsExecuted: roundNum,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
     return;
   }
@@ -3968,12 +4374,13 @@ async function executeDirectAgentTurn(params: {
       timestamp: new Date().toISOString(),
     });
 
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt: userMessage,
       status: 'completed',
       roundsExecuted: roundNum,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
   } catch (err) {
     const formatted = formatGeminiApiError(err, getAppSettings().language);
@@ -3986,12 +4393,13 @@ async function executeDirectAgentTurn(params: {
       content: `Agent execution error: ${message}`,
       timestamp: new Date().toISOString(),
     });
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt: userMessage,
       status: 'failed',
       roundsExecuted: roundNum,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
   }
 }
@@ -4031,12 +4439,13 @@ async function executeGroupDiscussionRound(params: {
         'No live LLM API key is configured. Add an API key in Settings or switch to Sandbox Dry-Run.',
       timestamp: new Date().toISOString(),
     });
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt: userMessage,
       status: 'failed',
       roundsExecuted: baseRound,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
     return;
   }
@@ -4293,12 +4702,13 @@ async function executeGroupDiscussionRound(params: {
       timestamp: new Date().toISOString(),
     });
 
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt: userMessage,
       status: 'completed',
       roundsExecuted: currentRound,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
   } catch (err) {
     const formatted = formatGeminiApiError(err, getAppSettings().language);
@@ -4311,12 +4721,13 @@ async function executeGroupDiscussionRound(params: {
       content: `Agent execution error: ${message}`,
       timestamp: new Date().toISOString(),
     });
-    updateRunRecord({
-      id: runId,
+    finalizeRunWithReport({
+      runId,
+      workflow,
+      taskPrompt: userMessage,
       status: 'failed',
       roundsExecuted: currentRound,
       events: runEventBuffers.get(runId) ?? [],
-      completed: true,
     });
   }
 }
@@ -4384,6 +4795,7 @@ app.post('/api/chat/message', chatLimiter, (req, res) => {
     runId = crypto.randomUUID();
     runEventBuffers.set(runId, []);
     seedSandboxFromProject(runId, workflow.projectContext?.projectId);
+    captureRunBaseline(runId, workflow.projectContext?.projectId);
     createRunRecord({
       id: runId,
       workflowId: workflow.id,
@@ -4391,7 +4803,13 @@ app.post('/api/chat/message', chatLimiter, (req, res) => {
       taskPrompt: cleanMessage,
       mode: resolvedMode,
       maxRounds: clampMaxRounds(workflow.maxRounds),
+      chatLanguage: detectConversationLanguage({
+        taskPrompt: cleanMessage,
+        fallbackLanguage: getAppSettings().language,
+      }),
     });
+  } else {
+    captureRunBaseline(runId, workflow.projectContext?.projectId);
   }
 
   const nextRound =
@@ -4675,6 +5093,7 @@ function listImportedProjectFilesFromDisk(
   if (!projectId) return [];
   const safeId = projectId.replace(/[^a-zA-Z0-9_-]/g, '');
   if (!safeId) return [];
+  migrateLegacyProjectIfNeeded(safeId);
   const origDir = path.join(PROJECTS_ORIGINALS_BASE, safeId);
   const currDir = path.join(PROJECTS_BASE, safeId);
   const dir = preferOriginals && fs.existsSync(origDir) ? origDir : currDir;
@@ -4682,9 +5101,9 @@ function listImportedProjectFilesFromDisk(
 
   const result: Array<{ path: string; content: string }> = [];
   function walk(curr: string) {
-    if (result.length >= 400) return;
+    if (result.length >= 5000) return;
     for (const entry of fs.readdirSync(curr, { withFileTypes: true })) {
-      if (result.length >= 400) return;
+      if (result.length >= 5000) return;
       const full = path.join(curr, entry.name);
       const rel = path.relative(dir, full).replace(/\\/g, '/');
       if (entry.isDirectory()) {
@@ -4694,11 +5113,14 @@ function listImportedProjectFilesFromDisk(
       } else if (entry.isFile() && isSafeExportFilePath(rel)) {
         try {
           const stat = fs.statSync(full);
-          if (stat.size <= 512 * 1024) {
-            result.push({
-              path: rel,
-              content: fs.readFileSync(full, 'utf-8'),
-            });
+          if (stat.size <= 1024 * 1024) {
+            const raw = fs.readFileSync(full);
+            if (!isProbablyBinaryBuffer(raw)) {
+              result.push({
+                path: rel,
+                content: raw.toString('utf-8'),
+              });
+            }
           }
         } catch {
           // ignore unreadable file
@@ -4825,13 +5247,18 @@ function collectExportBundleForServer(params: {
     throw new Error('Workflow configuration not found.');
   }
 
-  const sandboxFiles = resolveSandboxFilesForExport(workflow, params.runId);
+  // Never leak leftover test sandbox files into full_studio exports unless a specific runId was explicitly chosen
+  const sandboxFiles =
+    scope === 'full_studio' && !params.runId
+      ? []
+      : resolveSandboxFilesForExport(workflow, params.runId);
   const importedProjectFiles =
     scope === 'project_bundle' || scope === 'sandbox_only'
       ? listImportedProjectFilesFromDisk(workflow.projectContext?.projectId, true)
       : [];
   const studioSourceFiles = scope === 'full_studio' ? listStudioSourceFilesFromDisk() : [];
-  const bugReports = listBugReports({ workflowId: workflow.id });
+  const bugReports =
+    scope === 'full_studio' && !params.runId ? [] : listBugReports({ workflowId: workflow.id });
 
   const files = assembleExportBundleFiles({
     scope,

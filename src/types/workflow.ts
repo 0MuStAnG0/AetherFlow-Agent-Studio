@@ -246,6 +246,54 @@ export interface SandboxFile {
   updatedAt: string;
 }
 
+export interface RunChangeFileEntry {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  additions: number;
+  deletions: number;
+  agents: string[];
+  lines: DiffLine[];
+  truncated?: boolean;
+}
+
+export interface RunCommandSummary {
+  command: string;
+  agentName: string;
+  exitCode?: number;
+  approved?: boolean;
+  outputPreview?: string;
+}
+
+export interface RunChangeReport {
+  runId: string;
+  workflowName: string;
+  language: 'en' | 'fa';
+  status: 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
+  roundsExecuted: number;
+  durationMs?: number;
+  summaryText: string;
+  stats: {
+    addedFiles: number;
+    modifiedFiles: number;
+    deletedFiles: number;
+    totalAdditions: number;
+    totalDeletions: number;
+    totalCommands: number;
+    totalBugs: number;
+  };
+  fileChanges: RunChangeFileEntry[];
+  commands: RunCommandSummary[];
+  bugs: Array<{
+    id: string;
+    title: string;
+    category: 'bug' | 'improvement';
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    status: 'open' | 'acknowledged' | 'resolved';
+    agentName: string;
+  }>;
+  generatedAt: string;
+}
+
 export interface ExecutionRunSummary {
   id: string;
   workflowId: string;
@@ -256,6 +304,8 @@ export interface ExecutionRunSummary {
   roundsExecuted: number;
   maxRounds: number;
   durationMs?: number;
+  chatLanguage?: 'en' | 'fa';
+  changeReport?: RunChangeReport;
   createdAt: string;
   completedAt?: string;
 }

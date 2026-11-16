@@ -3,7 +3,12 @@ dist
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/projects/
+data/projects_originals/
+data/projects_archives/
+data/.master_key
 .git
 .env
 .playwright-cli
 *.log
+*.zip

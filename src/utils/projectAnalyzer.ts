@@ -162,7 +162,11 @@ export function parseGitHubRepoInput(
   }
 }
 
-export function sanitizeArchiveEntryPath(rawPath: string, stripCommonRoot = true): string | null {
+export function sanitizeArchiveEntryPath(
+  rawPath: string,
+  stripCommonRoot = true,
+  allowBinary = false,
+): string | null {
   const normalized = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
   if (!normalized || normalized.endsWith('/')) return null;
 
@@ -181,11 +185,13 @@ export function sanitizeArchiveEntryPath(rawPath: string, stripCommonRoot = true
   }
 
   const finalPath = trimmedSegments.join('/');
-  const dotIdx = finalPath.lastIndexOf('.');
-  if (dotIdx !== -1) {
-    const ext = finalPath.slice(dotIdx).toLowerCase();
-    if (BINARY_EXTENSIONS.has(ext)) {
-      return null;
+  if (!allowBinary) {
+    const dotIdx = finalPath.lastIndexOf('.');
+    if (dotIdx !== -1) {
+      const ext = finalPath.slice(dotIdx).toLowerCase();
+      if (BINARY_EXTENSIONS.has(ext)) {
+        return null;
+      }
     }
   }
 

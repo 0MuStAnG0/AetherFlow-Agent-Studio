@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
+import AdmZip from 'adm-zip';
 
 process.env.AETHERFLOW_NO_LISTEN = '1';
 
@@ -9,6 +10,7 @@ let server: Server;
 let baseUrl = '';
 const createdRunIds: string[] = [];
 const createdWorkflowIds: string[] = [];
+const createdProjectIds: string[] = [];
 
 test.before(async () => {
   const mod = await import('../server.ts');
@@ -30,6 +32,11 @@ test.after(async () => {
   }
   for (const wfId of createdWorkflowIds) {
     await fetch(`${baseUrl}/api/workflows/${encodeURIComponent(wfId)}`, {
+      method: 'DELETE',
+    }).catch(() => {});
+  }
+  for (const projId of createdProjectIds) {
+    await fetch(`${baseUrl}/api/projects/${encodeURIComponent(projId)}`, {
       method: 'DELETE',
     }).catch(() => {});
   }
@@ -109,6 +116,129 @@ test('POST /api/runs dry_run, /api/runs/:id/diff, and /api/export/zip execute cl
   const dlRes = await fetch(`${baseUrl}${zipJson.downloadUrl}`);
   assert.equal(dlRes.status, 200);
   assert.equal(dlRes.headers.get('content-type'), 'application/zip');
+});
+
+test('POST /api/projects/import/zip stores complete files offline and allows read/edit/delete', async () => {
+  const zip = new AdmZip();
+  zip.addFile(
+    'package.json',
+    Buffer.from(JSON.stringify({ name: 'offline-sample-app', version: '1.0.0' }, null, 2), 'utf-8'),
+  );
+  zip.addFile('src/index.ts', Buffer.from('export const greeting = "hello offline";\n', 'utf-8'));
+  // 1x1 PNG binary asset
+  zip.addFile(
+    'assets/pixel.png',
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=',
+      'base64',
+    ),
+  );
+  const zipBase64 = zip.toBuffer().toString('base64');
+
+  const importRes = await fetch(`${baseUrl}/api/projects/import/zip`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: 'offline-sample.zip',
+      contentBase64: `data:application/zip;base64,${zipBase64}`,
+      projectName: 'Offline Sample Project',
+      language: 'en',
+      mode: 'dry_run',
+    }),
+  });
+  assert.equal(importRes.status, 200);
+  const importJson = (await importRes.json()) as { project?: { id: string; totalFiles: number } };
+  assert.ok(importJson.project?.id);
+  const projId = importJson.project!.id;
+  createdProjectIds.push(projId);
+  assert.ok(importJson.project!.totalFiles >= 3);
+
+  const filesRes = await fetch(`${baseUrl}/api/projects/${encodeURIComponent(projId)}/files`);
+  assert.equal(filesRes.status, 200);
+  const filesJson = (await filesRes.json()) as {
+    storageDir: string;
+    hasSourceZip: boolean;
+    totalFiles: number;
+    files: Array<{ path: string; size: number }>;
+  };
+  assert.equal(filesJson.hasSourceZip, true);
+  assert.ok(filesJson.storageDir.includes('data/projects/'));
+  assert.ok(filesJson.files.some((f) => f.path === 'src/index.ts'));
+  assert.ok(filesJson.files.some((f) => f.path === 'assets/pixel.png'));
+
+  const readRes = await fetch(
+    `${baseUrl}/api/projects/${encodeURIComponent(projId)}/file?path=${encodeURIComponent('src/index.ts')}`,
+  );
+  assert.equal(readRes.status, 200);
+  const readJson = (await readRes.json()) as { isBinary: boolean; content: string };
+  assert.equal(readJson.isBinary, false);
+  assert.match(readJson.content, /hello offline/);
+
+  const binaryRes = await fetch(
+    `${baseUrl}/api/projects/${encodeURIComponent(projId)}/file?path=${encodeURIComponent('assets/pixel.png')}`,
+  );
+  assert.equal(binaryRes.status, 200);
+  const binaryJson = (await binaryRes.json()) as { isBinary: boolean };
+  assert.equal(binaryJson.isBinary, true);
+
+  const editRes = await fetch(`${baseUrl}/api/projects/${encodeURIComponent(projId)}/file`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: 'src/index.ts',
+      content: 'export const greeting = "updated offline content";\n',
+    }),
+  });
+  assert.equal(editRes.status, 200);
+
+  const rereadRes = await fetch(
+    `${baseUrl}/api/projects/${encodeURIComponent(projId)}/file?path=${encodeURIComponent('src/index.ts')}`,
+  );
+  const rereadJson = (await rereadRes.json()) as { content: string };
+  assert.match(rereadJson.content, /updated offline content/);
+});
+
+test('POST /api/chat/message in Persian generates Persian changeReport at /api/runs/:id/report', async () => {
+  const wfRes = await fetch(`${baseUrl}/api/workflows`);
+  const workflows = (await wfRes.json()) as Array<{ id: string }>;
+  const wfId = workflows[0].id;
+
+  const chatRes = await fetch(`${baseUrl}/api/chat/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      workflowId: wfId,
+      targetAgentId: 'all',
+      message: 'سلام، لطفا سرویس احراز هویت را بررسی و فایل تنظیمات را آماده کن.',
+      mode: 'dry_run',
+    }),
+  });
+  assert.equal(chatRes.status, 200);
+  const chatJson = (await chatRes.json()) as { runId: string };
+  assert.ok(chatJson.runId);
+  createdRunIds.push(chatJson.runId);
+
+  // Wait briefly for dry-run group round to finalize and persist changeReport
+  let reportJson: {
+    run?: { chatLanguage?: string };
+    changeReport?: { language: string; summaryText: string };
+  } = {};
+  for (let i = 0; i < 15; i += 1) {
+    await new Promise((r) => setTimeout(r, 250));
+    const repRes = await fetch(
+      `${baseUrl}/api/runs/${encodeURIComponent(chatJson.runId)}/report`,
+    );
+    if (repRes.ok) {
+      reportJson = (await repRes.json()) as typeof reportJson;
+      if (reportJson.changeReport && reportJson.run?.chatLanguage === 'fa') {
+        break;
+      }
+    }
+  }
+
+  assert.equal(reportJson.run?.chatLanguage, 'fa');
+  assert.equal(reportJson.changeReport?.language, 'fa');
+  assert.match(reportJson.changeReport?.summaryText ?? '', /تغییرات|گزارش|فایل/);
 });
 
 test('POST /api/webhooks/:workflowId enforces webhookSecret when configured', async () => {

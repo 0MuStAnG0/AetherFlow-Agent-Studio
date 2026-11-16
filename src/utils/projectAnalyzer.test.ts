@@ -35,6 +35,7 @@ test('sanitizeArchiveEntryPath blocks zip-slip traversal and ignores build/vendo
   assert.equal(sanitizeArchiveEntryPath('repo-main/node_modules/pkg/index.js', true), null);
   assert.equal(sanitizeArchiveEntryPath('repo-main/.git/HEAD', true), null);
   assert.equal(sanitizeArchiveEntryPath('repo-main/assets/logo.png', true), null);
+  assert.equal(sanitizeArchiveEntryPath('repo-main/assets/logo.png', true, true), 'assets/logo.png');
   assert.equal(sanitizeArchiveEntryPath('../../etc/passwd', false), null);
   assert.equal(sanitizeArchiveEntryPath('package.json', false), 'package.json');
 });

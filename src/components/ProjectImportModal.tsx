@@ -1,15 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   CheckSquare,
   CopyPlus,
   FileArchive,
+  FileCode2,
   FolderGit2,
   GitBranch,
+  HardDrive,
   Loader2,
   Pencil,
   Plus,
   PlusCircle,
+  RefreshCw,
+  Save,
+  Search,
   ShieldCheck,
   Trash2,
   Upload,
@@ -62,14 +67,15 @@ const COPY = {
     zipNameLabel: 'Project Name (optional)',
     zipNamePlaceholder: 'Derived from .zip filename if blank',
     zipDropLabel: 'Select a .zip project archive',
-    zipDropHint: 'node_modules, .git, dist, and binary assets are automatically skipped.',
+    zipDropHint:
+      'All project files & assets are extracted and stored offline on the server (node_modules, .git, and dist skipped).',
     chooseZip: 'Choose .zip File',
     uploadAnalyze: 'Upload & Analyze with Manager',
     uploading: 'Extracting & Analyzing...',
     recentProjects: 'Imported Projects',
     emptyAnalysisTitle: 'Ready for Manager Codebase Analysis',
     emptyAnalysisHint:
-      'Import a GitHub repository or .zip project on the left. Manager Agent will inspect manifests, frameworks, tests, and containers to recommend the right team.',
+      'Import a GitHub repository or .zip project on the left. Full files are stored offline on the server so agents and editors can inspect or modify them anytime.',
     managerAssessment: 'Manager Agent Assessment',
     liveAiTag: 'Live AI Analysis',
     staticScanTag: 'Codebase Static Scan',
@@ -89,11 +95,22 @@ const COPY = {
     applying: 'Applying...',
     deleteProj: 'Delete imported project',
     closeModal: 'Close project import dialog',
+    tabTeamAnalysis: 'Manager Analysis & Team',
+    tabOfflineRepo: 'Offline Server Repository',
+    offlineBannerTitle: 'Stored Completely Offline on Server',
+    offlineZipSaved: 'Source Archive Stored',
+    filterFilesPlaceholder: 'Filter stored project files...',
+    noRepoFiles: 'No stored files found for this project.',
+    selectFilePrompt: 'Select a file from the offline repository tree to read or edit it directly on the server.',
+    binaryNotice: 'Binary asset stored offline on server (preview/text editing disabled to preserve raw bytes).',
+    saveFileBtn: 'Save File to Server',
+    savingFileBtn: 'Saving...',
+    savedFileBadge: 'Saved to Server',
   },
   fa: {
     modalTitle: 'اتصال پروژه گیت‌هاب / ایمپورت ZIP و پیشنهاد تیم ایجنت‌ها',
     modalSubtitle:
-      'مخزن گیت‌هاب را متصل کنید یا فایل فشرده .zip پروژه را بارگذاری کنید تا ایجنت مدیر ساختار کد را تحلیل کرده و ایجنت‌ها و تخصص‌های مورد نیاز را پیشنهاد دهد.',
+      'مخزن گیت‌هاب را متصل کنید یا فایل فشرده .zip پروژه را بارگذاری کنید تا کل پروژه به‌صورت آفلاین در سرور ذخیره شود و ایجنت مدیر تیم تخصصی مورد نیاز را پیشنهاد دهد.',
     tabGithub: 'مخزن گیت‌هاب (GitHub)',
     tabZip: 'آپلود دستی فایل ZIP',
     repoLabel: 'آدرس مخزن گیت‌هاب یا owner/repo',
@@ -107,14 +124,15 @@ const COPY = {
     zipNameLabel: 'نام پروژه (اختیاری)',
     zipNamePlaceholder: 'در صورت خالی بودن از نام فایل .zip استفاده می‌شود',
     zipDropLabel: 'انتخاب فایل فشرده پروژه (.zip)',
-    zipDropHint: 'پوشه‌های node_modules، .git، dist و فایل‌های باینری به‌طور خودکار نادیده گرفته می‌شوند.',
+    zipDropHint:
+      'تمام فایل‌ها و دارایی‌های پروژه به‌صورت کامل و آفلاین در سرور ذخیره می‌شوند (پوشه‌های node_modules، .git و dist نادیده گرفته می‌شوند).',
     chooseZip: 'انتخاب فایل .zip',
     uploadAnalyze: 'بارگذاری و آنالیز با ایجنت مدیر',
     uploading: 'در حال استخراج و آنالیز...',
     recentProjects: 'پروژه‌های واردشده',
     emptyAnalysisTitle: 'آماده تحلیل پروژه توسط ایجنت مدیر',
     emptyAnalysisHint:
-      'از بخش کناری یک مخزن گیت‌هاب متصل کنید یا فایل .zip پروژه را آپلود کنید تا ایجنت مدیر بر اساس فریم‌ورک‌ها، دیتابیس، تست و داکر، تیم تخصصی پیشنهادی را معرفی کند.',
+      'از بخش کناری یک مخزن گیت‌هاب متصل کنید یا فایل .zip پروژه را آپلود کنید تا تمام فایل‌ها به‌صورت آفلاین در مخزن سرور ذخیره شده و همیشه قابل خواندن و ویرایش باشند.',
     managerAssessment: 'گزارش تحلیل ایجنت مدیر',
     liveAiTag: 'تحلیل هوشمند AI',
     staticScanTag: 'اسکن ساختار کد',
@@ -134,6 +152,17 @@ const COPY = {
     applying: 'در حال اعمال...',
     deleteProj: 'حذف پروژه واردشده',
     closeModal: 'بستن پنجره ورود پروژه',
+    tabTeamAnalysis: 'تحلیل مدیر و تیم پیشنهادی',
+    tabOfflineRepo: 'مخزن آفلاین سرور',
+    offlineBannerTitle: 'ذخیره کامل و آفلاین در سرور',
+    offlineZipSaved: 'بایگانی ZIP ذخیره شده',
+    filterFilesPlaceholder: 'جستجو در فایل‌های ذخیره‌شده پروژه...',
+    noRepoFiles: 'فایلی در مخزن آفلاین این پروژه یافت نشد.',
+    selectFilePrompt: 'یک فایل را از لیست انتخاب کنید تا محتوای ذخیره‌شده در سرور خوانده و در صورت نیاز ویرایش شود.',
+    binaryNotice: 'فایل باینری به‌صورت کامل و آفلاین در سرور ذخیره شده است (ویرایش متنی غیرفعال است).',
+    saveFileBtn: 'ذخیره فایل در سرور',
+    savingFileBtn: 'در حال ذخیره...',
+    savedFileBadge: 'در سرور ذخیره شد',
   },
 };
 
@@ -171,6 +200,28 @@ function readFileAsBase64(file: File): Promise<string> {
   });
 }
 
+function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(2)} MB`;
+}
+
+interface OfflineRepoFileMeta {
+  path: string;
+  size: number;
+  updatedAt: string;
+}
+
+interface OfflineRepoInventory {
+  projectId: string;
+  storageDir: string;
+  hasSourceZip: boolean;
+  totalFiles: number;
+  totalBytes: number;
+  files: OfflineRepoFileMeta[];
+}
+
 export function ProjectImportModal({
   isOpen,
   onClose,
@@ -184,6 +235,7 @@ export function ProjectImportModal({
   onApplyRecommendations,
 }: ProjectImportModalProps) {
   const [sourceTab, setSourceTab] = useState<'github' | 'zip'>('github');
+  const [rightPanelTab, setRightPanelTab] = useState<'team' | 'files'>('team');
   const [repoUrl, setRepoUrl] = useState('');
   const [branch, setBranch] = useState('');
   const [githubToken, setGithubToken] = useState('');
@@ -204,6 +256,21 @@ export function ProjectImportModal({
   const [editProjectBranch, setEditProjectBranch] = useState('');
   const [editProjectSummary, setEditProjectSummary] = useState('');
   const [isSavingProjectMeta, setIsSavingProjectMeta] = useState(false);
+
+  // Offline Server Repository browser/editor state
+  const [repoInventory, setRepoInventory] = useState<OfflineRepoInventory | null>(null);
+  const [repoLoading, setRepoLoading] = useState(false);
+  const [repoFilter, setRepoFilter] = useState('');
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [fileLoading, setFileLoading] = useState(false);
+  const [fileContent, setFileContent] = useState('');
+  const [fileIsBinary, setFileIsBinary] = useState(false);
+  const [fileSize, setFileSize] = useState<number>(0);
+  const [fileDirty, setFileDirty] = useState(false);
+  const [fileSaving, setFileSaving] = useState(false);
+  const [fileSavedNotice, setFileSavedNotice] = useState(false);
+  const [repoError, setRepoError] = useState<string | null>(null);
+
   const zipInputRef = useRef<HTMLInputElement | null>(null);
 
   const t = COPY[lang];
@@ -211,6 +278,58 @@ export function ProjectImportModal({
 
   const activeProject =
     projects.find((p) => p.id === selectedProjectId) ?? projects[0] ?? null;
+
+  const loadOfflineRepoFiles = useCallback(async (projectId: string) => {
+    setRepoLoading(true);
+    setRepoError(null);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`);
+      const data = (await res.json().catch(() => ({}))) as OfflineRepoInventory & {
+        error?: string;
+      };
+      if (!res.ok || !Array.isArray(data.files)) {
+        setRepoInventory(null);
+        setRepoError(data.error || 'Failed to inspect offline repository.');
+        return;
+      }
+      setRepoInventory(data);
+    } catch {
+      setRepoError('Network error while loading offline repository files.');
+    } finally {
+      setRepoLoading(false);
+    }
+  }, []);
+
+  const loadOfflineFileContent = useCallback(async (projectId: string, filePath: string) => {
+    setSelectedFilePath(filePath);
+    setFileLoading(true);
+    setRepoError(null);
+    setFileSavedNotice(false);
+    try {
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(filePath)}`,
+      );
+      const data = (await res.json().catch(() => ({}))) as {
+        path?: string;
+        size?: number;
+        isBinary?: boolean;
+        content?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setRepoError(data.error || 'Unable to load file content.');
+        return;
+      }
+      setFileIsBinary(Boolean(data.isBinary));
+      setFileSize(typeof data.size === 'number' ? data.size : 0);
+      setFileContent(typeof data.content === 'string' ? data.content : '');
+      setFileDirty(false);
+    } catch {
+      setRepoError('Network error while reading offline file.');
+    } finally {
+      setFileLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -231,6 +350,10 @@ export function ProjectImportModal({
     if (!activeProject) {
       setEditableSpecs([]);
       setIsEditingProjectMeta(false);
+      setRepoInventory(null);
+      setSelectedFilePath(null);
+      setFileContent('');
+      setFileDirty(false);
       return;
     }
     setEditableSpecs(activeProject.recommendations.map((r) => ({ ...r })));
@@ -240,14 +363,62 @@ export function ProjectImportModal({
     setEditProjectUrl(activeProject.sourceUrl ?? '');
     setEditProjectBranch(activeProject.branch ?? '');
     setEditProjectSummary(activeProject.managerSummary);
+    setSelectedFilePath(null);
+    setFileContent('');
+    setFileDirty(false);
+    setFileSavedNotice(false);
+    setRepoFilter('');
     const next: Record<string, boolean> = {};
     for (const rec of activeProject.recommendations) {
       next[rec.id] = rec.priority !== 'optional';
     }
     setCheckedIds(next);
-  }, [activeProject?.id]);
+    if (isOpen) {
+      void loadOfflineRepoFiles(activeProject.id);
+    }
+  }, [activeProject?.id, isOpen, loadOfflineRepoFiles]);
+
+  const filteredRepoFiles = useMemo(() => {
+    const list = repoInventory?.files ?? [];
+    const q = repoFilter.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((f) => f.path.toLowerCase().includes(q));
+  }, [repoInventory, repoFilter]);
 
   if (!isOpen) return null;
+
+  const handleSaveOfflineFile = async () => {
+    if (!activeProject || !selectedFilePath || fileIsBinary) return;
+    setFileSaving(true);
+    setRepoError(null);
+    setFileSavedNotice(false);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(activeProject.id)}/file`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: selectedFilePath, content: fileContent }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        size?: number;
+        updatedAt?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.ok) {
+        setRepoError(data.error || 'Failed to save file.');
+        return;
+      }
+      setFileDirty(false);
+      setFileSavedNotice(true);
+      if (typeof data.size === 'number') setFileSize(data.size);
+      await loadOfflineRepoFiles(activeProject.id);
+      setTimeout(() => setFileSavedNotice(false), 2500);
+    } catch {
+      setRepoError('Network error while saving file to offline repository.');
+    } finally {
+      setFileSaving(false);
+    }
+  };
 
   const handleSaveProjectMeta = async () => {
     if (!activeProject || !editProjectName.trim()) return;
@@ -742,7 +913,7 @@ export function ProjectImportModal({
             )}
           </div>
 
-          {/* Right Panel: Manager Agent Analysis & Recommended Team */}
+          {/* Right Panel: Manager Agent Analysis / Offline Server Repository */}
           <div className="flex flex-col overflow-hidden lg:col-span-7">
             {!activeProject ? (
               <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
@@ -756,7 +927,228 @@ export function ProjectImportModal({
               </div>
             ) : (
               <>
-                <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
+                {/* Right Panel Mode Switcher */}
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50/70 px-5 py-2.5 dark:border-slate-800 dark:bg-slate-950/60">
+                  <div className="inline-flex rounded-lg bg-slate-200/70 p-0.5 dark:bg-slate-800">
+                    <button
+                      type="button"
+                      data-testid="tab-project-team"
+                      onClick={() => setRightPanelTab('team')}
+                      className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-semibold transition-colors ${
+                        rightPanelTab === 'team'
+                          ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-900 dark:text-slate-100'
+                          : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                      }`}
+                    >
+                      <ShieldCheck className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                      <span>{t.tabTeamAnalysis}</span>
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="tab-offline-repo"
+                      onClick={() => {
+                        setRightPanelTab('files');
+                        void loadOfflineRepoFiles(activeProject.id);
+                      }}
+                      className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-semibold transition-colors ${
+                        rightPanelTab === 'files'
+                          ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-900 dark:text-slate-100'
+                          : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                      }`}
+                    >
+                      <HardDrive className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                      <span>
+                        {t.tabOfflineRepo} (
+                        {repoInventory?.totalFiles ?? activeProject.totalFiles})
+                      </span>
+                    </button>
+                  </div>
+
+                  {repoInventory && (
+                    <span className="inline-flex items-center gap-1.5 text-[11px] text-emerald-700 dark:text-emerald-400">
+                      <HardDrive className="h-3 w-3" />
+                      <span className="font-medium">
+                        {t.offlineBannerTitle} · {formatByteSize(repoInventory.totalBytes)}
+                      </span>
+                    </span>
+                  )}
+                </div>
+
+                {rightPanelTab === 'files' ? (
+                  <div
+                    data-testid="offline-repo-panel"
+                    className="flex min-h-0 flex-1 flex-col overflow-hidden"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-2.5 text-[11px] dark:border-slate-800">
+                      <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-300">
+                        <span
+                          dir="ltr"
+                          className="rounded border border-slate-200 bg-slate-100 px-2 py-0.5 font-mono text-[10px] dark:border-slate-700 dark:bg-slate-800"
+                        >
+                          {repoInventory?.storageDir ?? `data/projects/${activeProject.id}`}
+                        </span>
+                        {repoInventory?.hasSourceZip && (
+                          <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300">
+                            {t.offlineZipSaved}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void loadOfflineRepoFiles(activeProject.id)}
+                        className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                      >
+                        <RefreshCw className={`h-3 w-3 ${repoLoading ? 'animate-spin' : ''}`} />
+                        <span>{lang === 'fa' ? 'به‌روزرسانی' : 'Refresh'}</span>
+                      </button>
+                    </div>
+
+                    {repoError && (
+                      <div
+                        role="alert"
+                        className="mx-5 mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-200"
+                      >
+                        {repoError}
+                      </div>
+                    )}
+
+                    <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden md:grid-cols-12">
+                      {/* Stored File Tree */}
+                      <div className="flex flex-col overflow-hidden border-b border-slate-200 dark:border-slate-800 md:col-span-5 md:border-b-0 md:border-e">
+                        <div className="border-b border-slate-200 p-2.5 dark:border-slate-800">
+                          <div className="relative">
+                            <Search className="pointer-events-none absolute start-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
+                            <input
+                              type="search"
+                              data-testid="offline-repo-search"
+                              value={repoFilter}
+                              onChange={(e) => setRepoFilter(e.target.value)}
+                              placeholder={t.filterFilesPlaceholder}
+                              className="w-full rounded-md border border-slate-200 bg-slate-50 py-1.5 ps-8 pe-2.5 text-xs text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                            />
+                          </div>
+                        </div>
+                        <div
+                          className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-2"
+                          data-testid="offline-repo-filelist"
+                        >
+                          {repoLoading && !repoInventory ? (
+                            <div className="flex items-center justify-center py-8 text-xs text-slate-400">
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            </div>
+                          ) : filteredRepoFiles.length === 0 ? (
+                            <p className="px-2 py-6 text-center text-xs text-slate-500 dark:text-slate-400">
+                              {t.noRepoFiles}
+                            </p>
+                          ) : (
+                            filteredRepoFiles.map((f) => {
+                              const isSelected = selectedFilePath === f.path;
+                              return (
+                                <button
+                                  key={f.path}
+                                  type="button"
+                                  data-testid={`offline-file-item-${f.path}`}
+                                  onClick={() =>
+                                    void loadOfflineFileContent(activeProject.id, f.path)
+                                  }
+                                  className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-start text-xs transition-colors ${
+                                    isSelected
+                                      ? 'bg-blue-50 font-semibold text-blue-700 dark:bg-blue-950/50 dark:text-blue-300'
+                                      : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800/70'
+                                  }`}
+                                >
+                                  <span dir="ltr" className="min-w-0 flex-1 truncate font-mono text-[11px]">
+                                    {f.path}
+                                  </span>
+                                  <span className="shrink-0 font-mono text-[10px] text-slate-400">
+                                    {formatByteSize(f.size)}
+                                  </span>
+                                </button>
+                              );
+                            })
+                          )}
+                        </div>
+                      </div>
+
+                      {/* File Reader & Offline Editor */}
+                      <div className="flex min-h-0 flex-col overflow-hidden md:col-span-7">
+                        {!selectedFilePath ? (
+                          <div className="flex flex-1 flex-col items-center justify-center p-6 text-center">
+                            <FileCode2 className="h-8 w-8 text-slate-300 dark:text-slate-700" />
+                            <p className="mt-2 max-w-xs text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+                              {t.selectFilePrompt}
+                            </p>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-3.5 py-2 dark:border-slate-800 dark:bg-slate-950">
+                              <div className="min-w-0 flex-1">
+                                <div
+                                  dir="ltr"
+                                  className="truncate font-mono text-xs font-semibold text-slate-900 dark:text-slate-100"
+                                >
+                                  {selectedFilePath}
+                                </div>
+                                <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                                  {formatByteSize(fileSize)}
+                                  {fileDirty ? (lang === 'fa' ? ' · تغییر یافته' : ' · Modified') : ''}
+                                </div>
+                              </div>
+                              {!fileIsBinary && (
+                                <div className="flex items-center gap-2">
+                                  {fileSavedNotice && (
+                                    <span
+                                      data-testid="offline-repo-saved-badge"
+                                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400"
+                                    >
+                                      <Check className="h-3.5 w-3.5" />
+                                      {t.savedFileBadge}
+                                    </span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    data-testid="offline-repo-save-btn"
+                                    disabled={fileSaving || !fileDirty}
+                                    onClick={() => void handleSaveOfflineFile()}
+                                    className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+                                  >
+                                    <Save className="h-3.5 w-3.5" />
+                                    <span>{fileSaving ? t.savingFileBtn : t.saveFileBtn}</span>
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+
+                            {fileLoading ? (
+                              <div className="flex flex-1 items-center justify-center text-xs text-slate-400">
+                                <Loader2 className="h-5 w-5 animate-spin" />
+                              </div>
+                            ) : fileIsBinary ? (
+                              <div className="flex flex-1 flex-col items-center justify-center p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+                                {t.binaryNotice}
+                              </div>
+                            ) : (
+                              <textarea
+                                dir="ltr"
+                                data-testid="offline-repo-editor"
+                                value={fileContent}
+                                onChange={(e) => {
+                                  setFileContent(e.target.value);
+                                  setFileDirty(true);
+                                  setFileSavedNotice(false);
+                                }}
+                                spellCheck={false}
+                                className="min-h-0 flex-1 resize-none bg-slate-950 p-3.5 font-mono text-xs leading-relaxed text-slate-100 focus:outline-none"
+                              />
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
                   {/* Manager Assessment Overview */}
                   <section
                     data-testid="manager-project-analysis"
@@ -1230,29 +1622,31 @@ export function ProjectImportModal({
                   </section>
                 </div>
 
-                {/* Footer Apply Actions */}
-                <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-slate-200 bg-slate-50 px-5 py-3.5 dark:border-slate-800 dark:bg-slate-950">
-                  <button
-                    type="button"
-                    data-testid="apply-merge-team-btn"
-                    disabled={isApplying || selectedRecommendations.length === 0}
-                    onClick={() => void handleApply('merge')}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                  >
-                    <PlusCircle className="h-3.5 w-3.5" />
-                    <span>{isApplying ? t.applying : t.addToCanvas}</span>
-                  </button>
-                  <button
-                    type="button"
-                    data-testid="apply-replace-team-btn"
-                    disabled={isApplying || selectedRecommendations.length === 0}
-                    onClick={() => void handleApply('replace')}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    <Workflow className="h-3.5 w-3.5" />
-                    <span>{isApplying ? t.applying : t.buildNewTeam}</span>
-                  </button>
-                </div>
+                    {/* Footer Apply Actions (Team Analysis Tab) */}
+                    <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-slate-200 bg-slate-50 px-5 py-3.5 dark:border-slate-800 dark:bg-slate-950">
+                      <button
+                        type="button"
+                        data-testid="apply-merge-team-btn"
+                        disabled={isApplying || selectedRecommendations.length === 0}
+                        onClick={() => void handleApply('merge')}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                      >
+                        <PlusCircle className="h-3.5 w-3.5" />
+                        <span>{isApplying ? t.applying : t.addToCanvas}</span>
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="apply-replace-team-btn"
+                        disabled={isApplying || selectedRecommendations.length === 0}
+                        onClick={() => void handleApply('replace')}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        <Workflow className="h-3.5 w-3.5" />
+                        <span>{isApplying ? t.applying : t.buildNewTeam}</span>
+                      </button>
+                    </div>
+                  </>
+                )}
               </>
             )}
           </div>
