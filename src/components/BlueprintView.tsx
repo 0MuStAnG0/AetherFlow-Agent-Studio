@@ -1113,8 +1113,8 @@ export function BlueprintView({
           </label>
           <span className="text-[11px] text-slate-500 dark:text-slate-400">
             {lang === 'fa'
-              ? 'Nginx و گواهی رایگان Let’s Encrypt را نصب می‌کند (تغییری در محدودیت جغرافیایی Google API نمی‌دهد).'
-              : 'Installs Nginx + Let’s Encrypt HTTPS for your domain (does not bypass Google outbound geo-blocks).'}
+              ? 'اگر خالی باشد، اسکریپت هنگام نصب از شما نام دامنه را می‌پرسد تا Nginx و گواهی HTTPS رایگان (Let’s Encrypt) را فعال کند.'
+              : 'If left blank, the installer prompts for your domain during setup to configure Nginx + Let’s Encrypt HTTPS (pass --no-domain to skip).'}
           </span>
         </div>
 

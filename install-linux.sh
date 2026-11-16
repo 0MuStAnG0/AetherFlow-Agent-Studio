@@ -31,6 +31,11 @@ TARGET_DIR="${AETHERFLOW_DIR:-}"
 CUSTOM_PORT="${AETHERFLOW_PORT:-}"
 UPDATE_ONLY=false
 ENABLE_NGINX=false
+NON_INTERACTIVE=false
+SKIP_DOMAIN_PROMPT=false
+if [[ "${AETHERFLOW_NON_INTERACTIVE:-}" == "1" || "${AETHERFLOW_NON_INTERACTIVE:-}" == "true" ]]; then
+  NON_INTERACTIVE=true
+fi
 SSL_DOMAIN="${AETHERFLOW_DOMAIN:-}"
 SSL_EMAIL="${AETHERFLOW_EMAIL:-}"
 
@@ -39,13 +44,13 @@ usage() {
 AetherFlow Agent Studio — Linux Prerequisites & One-Command Installer
 Default Repo: https://github.com/0MuStAnG0/AetherFlow-Agent-Studio
 
-One-Line Remote Install (run on Ubuntu / Debian / RHEL / Rocky / Alma / Alpine):
+One-Line Remote Install (prompts for domain to enable Nginx + HTTPS SSL):
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash
 
 With Systemd Background Service:
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
 
-With Nginx Reverse Proxy + Let's Encrypt SSL:
+With Nginx Reverse Proxy + Let's Encrypt SSL (pre-set domain):
   curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --nginx --domain studio.example.com
 
 With Docker Compose:
@@ -62,6 +67,8 @@ Options:
   --nginx                  Install and configure Nginx reverse proxy (ports 80/443 -> app PORT)
   --domain <hostname>      Domain name for Nginx + automatic Let's Encrypt SSL certificate (implies --nginx)
   --email <email>          Optional email for Let's Encrypt SSL expiry notifications
+  --no-domain              Skip interactive domain/HTTPS prompt during installation
+  --non-interactive, -y    Run unattended without interactive prompts
   --update                 Pull latest changes from GitHub and rebuild/restart
   --skip-deps              Skip automatic OS prerequisite package installation
   --check                  Check Linux prerequisites without modifying the system
@@ -77,14 +84,18 @@ while [[ $# -gt 0 ]]; do
     --nginx) ENABLE_NGINX=true; shift ;;
     --domain)
       [[ $# -ge 2 ]] || { echo "Missing value for --domain" >&2; exit 1; }
-      SSL_DOMAIN="$2"; ENABLE_NGINX=true; shift 2 ;;
+      SSL_DOMAIN="$2"; ENABLE_NGINX=true; SKIP_DOMAIN_PROMPT=true; shift 2 ;;
     --domain=*)
-      SSL_DOMAIN="${1#*=}"; ENABLE_NGINX=true; shift ;;
+      SSL_DOMAIN="${1#*=}"; ENABLE_NGINX=true; SKIP_DOMAIN_PROMPT=true; shift ;;
     --email)
       [[ $# -ge 2 ]] || { echo "Missing value for --email" >&2; exit 1; }
       SSL_EMAIL="$2"; shift 2 ;;
     --email=*)
       SSL_EMAIL="${1#*=}"; shift ;;
+    --no-domain)
+      SKIP_DOMAIN_PROMPT=true; shift ;;
+    --non-interactive|--yes|-y)
+      NON_INTERACTIVE=true; shift ;;
     --check) RUN_CHECK_ONLY=true; shift ;;
     --update) UPDATE_ONLY=true; shift ;;
     --skip-deps) SKIP_DEPS=true; shift ;;
@@ -162,6 +173,99 @@ normalize_repo_url() {
   else
     echo "$raw"
   fi
+}
+
+normalize_domain_value() {
+  local raw="$1"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  raw="${raw#https://}"
+  raw="${raw#http://}"
+  raw="${raw%%/*}"
+  raw="${raw%%:*}"
+  raw="${raw%.}"
+  printf '%s' "$raw"
+}
+
+is_valid_domain() {
+  local d="$1"
+  [[ -n "$d" && ${#d} -le 253 ]] || return 1
+  [[ "$d" == *.* ]] || return 1
+  [[ "$d" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || return 1
+  # Reject bare IPv4 addresses
+  if [[ "$d" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    return 1
+  fi
+  return 0
+}
+
+prompt_domain_for_https() {
+  if [[ -n "$SSL_DOMAIN" ]]; then
+    local norm
+    norm="$(normalize_domain_value "$SSL_DOMAIN")"
+    if ! is_valid_domain "$norm"; then
+      err "Invalid --domain hostname: $SSL_DOMAIN"
+      exit 1
+    fi
+    SSL_DOMAIN="$norm"
+    ENABLE_NGINX=true
+    SKIP_DOMAIN_PROMPT=true
+    return 0
+  fi
+
+  if [[ "$RUN_CHECK_ONLY" == true || "$NON_INTERACTIVE" == true || "$SKIP_DOMAIN_PROMPT" == true ]]; then
+    return 0
+  fi
+
+  local tty_in=""
+  local tty_out=""
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    tty_in="/dev/tty"
+    tty_out="/dev/tty"
+  elif [[ -t 0 ]]; then
+    tty_in="/dev/stdin"
+    tty_out="/dev/stdout"
+  else
+    log "Non-interactive shell detected; skipping domain prompt (pass --domain <host> or configure later in Deploy & Code)."
+    SKIP_DOMAIN_PROMPT=true
+    return 0
+  fi
+
+  printf "\n\033[1;34m[AetherFlow]\033[0m Domain & HTTPS SSL Setup (Nginx + Let's Encrypt)\n" > "$tty_out"
+  printf "  Point a domain's DNS A-record to this server to automatically enable HTTPS.\n" > "$tty_out"
+
+  local attempts=0
+  local input_domain=""
+  while [[ $attempts -lt 3 ]]; do
+    printf "  Enter domain name (e.g. studio.example.com) [press Enter to skip]: " > "$tty_out"
+    if ! IFS= read -r input_domain < "$tty_in"; then
+      break
+    fi
+    local trimmed
+    trimmed="$(normalize_domain_value "$input_domain")"
+    if [[ -z "$trimmed" ]]; then
+      log "Skipping automatic Nginx/HTTPS domain setup (you can configure your domain later in Deploy & Code)."
+      SKIP_DOMAIN_PROMPT=true
+      return 0
+    fi
+    if is_valid_domain "$trimmed"; then
+      SSL_DOMAIN="$trimmed"
+      ENABLE_NGINX=true
+      SKIP_DOMAIN_PROMPT=true
+      if [[ -z "$SSL_EMAIL" ]]; then
+        printf "  Enter email for Let's Encrypt SSL alerts [optional, Enter to skip]: " > "$tty_out"
+        if IFS= read -r input_email < "$tty_in"; then
+          SSL_EMAIL="$(printf '%s' "$input_email" | tr -d '[:space:]')"
+        fi
+      fi
+      log "Configured domain for Nginx + HTTPS SSL: ${SSL_DOMAIN}"
+      return 0
+    fi
+    warn "Invalid domain '$input_domain'. Enter a valid FQDN like studio.example.com or press Enter to skip."
+    attempts=$((attempts + 1))
+  done
+
+  SKIP_DOMAIN_PROMPT=true
+  return 0
 }
 
 check_node_version() {
@@ -347,6 +451,8 @@ elif [[ -f "$(pwd)/package.json" && -f "$(pwd)/server.ts" ]]; then
   APP_DIR="$(pwd)"
 fi
 
+prompt_domain_for_https
+
 # Remote bootstrap path (curl | bash) or explicit --repo clone/update
 if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
   install_base_prerequisites
@@ -400,9 +506,14 @@ if [[ "$LOCAL_MODE" == false || "$REPO_EXPLICIT" == true ]]; then
   fi
   if [[ -n "$SSL_DOMAIN" ]]; then
     FORWARD_ARGS+=(--domain "$SSL_DOMAIN")
+  elif [[ "$SKIP_DOMAIN_PROMPT" == true ]]; then
+    FORWARD_ARGS+=(--no-domain)
   fi
   if [[ -n "$SSL_EMAIL" ]]; then
     FORWARD_ARGS+=(--email "$SSL_EMAIL")
+  fi
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    FORWARD_ARGS+=(--non-interactive)
   fi
   if [[ "$SKIP_DEPS" == true ]]; then
     FORWARD_ARGS+=(--skip-deps)
@@ -423,17 +534,25 @@ if [[ "$UPDATE_ONLY" == true && -d "$APP_DIR/.git" ]]; then
   git -C "$APP_DIR" reset --hard "origin/$BRANCH"
 fi
 
+upsert_env_var() {
+  local key="$1"
+  local val="$2"
+  local file="$APP_DIR/.env"
+  [[ -f "$file" ]] || return 0
+  if grep -qE "^${key}=" "$file"; then
+    sed -i.bak -E "s|^${key}=.*|${key}=${val}|" "$file" && rm -f "${file}.bak"
+  else
+    printf "\n%s=%s\n" "$key" "$val" >> "$file"
+  fi
+}
+
 ensure_env_file() {
   if [[ ! -f "$APP_DIR/.env" && -f "$APP_DIR/.env.example" ]]; then
     cp "$APP_DIR/.env.example" "$APP_DIR/.env"
     log "Created .env from .env.example — set GEMINI_API_KEY / provider keys in $APP_DIR/.env if needed."
   fi
   if [[ -n "$CUSTOM_PORT" && -f "$APP_DIR/.env" ]]; then
-    if grep -qE '^PORT=' "$APP_DIR/.env"; then
-      sed -i.bak -E "s|^PORT=.*|PORT=${CUSTOM_PORT}|" "$APP_DIR/.env" && rm -f "$APP_DIR/.env.bak"
-    else
-      printf "\nPORT=%s\n" "$CUSTOM_PORT" >> "$APP_DIR/.env"
-    fi
+    upsert_env_var "PORT" "$CUSTOM_PORT"
     export PORT="$CUSTOM_PORT"
     log "Configured PORT=$CUSTOM_PORT in .env"
   elif [[ -f "$APP_DIR/.env" ]]; then
@@ -441,6 +560,13 @@ ensure_env_file() {
     env_port="$(grep -E '^PORT=' "$APP_DIR/.env" | head -n1 | cut -d'=' -f2- | tr -d '[:space:]' || true)"
     if [[ -n "$env_port" ]]; then
       export PORT="$env_port"
+    fi
+  fi
+  if [[ -n "$SSL_DOMAIN" && -f "$APP_DIR/.env" ]]; then
+    upsert_env_var "AETHERFLOW_DOMAIN" "\"${SSL_DOMAIN}\""
+    upsert_env_var "APP_URL" "\"https://${SSL_DOMAIN}\""
+    if [[ -n "$SSL_EMAIL" ]]; then
+      upsert_env_var "AETHERFLOW_EMAIL" "\"${SSL_EMAIL}\""
     fi
   fi
 }
@@ -467,7 +593,8 @@ setup_nginx_and_ssl() {
   local server_name="_"
 
   if [[ -n "$SSL_DOMAIN" ]]; then
-    if [[ ! "$SSL_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    SSL_DOMAIN="$(normalize_domain_value "$SSL_DOMAIN")"
+    if ! is_valid_domain "$SSL_DOMAIN"; then
       err "Invalid --domain hostname: $SSL_DOMAIN"
       exit 1
     fi
@@ -521,7 +648,9 @@ server {
     listen [::]:80;
     server_name ${server_name};
 
-    client_max_body_size 30M;
+    client_max_body_size 50M;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     location /ws {
         proxy_pass http://127.0.0.1:${app_port};
@@ -533,6 +662,19 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:${app_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
     }
 
     location / {
@@ -574,15 +716,13 @@ EOF
       cert_args+=(--register-unsafely-without-email)
     fi
     if run_priv certbot "${cert_args[@]}"; then
-      if [[ -f "$APP_DIR/.env" ]]; then
-        if grep -qE '^APP_URL=' "$APP_DIR/.env"; then
-          sed -i.bak -E "s|^APP_URL=.*|APP_URL=\"https://${SSL_DOMAIN}\"|" "$APP_DIR/.env" && rm -f "$APP_DIR/.env.bak"
-        else
-          printf "\nAPP_URL=\"https://%s\"\n" "$SSL_DOMAIN" >> "$APP_DIR/.env"
-        fi
-      fi
+      upsert_env_var "AETHERFLOW_DOMAIN" "\"${SSL_DOMAIN}\""
+      upsert_env_var "AETHERFLOW_SSL_ACTIVE" "\"true\""
+      upsert_env_var "APP_URL" "\"https://${SSL_DOMAIN}\""
       log "HTTPS SSL active at https://${SSL_DOMAIN}"
     else
+      upsert_env_var "AETHERFLOW_DOMAIN" "\"${SSL_DOMAIN}\""
+      upsert_env_var "AETHERFLOW_SSL_ACTIVE" "\"pending\""
       warn "Certbot SSL issuance failed (ensure DNS A-record points to this server and port 80 is open). Re-run: sudo certbot --nginx -d ${SSL_DOMAIN}"
     fi
   fi

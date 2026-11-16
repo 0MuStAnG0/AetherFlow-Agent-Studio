@@ -180,6 +180,28 @@ const PROJECTS_ORIGINALS_BASE = path.resolve('/tmp/aetherflow_projects_originals
 
 // Initialize SQLite database on boot and wire persistent user sessions
 getDb();
+{
+  const envDomainRaw = (process.env.AETHERFLOW_DOMAIN || '').trim();
+  if (envDomainRaw) {
+    const check = validateDomainHostname(envDomainRaw);
+    if (check.valid) {
+      const existing = listNginxDomains().find((d) => d.domain === check.domain);
+      if (!existing) {
+        upsertNginxDomain({
+          domain: check.domain,
+          upstreamPort: clampUpstreamPort(PORT),
+          sslMode: 'letsencrypt',
+          sslEmail: (process.env.AETHERFLOW_EMAIL || '').trim() || undefined,
+          redirectWww: false,
+          clientMaxBodyMb: 50,
+          enableWebsocket: true,
+          enableHsts: true,
+          status: process.env.AETHERFLOW_SSL_ACTIVE === 'true' ? 'active' : 'draft',
+        });
+      }
+    }
+  }
+}
 registerUserSessionResolver({
   isUserAuthRequired: () => countUsers() > 0 && getAuthPolicy().requireAuth,
   verifyUserCookie: (cookieVal: string) => {

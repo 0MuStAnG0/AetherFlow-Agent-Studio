@@ -18,14 +18,24 @@ curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/m
 curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
 ```
 
+### نصب و اتصال خودکار دامنه + گواهی HTTPS (Nginx + Let's Encrypt):
+اسکریپت نصب هنگام اجرا به‌صورت خودکار **نام دامنه (و ایمیل اختیاری)** را از شما می‌پرسد تا **Nginx Reverse Proxy** و گواهی رایگان **HTTPS SSL** را تنظیم و فعال کند (برای رد کردن این مرحله کافیست کلید Enter را بزنید یا فلگ `--no-domain` را بدهید):
+```bash
+curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd
+```
+یا تعیین مستقیم دامنه در دستور نصب:
+```bash
+curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --domain studio.example.com
+```
+
 ### نصب با Docker Compose (نصب خودکار Docker Engine در صورت نبودن):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --docker
 ```
 
-### تنظیم پورت دلخواه (مثلاً پورت `8080`) یا مسیر نصب:
+### تنظیم پورت دلخواه (مثلاً پورت `8080`)، مسیر نصب یا نصب بدون سوال (`--no-domain`):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --dir /opt/aetherflow-studio --port 8080
+curl -fsSL https://raw.githubusercontent.com/0MuStAnG0/AetherFlow-Agent-Studio/main/install-linux.sh | bash -s -- --systemd --dir /opt/aetherflow-studio --port 8080 --no-domain
 ```
 
 ---
