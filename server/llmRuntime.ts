@@ -17,6 +17,7 @@ import {
   buildCompactSystemPrompt,
   compactConversationHistory,
   truncateMiddle,
+  type ActiveManagerAssignment,
 } from '../src/utils/promptOptimizer.ts';
 import { estimateTokenUsage, isManagerNode } from '../src/utils/workflowEngine.ts';
 
@@ -263,16 +264,20 @@ export function buildGeminiToolDeclarations(node: WorkflowNode): FunctionDeclara
   if (isManagerNode(node)) {
     declarations.push({
       name: 'delegate_agent',
-      description: 'Delegate an issue to a specialist agent.',
+      description: 'Delegate an issue or question to a specialist agent so they can respond directly.',
       parameters: {
         type: Type.OBJECT,
         properties: {
           targetRole: {
             type: Type.STRING,
-            description: 'backend | frontend | security_qa | executor',
+            description: 'backend | frontend | security_qa | executor | custom',
           },
-          issue: { type: Type.STRING, description: 'Short issue summary' },
-          reason: { type: Type.STRING, description: 'Expected fix' },
+          targetAgent: {
+            type: Type.STRING,
+            description: 'Optional exact specialist name (useful for custom agents)',
+          },
+          issue: { type: Type.STRING, description: 'Short issue or question summary' },
+          reason: { type: Type.STRING, description: 'Expected fix or answer' },
         },
         required: ['targetRole', 'issue', 'reason'],
       },
@@ -464,6 +469,8 @@ export async function generateLiveAgentReply(params: {
   history: Array<{ role: string; content: string }>;
   isGroupDiscussion?: boolean;
   teammates?: string[];
+  managerName?: string;
+  activeAssignment?: ActiveManagerAssignment | null;
   inspectionSnapshot?: string;
   delegationPhase?: 'test' | 'deploy' | 'review';
   signal?: AbortSignal;
@@ -479,6 +486,8 @@ export async function generateLiveAgentReply(params: {
     history,
     isGroupDiscussion,
     teammates,
+    managerName,
+    activeAssignment = null,
     inspectionSnapshot,
     delegationPhase,
     signal,
@@ -497,6 +506,8 @@ export async function generateLiveAgentReply(params: {
     isManager: isManagerNode(node),
     isGroupDiscussion,
     teammates,
+    managerName,
+    activeAssignment,
     delegationPhase,
   });
   const systemInstruction = systemPromptMeta.systemPrompt;
@@ -519,10 +530,21 @@ export async function generateLiveAgentReply(params: {
       : usage;
 
   const snapshotBlock = trimmedSnapshot ? `\n\n[AUDIT]\n${trimmedSnapshot}` : '';
+  const assignmentCue =
+    activeAssignment && !isManagerNode(node)
+      ? `\n\n[DIRECT MESSAGE FROM MANAGER @${activeAssignment.managerName}]:\n` +
+        `Issue/Request: ${activeAssignment.issue}\n` +
+        (activeAssignment.reason && activeAssignment.reason !== activeAssignment.issue
+          ? `Expected outcome: ${activeAssignment.reason}\n`
+          : '') +
+        `Address @${activeAssignment.managerName} directly in the conversation's language, answer clearly like a collaborative teammate, apply any required file fixes, and report your exact result.`
+      : '';
   const transcript =
     compactedHistory.messages
       .map((m) => `[${m.role.toUpperCase()}]:\n${m.content}`)
-      .join('\n\n---\n\n') + snapshotBlock;
+      .join('\n\n---\n\n') +
+    snapshotBlock +
+    assignmentCue;
   const promptInputText = `${systemInstruction}\n${transcript}`;
   const userContent = `${transcript}\n\nReply as ${node.data.label}:`;
 

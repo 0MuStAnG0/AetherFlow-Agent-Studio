@@ -218,19 +218,35 @@ test('POST /api/chat/message in Persian generates Persian changeReport at /api/r
   assert.ok(chatJson.runId);
   createdRunIds.push(chatJson.runId);
 
-  // Wait briefly for dry-run group round to finalize and persist changeReport
+  // Wait for dry-run group round (including closed-loop Manager -> Specialist -> Manager) to finalize
   let reportJson: {
-    run?: { chatLanguage?: string };
-    changeReport?: { language: string; summaryText: string };
+    run?: { chatLanguage?: string; status?: string };
+    changeReport?: {
+      language: string;
+      summaryText: string;
+      agentReports?: Array<{
+        agentId: string;
+        agentName: string;
+        role: string;
+        delegationsIssued: number;
+        delegationsReceived: number;
+        repliedToManager: boolean;
+        workSummary: string;
+      }>;
+    };
   } = {};
-  for (let i = 0; i < 15; i += 1) {
+  for (let i = 0; i < 30; i += 1) {
     await new Promise((r) => setTimeout(r, 250));
     const repRes = await fetch(
       `${baseUrl}/api/runs/${encodeURIComponent(chatJson.runId)}/report`,
     );
     if (repRes.ok) {
       reportJson = (await repRes.json()) as typeof reportJson;
-      if (reportJson.changeReport && reportJson.run?.chatLanguage === 'fa') {
+      if (
+        reportJson.run?.status === 'completed' &&
+        reportJson.changeReport &&
+        (reportJson.changeReport.agentReports?.length ?? 0) >= 2
+      ) {
         break;
       }
     }
@@ -238,7 +254,122 @@ test('POST /api/chat/message in Persian generates Persian changeReport at /api/r
 
   assert.equal(reportJson.run?.chatLanguage, 'fa');
   assert.equal(reportJson.changeReport?.language, 'fa');
-  assert.match(reportJson.changeReport?.summaryText ?? '', /تغییرات|گزارش|فایل/);
+  assert.match(reportJson.changeReport?.summaryText ?? '', /گزارش کار هر ایجنت/);
+  assert.ok((reportJson.changeReport?.agentReports?.length ?? 0) >= 2);
+  assert.ok(
+    reportJson.changeReport!.agentReports!.some((ar) => ar.repliedToManager),
+    'Expected at least one delegated specialist to reply directly to the Manager',
+  );
+
+  const runDetailRes = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(chatJson.runId)}`);
+  assert.equal(runDetailRes.status, 200);
+  const runDetail = (await runDetailRes.json()) as {
+    events: Array<{ type: string; replyingToManager?: string }>;
+  };
+  assert.ok(
+    runDetail.events.some((e) => e.type === 'manager_delegation'),
+    'Expected manager_delegation event in GroupChat run',
+  );
+  assert.ok(
+    runDetail.events.some((e) => e.type === 'agent_message' && Boolean(e.replyingToManager)),
+    'Expected specialist agent_message with replyingToManager populated',
+  );
+});
+
+test('POST /api/chat/message in live mode on unconfigured agent emits agent_error and records it in report', async () => {
+  const wfId = `wf-live-err-${Date.now()}`;
+  createdWorkflowIds.push(wfId);
+
+  const saveRes = await fetch(`${baseUrl}/api/workflows`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: wfId,
+      name: 'Live Error Verification Flow',
+      description: 'Verifies agent_error popup payload on missing provider key',
+      maxRounds: 4,
+      humanInTheLoop: false,
+      nodes: [
+        {
+          id: 'node-unconfigured-openai',
+          type: 'agentNode',
+          position: { x: 180, y: 120 },
+          data: {
+            role: 'backend',
+            label: 'Unconfigured OpenAI Backend',
+            provider: 'openai',
+            model: 'gpt-4o',
+            envSecretRef: 'NON_EXISTENT_TEST_OPENAI_KEY_XYZ',
+            systemPrompt: 'Implement API endpoints.',
+            temperature: 0.2,
+            tools: { readFile: true, writeFile: false, execBash: false },
+            status: 'idle',
+          },
+        },
+      ],
+      edges: [],
+      updatedAt: new Date().toISOString(),
+    }),
+  });
+  assert.equal(saveRes.status, 200);
+
+  const chatRes = await fetch(`${baseUrl}/api/chat/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      workflowId: wfId,
+      targetAgentId: 'node-unconfigured-openai',
+      message: 'Check API health endpoint',
+      mode: 'live',
+    }),
+  });
+  assert.equal(chatRes.status, 200);
+  const chatJson = (await chatRes.json()) as { runId: string };
+  assert.ok(chatJson.runId);
+  createdRunIds.push(chatJson.runId);
+
+  let runDetail: {
+    status?: string;
+    events?: Array<{
+      type: string;
+      agentId?: string;
+      provider?: string;
+      model?: string;
+      errorSource?: string;
+      content: string;
+    }>;
+  } = {};
+  for (let i = 0; i < 20; i += 1) {
+    await new Promise((r) => setTimeout(r, 150));
+    const res = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(chatJson.runId)}`);
+    if (res.ok) {
+      runDetail = (await res.json()) as typeof runDetail;
+      if (runDetail.events?.some((e) => e.type === 'agent_error')) break;
+    }
+  }
+
+  const errEvt = runDetail.events?.find((e) => e.type === 'agent_error');
+  assert.ok(errEvt, 'Expected agent_error event for unconfigured live agent');
+  assert.equal(errEvt!.agentId, 'node-unconfigured-openai');
+  assert.equal(errEvt!.provider, 'openai');
+  assert.equal(errEvt!.model, 'gpt-4o');
+  assert.equal(errEvt!.errorSource, 'config');
+
+  const repRes = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(chatJson.runId)}/report`);
+  assert.equal(repRes.status, 200);
+  const repJson = (await repRes.json()) as {
+    changeReport?: {
+      stats: { totalErrors?: number };
+      agentReports?: Array<{ agentId: string; status: string; errors: string[] }>;
+    };
+  };
+  assert.ok((repJson.changeReport?.stats.totalErrors ?? 0) >= 1);
+  const agentRep = repJson.changeReport?.agentReports?.find(
+    (a) => a.agentId === 'node-unconfigured-openai',
+  );
+  assert.ok(agentRep);
+  assert.equal(agentRep!.status, 'error');
+  assert.ok(agentRep!.errors.length >= 1);
 });
 
 test('POST /api/webhooks/:workflowId enforces webhookSecret when configured', async () => {

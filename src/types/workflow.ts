@@ -18,6 +18,20 @@ export type AgentPowerLevel = 'eco' | 'standard' | 'pro' | 'ultra';
 
 export type TokenOptimizationMode = 'ultra_compact' | 'balanced' | 'off';
 
+export interface AgentErrorAlert {
+  id: string;
+  agentId: string;
+  agentName: string;
+  title: string;
+  message: string;
+  source: 'llm' | 'tool' | 'config' | 'runtime';
+  provider?: LLMProvider;
+  model?: string;
+  round?: number;
+  timestamp: string;
+  dismissed?: boolean;
+}
+
 export interface AgentNodeData extends Record<string, unknown> {
   label: string;
   role: AgentRole;
@@ -32,6 +46,7 @@ export interface AgentNodeData extends Record<string, unknown> {
   systemPrompt: string;
   tools: AgentToolsConfig;
   status?: 'idle' | 'speaking' | 'waiting_approval' | 'done' | 'error';
+  errorAlert?: AgentErrorAlert | null;
 }
 
 export interface WorkflowNode {
@@ -194,6 +209,7 @@ export interface ExecutionEvent {
     | 'user_message'
     | 'agent_chunk'
     | 'agent_message'
+    | 'agent_error'
     | 'tool_executed'
     | 'bug_reported'
     | 'manager_delegation'
@@ -208,6 +224,8 @@ export interface ExecutionEvent {
   role?: AgentRole;
   provider?: LLMProvider;
   model?: string;
+  errorSource?: 'llm' | 'tool' | 'config' | 'runtime';
+  replyingToManager?: string;
   content: string;
   streamDone?: boolean;
   durationMs?: number;
@@ -264,6 +282,28 @@ export interface RunCommandSummary {
   outputPreview?: string;
 }
 
+export interface RunAgentWorkReport {
+  agentId: string;
+  agentName: string;
+  role: AgentRole;
+  section?: string;
+  positionTitle?: string;
+  provider?: LLMProvider;
+  model?: string;
+  status: 'completed' | 'error' | 'warning';
+  roundsSpoken: number;
+  durationMs: number;
+  delegationsIssued: number;
+  delegationsReceived: number;
+  repliedToManager: boolean;
+  filesModified: string[];
+  commandsExecuted: number;
+  bugsLogged: number;
+  errors: string[];
+  highlights: string[];
+  workSummary: string;
+}
+
 export interface RunChangeReport {
   runId: string;
   workflowName: string;
@@ -280,6 +320,7 @@ export interface RunChangeReport {
     totalDeletions: number;
     totalCommands: number;
     totalBugs: number;
+    totalErrors?: number;
   };
   fileChanges: RunChangeFileEntry[];
   commands: RunCommandSummary[];
@@ -291,6 +332,7 @@ export interface RunChangeReport {
     status: 'open' | 'acknowledged' | 'resolved';
     agentName: string;
   }>;
+  agentReports?: RunAgentWorkReport[];
   generatedAt: string;
 }
 

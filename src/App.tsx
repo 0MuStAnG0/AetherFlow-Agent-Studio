@@ -38,6 +38,7 @@ import {
   type AgentRoleTemplate,
 } from './data/agentTemplates';
 import type {
+  AgentErrorAlert,
   AgentNodeData,
   AgentRole,
   AppSettings,
@@ -204,6 +205,7 @@ export default function App() {
   const [waitingNodeId, setWaitingNodeId] = useState<string | null>(null);
   const [completedNodeIds, setCompletedNodeIds] = useState<Set<string>>(() => new Set());
   const [errorNodeIds, setErrorNodeIds] = useState<Set<string>>(() => new Set());
+  const [agentErrors, setAgentErrors] = useState<Record<string, AgentErrorAlert>>({});
   const [pendingApproval, setPendingApproval] = useState<{
     approvalId: string;
     agentName: string;
@@ -456,6 +458,37 @@ export default function App() {
           } else if (evt.type === 'manager_delegation' && evt.delegation) {
             setActiveNodeId(evt.delegation.targetAgentId);
             setWaitingNodeId(null);
+          } else if (evt.type === 'agent_error' && evt.agentId) {
+            setStreamingEvents((prev) => {
+              if (!prev[evt.agentId!]) return prev;
+              const next = { ...prev };
+              delete next[evt.agentId!];
+              return next;
+            });
+            setErrorNodeIds((prev) => new Set(prev).add(evt.agentId!));
+            setAgentErrors((prev) => ({
+              ...prev,
+              [evt.agentId!]: {
+                id: evt.id,
+                agentId: evt.agentId!,
+                agentName: evt.agentName || evt.agentId!,
+                title:
+                  evt.errorSource === 'config'
+                    ? lang === 'fa'
+                      ? 'کلید API تنظیم نشده است'
+                      : 'API Key Missing'
+                    : lang === 'fa'
+                      ? 'خطای اجرای ایجنت'
+                      : 'Agent Execution Error',
+                message: evt.content,
+                source: evt.errorSource ?? 'llm',
+                provider: evt.provider,
+                model: evt.model,
+                round: evt.round,
+                timestamp: evt.timestamp,
+                dismissed: false,
+              },
+            }));
           } else if (evt.type === 'agent_message') {
             if (evt.agentId) {
               setStreamingEvents((prev) => {
@@ -469,17 +502,37 @@ export default function App() {
             setWaitingNodeId(null);
             setIsSendingChat(false);
             if (evt.agentId) {
-              const hadToolErr = Boolean(
-                evt.toolCalls?.some((tc) => (tc.exitCode ?? 0) !== 0),
-              );
-              if (hadToolErr) {
+              const failingTool = evt.toolCalls?.find((tc) => (tc.exitCode ?? 0) !== 0);
+              if (failingTool) {
                 setErrorNodeIds((prev) => new Set(prev).add(evt.agentId!));
+                setAgentErrors((prev) => ({
+                  ...prev,
+                  [evt.agentId!]: {
+                    id: failingTool.id || evt.id,
+                    agentId: evt.agentId!,
+                    agentName: evt.agentName || evt.agentId!,
+                    title: lang === 'fa' ? 'خطای اجرای ابزار' : 'Tool Execution Failed',
+                    message: `${failingTool.tool}(${failingTool.target}) [exit ${failingTool.exitCode}]: ${(failingTool.result || '').slice(0, 260)}`,
+                    source: 'tool',
+                    provider: evt.provider,
+                    model: evt.model,
+                    round: evt.round,
+                    timestamp: evt.timestamp,
+                    dismissed: false,
+                  },
+                }));
               } else {
                 setCompletedNodeIds((prev) => new Set(prev).add(evt.agentId!));
                 setErrorNodeIds((prev) => {
                   if (!prev.has(evt.agentId!)) return prev;
                   const next = new Set(prev);
                   next.delete(evt.agentId!);
+                  return next;
+                });
+                setAgentErrors((prev) => {
+                  if (!prev[evt.agentId!]) return prev;
+                  const next = { ...prev };
+                  delete next[evt.agentId!];
                   return next;
                 });
               }
@@ -504,6 +557,26 @@ export default function App() {
             setStreamingEvents({});
             if (evt.type === 'run_error' && evt.agentId) {
               setErrorNodeIds((prev) => new Set(prev).add(evt.agentId!));
+              setAgentErrors((prev) =>
+                prev[evt.agentId!]
+                  ? prev
+                  : {
+                      ...prev,
+                      [evt.agentId!]: {
+                        id: evt.id,
+                        agentId: evt.agentId!,
+                        agentName: evt.agentName || evt.agentId!,
+                        title: lang === 'fa' ? 'خطای ایجنت' : 'Agent Error',
+                        message: evt.content,
+                        source: evt.errorSource ?? 'runtime',
+                        provider: evt.provider,
+                        model: evt.model,
+                        round: evt.round,
+                        timestamp: evt.timestamp,
+                        dismissed: false,
+                      },
+                    },
+              );
             }
             setIsRunning(false);
             setIsSendingChat(false);
@@ -519,7 +592,7 @@ export default function App() {
         }
       };
     },
-    [loadBugReports, loadRunsHistory, refreshSandboxFiles],
+    [lang, loadBugReports, loadRunsHistory, refreshSandboxFiles],
   );
 
   useEffect(() => {
@@ -1282,9 +1355,47 @@ export default function App() {
     setWaitingNodeId(null);
     setCompletedNodeIds(new Set());
     setErrorNodeIds(new Set());
+    setAgentErrors({});
     setValidationError(null);
     setPromptEnhancedNotice(null);
   };
+
+  const handleDismissAgentError = useCallback((nodeId: string) => {
+    setAgentErrors((prev) => {
+      const existing = prev[nodeId];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        [nodeId]: { ...existing, dismissed: true },
+      };
+    });
+  }, []);
+
+  const handleReopenAgentError = useCallback((nodeId: string) => {
+    setAgentErrors((prev) => {
+      const existing = prev[nodeId];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        [nodeId]: { ...existing, dismissed: false },
+      };
+    });
+  }, []);
+
+  const handleInspectAgentError = useCallback(
+    (nodeId: string) => {
+      const existing = agentErrors[nodeId];
+      setSelectedNodeId(nodeId);
+      setSelectedEdgeId(null);
+      if (existing?.source === 'config') {
+        setTopView('settings');
+      } else {
+        setRightTab('inspector');
+        setMobileWorkspacePane('panel');
+      }
+    },
+    [agentErrors],
+  );
 
   const handleConvertToPrompt = async () => {
     const clean = taskPrompt.trim();
@@ -1465,6 +1576,7 @@ export default function App() {
     setPendingApproval(null);
     setCompletedNodeIds(new Set());
     setErrorNodeIds(new Set());
+    setAgentErrors({});
     setIsRunning(true);
     setRightTab('execution');
 
@@ -1515,6 +1627,7 @@ export default function App() {
     setPendingApproval(null);
     setCompletedNodeIds(new Set());
     setErrorNodeIds(new Set());
+    setAgentErrors({});
     setIsRunning(true);
     setTopView('canvas');
     setRightTab('execution');
@@ -1580,6 +1693,7 @@ export default function App() {
     setRightTab('execution');
     setCompletedNodeIds(new Set());
     setErrorNodeIds(new Set());
+    setAgentErrors({});
     const res = await fetch(`/api/runs/${runId}`);
     if (res.ok) {
       const data = (await res.json()) as { events?: ExecutionEvent[] };
@@ -1587,19 +1701,56 @@ export default function App() {
       setEvents(loadedEvents);
       const doneIds = new Set<string>();
       const errIds = new Set<string>();
+      const replayedErrors: Record<string, AgentErrorAlert> = {};
       for (const evt of loadedEvents) {
         if (evt.type === 'agent_message' && evt.agentId) {
-          if (evt.toolCalls?.some((tc) => (tc.exitCode ?? 0) !== 0)) {
+          const failingTool = evt.toolCalls?.find((tc) => (tc.exitCode ?? 0) !== 0);
+          if (failingTool) {
             errIds.add(evt.agentId);
+            replayedErrors[evt.agentId] = {
+              id: failingTool.id || evt.id,
+              agentId: evt.agentId,
+              agentName: evt.agentName || evt.agentId,
+              title: lang === 'fa' ? 'خطای اجرای ابزار' : 'Tool Execution Failed',
+              message: `${failingTool.tool}(${failingTool.target}) [exit ${failingTool.exitCode}]: ${(failingTool.result || '').slice(0, 260)}`,
+              source: 'tool',
+              provider: evt.provider,
+              model: evt.model,
+              round: evt.round,
+              timestamp: evt.timestamp,
+              dismissed: false,
+            };
           } else {
             doneIds.add(evt.agentId);
+            delete replayedErrors[evt.agentId];
           }
-        } else if (evt.type === 'run_error' && evt.agentId) {
+        } else if ((evt.type === 'agent_error' || evt.type === 'run_error') && evt.agentId) {
           errIds.add(evt.agentId);
+          replayedErrors[evt.agentId] = {
+            id: evt.id,
+            agentId: evt.agentId,
+            agentName: evt.agentName || evt.agentId,
+            title:
+              evt.errorSource === 'config'
+                ? lang === 'fa'
+                  ? 'کلید API تنظیم نشده است'
+                  : 'API Key Missing'
+                : lang === 'fa'
+                  ? 'خطای اجرای ایجنت'
+                  : 'Agent Execution Error',
+            message: evt.content,
+            source: evt.errorSource ?? (evt.type === 'agent_error' ? 'llm' : 'runtime'),
+            provider: evt.provider,
+            model: evt.model,
+            round: evt.round,
+            timestamp: evt.timestamp,
+            dismissed: false,
+          };
         }
       }
       setCompletedNodeIds(doneIds);
       setErrorNodeIds(errIds);
+      setAgentErrors(replayedErrors);
     }
     await refreshSandboxFiles(runId);
   };
@@ -1668,6 +1819,7 @@ export default function App() {
     setPendingApproval(null);
     setCompletedNodeIds(new Set());
     setErrorNodeIds(new Set());
+    setAgentErrors({});
     setIsRunning(true);
     setTopView('canvas');
     setRightTab('execution');
@@ -2439,11 +2591,15 @@ export default function App() {
                     waitingNodeId={waitingNodeId}
                     completedNodeIds={completedNodeIds}
                     errorNodeIds={errorNodeIds}
+                    agentErrors={agentErrors}
                     selectedNodeId={selectedNodeId}
                     selectedEdgeId={selectedEdgeId}
                     lang={lang}
                     showMiniMap={appSettings.showMiniMap}
                     gridVariant={appSettings.canvasGridVariant}
+                    onDismissAgentError={handleDismissAgentError}
+                    onReopenAgentError={handleReopenAgentError}
+                    onInspectAgentError={handleInspectAgentError}
                     onNodesChange={(changes: NodeChange<Node<AgentNodeData>>[]) => {
                       const removedIds = new Set(
                         changes.filter((c) => c.type === 'remove').map((c) => c.id),

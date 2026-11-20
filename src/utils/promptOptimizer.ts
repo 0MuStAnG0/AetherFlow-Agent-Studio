@@ -133,7 +133,15 @@ export function compactConversationHistory(
   }
 
   const droppedCount = Math.max(0, rest.length - keepRecentCount);
+  const droppedTurns = droppedCount > 0 ? rest.slice(0, droppedCount) : [];
   const recentWindow = rest.slice(-keepRecentCount);
+
+  const recentHasManager = recentWindow.some(
+    (t) => /manager|مدیر/i.test(t.role),
+  );
+  const latestDroppedManager = !recentHasManager
+    ? [...droppedTurns].reverse().find((t) => /manager|مدیر/i.test(t.role))
+    : undefined;
 
   const compactedRecent = recentWindow.map((turn, idx) => {
     const isLatestTurn = idx === recentWindow.length - 1;
@@ -163,13 +171,20 @@ export function compactConversationHistory(
     };
   });
 
+  const managerCarryover = latestDroppedManager
+    ? ` Latest Manager directive (${latestDroppedManager.role}): ${truncateMiddle(
+        compactCodeBlocksInMessage(latestDroppedManager.content, 1),
+        mode === 'ultra_compact' ? 140 : 240,
+      )}`
+    : '';
+
   const messages: ConversationTurn[] = [
     ...pinned,
     ...(droppedCount > 0
       ? [
           {
             role: 'context',
-            content: `[${droppedCount} earlier turn(s) omitted to save tokens; use read_file for file inspection]`,
+            content: `[${droppedCount} earlier turn(s) omitted to save tokens; use read_file for file inspection.${managerCarryover}]`,
           },
         ]
       : []),
@@ -188,6 +203,13 @@ export function compactConversationHistory(
   };
 }
 
+export interface ActiveManagerAssignment {
+  managerName: string;
+  issue: string;
+  reason?: string;
+  phase?: 'test' | 'deploy' | 'review';
+}
+
 export function buildCompactSystemPrompt(params: {
   node: WorkflowNode;
   mode?: TokenOptimizationMode;
@@ -195,6 +217,8 @@ export function buildCompactSystemPrompt(params: {
   isManager?: boolean;
   isGroupDiscussion?: boolean;
   teammates?: string[];
+  managerName?: string;
+  activeAssignment?: ActiveManagerAssignment | null;
   delegationPhase?: 'test' | 'deploy' | 'review';
 }): {
   systemPrompt: string;
@@ -209,6 +233,8 @@ export function buildCompactSystemPrompt(params: {
     isManager = false,
     isGroupDiscussion = false,
     teammates = [],
+    managerName,
+    activeAssignment = null,
     delegationPhase = 'review',
   } = params;
 
@@ -230,6 +256,20 @@ export function buildCompactSystemPrompt(params: {
     toolsList.push(nativeToolsEnabled ? 'exec_bash' : 'EXEC_BASH:<cmd>');
   }
 
+  const assignmentBlock =
+    !isManager && activeAssignment
+      ? `\nDirect Assignment from Manager @${activeAssignment.managerName}: "${truncateMiddle(
+          compactPromptText(activeAssignment.issue),
+          140,
+        )}"${
+          activeAssignment.reason && activeAssignment.reason !== activeAssignment.issue
+            ? ` (Reason: ${truncateMiddle(compactPromptText(activeAssignment.reason), 110)})`
+            : ''
+        }. Respond directly to @${activeAssignment.managerName} like a collaborative human engineer: acknowledge their request, report concrete changes/results, and state any blockers or next steps.`
+      : !isManager && managerName
+        ? `\nTeam Lead: @${managerName}. Communicate naturally like a senior teammate—answer @${managerName}'s questions directly, summarize what you changed/verified, and flag blockers clearly.`
+        : '';
+
   if (mode === 'off') {
     const full = compactPromptText(
       `${node.data.systemPrompt}\n` +
@@ -239,12 +279,13 @@ export function buildCompactSystemPrompt(params: {
         (node.data.responsibility ? `\nResponsibility: ${node.data.responsibility}` : '') +
         `\nProfile: ${powerMeta.en} — ${powerMeta.directive}` +
         `\nTools: ${toolsList.join(', ') || 'None'}` +
-        `\nEdit files directly in source/test folders; write change notes only in README.md. Keep reply under 240 words.` +
+        `\nEdit files directly in source/test folders; write change notes only in README.md. Keep reply natural, collaborative, and under 240 words.` +
         (isManager
-          ? `\nManager (${delegationPhase}): audit sandbox & bugs. Call delegate_agent or DELEGATE: {"targetRole":"backend"|"frontend"|"security_qa"|"executor","issue":"...","reason":"..."} if defects exist; emit TERMINATE only when clean.`
+          ? `\nManager (${delegationPhase}): collaborate naturally with teammates, review their replies & sandbox results, and call delegate_agent or DELEGATE: {"targetRole":"backend"|"frontend"|"security_qa"|"executor","targetAgent":"<exact agent name if custom>","issue":"...","reason":"..."} whenever a specialist must answer or fix something; emit TERMINATE only after specialists confirm everything is clean.`
           : '') +
+        assignmentBlock +
         (isGroupDiscussion
-          ? `\nGroupChat teammates: ${teammates.join(', ')}. Reply directly in User's language; no TERMINATE unless requested.`
+          ? `\nGroupChat teammates: ${teammates.join(', ')}. Reply directly in User's language with human-like clarity; no TERMINATE unless requested.`
           : `\nReply in User's language.`) +
         `\nTo log issues call report_bug or emit BUG_REPORT: {"category":"bug"|"improvement","severity":"critical"|"high"|"medium"|"low","title":"...","description":"...","suggestedFix":"..."}`,
     );
@@ -274,11 +315,22 @@ export function buildCompactSystemPrompt(params: {
       : 'Tools: none.';
 
   const managerRule = isManager
-    ? `\nMgr(${delegationPhase}): if bugs/failures exist, call ${nativeToolsEnabled ? 'delegate_agent' : 'DELEGATE:{"targetRole":"backend|frontend|security_qa|executor","issue":"...","reason":"..."}'}; else emit TERMINATE.`
+    ? `\nMgr(${delegationPhase}): review replies & bugs; if fixes/answers needed, call ${nativeToolsEnabled ? 'delegate_agent' : 'DELEGATE:{"targetRole":"backend|frontend|security_qa|executor","targetAgent":"name","issue":"...","reason":"..."}'}; else confirm & emit TERMINATE.`
     : '';
 
+  const compactAssignmentRule =
+    !isManager && activeAssignment
+      ? `\nReply to @${activeAssignment.managerName} on "${truncateMiddle(compactPromptText(activeAssignment.issue), 95)}"${
+          activeAssignment.reason && activeAssignment.reason !== activeAssignment.issue
+            ? ` (${truncateMiddle(compactPromptText(activeAssignment.reason), 75)})`
+            : ''
+        }: confirm fix/findings & blockers clearly.`
+      : !isManager && managerName
+        ? `\nCollaborate naturally; address @${managerName} when reporting results/blockers.`
+        : '';
+
   const groupRule = isGroupDiscussion
-    ? `\nRoom(${teammates.slice(0, 5).join(', ')}): address user & prior speakers; match user language; no TERMINATE.`
+    ? `\nRoom(${teammates.slice(0, 5).join(', ')}): reply naturally to user & teammates; match user language; no TERMINATE.`
     : `\nMatch user language.`;
 
   const bugRule = nativeToolsEnabled
@@ -291,6 +343,7 @@ export function buildCompactSystemPrompt(params: {
     `${toolLine} ${bugRule}\n` +
     `Rules: edit real src/test paths directly (changelog only in README.md); avoid repeating unchanged code; stay under ${wordBudget} words.` +
     managerRule +
+    compactAssignmentRule +
     groupRule;
 
   const optimizedTokens = estimateCharTokens(compact);

@@ -16,6 +16,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import { GitBranch, Trash2, X } from 'lucide-react';
 import type {
+  AgentErrorAlert,
   AgentNodeData,
   AgentRole,
   EdgeConditionType,
@@ -37,6 +38,7 @@ interface WorkflowCanvasProps {
   waitingNodeId: string | null;
   completedNodeIds?: Set<string>;
   errorNodeIds?: Set<string>;
+  agentErrors?: Record<string, AgentErrorAlert>;
   selectedNodeId: string | null;
   selectedEdgeId?: string | null;
   lang?: 'en' | 'fa';
@@ -52,6 +54,9 @@ interface WorkflowCanvasProps {
   onEditNode?: (nodeId: string) => void;
   onDuplicateNode?: (nodeId: string) => void;
   onDeleteNode?: (nodeId: string) => void;
+  onDismissAgentError?: (nodeId: string) => void;
+  onReopenAgentError?: (nodeId: string) => void;
+  onInspectAgentError?: (nodeId: string) => void;
   onDropTemplate: (role: AgentRole, position: { x: number; y: number }) => void;
 }
 
@@ -69,6 +74,7 @@ export function WorkflowCanvas({
   waitingNodeId,
   completedNodeIds,
   errorNodeIds,
+  agentErrors,
   selectedNodeId,
   selectedEdgeId = null,
   lang = 'en',
@@ -84,12 +90,31 @@ export function WorkflowCanvas({
   onEditNode,
   onDuplicateNode,
   onDeleteNode,
+  onDismissAgentError,
+  onReopenAgentError,
+  onInspectAgentError,
   onDropTemplate,
 }: WorkflowCanvasProps) {
   const { screenToFlowPosition } = useReactFlow();
   const canvasActions = useMemo(
-    () => ({ onEditNode, onDuplicateNode, onDeleteNode }),
-    [onEditNode, onDuplicateNode, onDeleteNode],
+    () => ({
+      lang,
+      onEditNode,
+      onDuplicateNode,
+      onDeleteNode,
+      onDismissAgentError,
+      onReopenAgentError,
+      onInspectAgentError,
+    }),
+    [
+      lang,
+      onEditNode,
+      onDuplicateNode,
+      onDeleteNode,
+      onDismissAgentError,
+      onReopenAgentError,
+      onInspectAgentError,
+    ],
   );
 
   const selectedEdge = useMemo(
@@ -104,24 +129,30 @@ export function WorkflowCanvas({
 
   const rfNodes: Node<AgentNodeData>[] = useMemo(
     () =>
-      nodes.map((n) => ({
-        ...n,
-        selected: n.id === selectedNodeId,
-        data: {
-          ...n.data,
-          status:
-            waitingNodeId === n.id
-              ? 'waiting_approval'
-              : activeNodeId === n.id
-                ? 'speaking'
-                : errorNodeIds?.has(n.id)
-                  ? 'error'
-                  : completedNodeIds?.has(n.id)
-                    ? 'done'
-                    : 'idle',
-        },
-      })),
-    [nodes, selectedNodeId, waitingNodeId, activeNodeId, errorNodeIds, completedNodeIds],
+      nodes.map((n) => {
+        const alert = agentErrors?.[n.id] ?? null;
+        const hasVisiblePopup = Boolean(alert && !alert.dismissed);
+        return {
+          ...n,
+          selected: n.id === selectedNodeId,
+          ...(hasVisiblePopup ? { zIndex: 1000 } : {}),
+          data: {
+            ...n.data,
+            errorAlert: alert,
+            status:
+              waitingNodeId === n.id
+                ? 'waiting_approval'
+                : activeNodeId === n.id
+                  ? 'speaking'
+                  : errorNodeIds?.has(n.id) || Boolean(alert)
+                    ? 'error'
+                    : completedNodeIds?.has(n.id)
+                      ? 'done'
+                      : 'idle',
+          },
+        };
+      }),
+    [nodes, selectedNodeId, waitingNodeId, activeNodeId, errorNodeIds, completedNodeIds, agentErrors],
   );
 
   const rfEdges: Edge[] = useMemo(

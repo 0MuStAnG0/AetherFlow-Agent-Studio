@@ -409,6 +409,7 @@ export function selectNextSpeaker(params: {
   currentNodeId: string | null;
   roundIndex: number;
   maxRounds: number;
+  requestedNextAgentId?: string;
   requestedNextRole?: string;
   lastTurnHadError?: boolean;
   lastReply?: string;
@@ -419,6 +420,7 @@ export function selectNextSpeaker(params: {
     currentNodeId,
     roundIndex,
     maxRounds,
+    requestedNextAgentId,
     requestedNextRole,
     lastTurnHadError,
     lastReply,
@@ -442,20 +444,28 @@ export function selectNextSpeaker(params: {
   );
   const outgoingIds = outgoingEdges.map((e) => e.target);
 
+  if (requestedNextAgentId) {
+    const exactIdTarget = orderedNodes.find(
+      (n) => n.id === requestedNextAgentId && n.id !== currentNodeId,
+    );
+    if (exactIdTarget) {
+      return {
+        node: exactIdTarget,
+        reason: `Delegated by Manager to ${exactIdTarget.data.label}`,
+      };
+    }
+  }
+
   if (requestedNextRole) {
+    const cleanReq = requestedNextRole.trim().toLowerCase();
+    const matchesHint = (n: WorkflowNode) =>
+      n.data.role === requestedNextRole ||
+      n.data.label.toLowerCase().includes(cleanReq) ||
+      (n.data.section?.toLowerCase().includes(cleanReq) ?? false) ||
+      (n.data.positionTitle?.toLowerCase().includes(cleanReq) ?? false);
     const matchingTarget =
-      orderedNodes.find(
-        (n) =>
-          outgoingIds.includes(n.id) &&
-          (n.data.role === requestedNextRole ||
-            n.data.label.toLowerCase().includes(requestedNextRole.toLowerCase())),
-      ) ??
-      orderedNodes.find(
-        (n) =>
-          n.id !== currentNodeId &&
-          (n.data.role === requestedNextRole ||
-            n.data.label.toLowerCase().includes(requestedNextRole.toLowerCase())),
-      );
+      orderedNodes.find((n) => outgoingIds.includes(n.id) && matchesHint(n)) ??
+      orderedNodes.find((n) => n.id !== currentNodeId && matchesHint(n));
     if (matchingTarget) {
       return {
         node: matchingTarget,
@@ -748,12 +758,29 @@ export function findDomainSpecialistNode(
 ): WorkflowNode | null {
   const cleanRole = targetRole.trim().toLowerCase();
   const candidates = nodes.filter((n) => n.id !== excludeId);
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0 || !cleanRole) return null;
 
+  // 1. Exact ID or exact label match first (handles custom agents reliably)
+  const exactIdOrLabel = candidates.find(
+    (n) =>
+      n.id.toLowerCase() === cleanRole ||
+      n.data.label.trim().toLowerCase() === cleanRole,
+  );
+  if (exactIdOrLabel) return exactIdOrLabel;
+
+  // 2. Partial label / positionTitle / section match for custom & named specialists
+  const exactLabelPartial = candidates.find(
+    (n) =>
+      n.data.label.toLowerCase().includes(cleanRole) ||
+      (n.data.positionTitle?.toLowerCase().includes(cleanRole) ?? false),
+  );
+  if (exactLabelPartial && cleanRole !== 'custom') return exactLabelPartial;
+
+  // 3. Canonical role keyword match
   const normalizedRole: AgentRole | null =
-    cleanRole === 'backend' || cleanRole.includes('back') || cleanRole.includes('بک')
+    cleanRole === 'backend' || cleanRole.includes('back') || cleanRole.includes('بک') || cleanRole.includes('سرور')
       ? 'backend'
-      : cleanRole === 'frontend' || cleanRole.includes('front') || cleanRole.includes('فرانت')
+      : cleanRole === 'frontend' || cleanRole.includes('front') || cleanRole.includes('فرانت') || cleanRole.includes('رابط')
         ? 'frontend'
         : cleanRole === 'security_qa' ||
             cleanRole.includes('security') ||
@@ -777,9 +804,13 @@ export function findDomainSpecialistNode(
     if (exactRoleMatch) return exactRoleMatch;
   }
 
+  // 4. Section or responsibility fallback for specialized custom agents
   return (
-    candidates.find((n) => n.data.label.toLowerCase().includes(cleanRole)) ??
-    null
+    candidates.find(
+      (n) =>
+        (n.data.section?.toLowerCase().includes(cleanRole) ?? false) ||
+        (n.data.responsibility?.toLowerCase().includes(cleanRole) ?? false),
+    ) ?? null
   );
 }
 
@@ -804,12 +835,20 @@ export function extractManagerDelegations(
           issue?: string;
           reason?: string;
         };
-        const targetHint = (parsed.targetRole || parsed.targetAgent || '').trim();
+        const targetAgentHint = (parsed.targetAgent || '').trim();
+        const targetRoleHint = (parsed.targetRole || '').trim();
+        const targetHint = targetAgentHint || targetRoleHint;
         const issue = (parsed.issue || '').trim();
         const reason = (parsed.reason || '').trim();
         if (!targetHint || (!issue && !reason)) return '';
 
-        const targetNode = findDomainSpecialistNode(nodes, targetHint, managerNode.id);
+        const targetNode =
+          (targetAgentHint
+            ? findDomainSpecialistNode(nodes, targetAgentHint, managerNode.id)
+            : null) ??
+          (targetRoleHint
+            ? findDomainSpecialistNode(nodes, targetRoleHint, managerNode.id)
+            : null);
         if (!targetNode) return '';
 
         delegations.push({

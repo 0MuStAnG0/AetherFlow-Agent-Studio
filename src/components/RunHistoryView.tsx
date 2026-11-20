@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
+  Bot,
   Bug,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -16,6 +19,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  Users,
   X,
 } from 'lucide-react';
 import type { ExecutionRunSummary, RunChangeReport } from '../types/workflow';
@@ -53,6 +57,21 @@ const REPORT_COPY = {
     lineDelta: 'Line Changes',
     commandsCount: 'Commands Run',
     bugsCount: 'Issues Logged',
+    agentReportsHeading: 'Per-Agent Work Reports',
+    noAgentReports: 'No individual agent activity was recorded for this run.',
+    agentTurnsLabel: 'Turns',
+    agentFilesLabel: 'Files',
+    agentCommandsLabel: 'Cmds',
+    agentDelegationsOutLabel: 'Delegated',
+    agentDelegationsInLabel: 'Assigned',
+    agentBugsLabel: 'Issues',
+    agentErrorsLabel: 'Errors',
+    repliedToManagerLabel: 'Replied to Manager',
+    agentStatusText: {
+      completed: 'Completed',
+      warning: 'Warning',
+      error: 'Error',
+    },
     fileChangesHeading: 'Applied File Changes & Diffs',
     noFileChanges: 'No files were created, modified, or deleted during this run.',
     agentsLabel: 'Agents:',
@@ -91,6 +110,21 @@ const REPORT_COPY = {
     lineDelta: 'تغییرات خطوط',
     commandsCount: 'دستورات اجراشده',
     bugsCount: 'موارد گزارش‌شده',
+    agentReportsHeading: 'گزارش کار هر ایجنت',
+    noAgentReports: 'فعالیت مجزایی برای ایجنت‌ها در این اجرا ثبت نشده است.',
+    agentTurnsLabel: 'نوبت',
+    agentFilesLabel: 'فایل',
+    agentCommandsLabel: 'دستور',
+    agentDelegationsOutLabel: 'ارجاع داده',
+    agentDelegationsInLabel: 'ارجاع گرفته',
+    agentBugsLabel: 'باگ/ایده',
+    agentErrorsLabel: 'خطا',
+    repliedToManagerLabel: 'پاسخ مستقیم به مدیر',
+    agentStatusText: {
+      completed: 'موفق',
+      warning: 'دارای هشدار',
+      error: 'خطا',
+    },
     fileChangesHeading: 'فایل‌های تغییریافته و Diff خطوط',
     noFileChanges: 'در این اجرا هیچ فایلی ایجاد، ویرایش یا حذف نشده است.',
     agentsLabel: 'ایجنت‌های مسئول:',
@@ -232,6 +266,14 @@ export function RunHistoryView({
       '',
       report.summaryText,
     ];
+    if (report.agentReports && report.agentReports.length > 0) {
+      lines.push('', `--- ${rt.agentReportsHeading} ---`);
+      for (const ar of report.agentReports) {
+        lines.push(
+          `[${rt.agentStatusText[ar.status]}] ${ar.agentName} (${ar.role}): ${ar.workSummary}`,
+        );
+      }
+    }
     if (report.fileChanges.length > 0) {
       lines.push('', `--- ${rt.fileChangesHeading} ---`);
       for (const fc of report.fileChanges) {
@@ -410,6 +452,14 @@ export function RunHistoryView({
                           </span>
                         ) : (
                           <span className="text-slate-400">—</span>
+                        )}
+                        {run.changeReport?.agentReports && run.changeReport.agentReports.length > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                            <Users className="h-2.5 w-2.5 text-slate-400" />
+                            <span>
+                              {run.changeReport.agentReports.length} {isFa ? 'ایجنت' : 'agents'}
+                            </span>
+                          </span>
                         )}
                       </div>
                     </td>
@@ -630,6 +680,152 @@ export function RunHistoryView({
                       </div>
                     </div>
                   </div>
+
+                  {/* Per-Agent Work Reports */}
+                  <section data-testid="run-report-agent-reports">
+                    <div className="mb-2 flex items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-slate-100">
+                      <Users className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+                      <span>
+                        {rt.agentReportsHeading} ({report.agentReports?.length ?? 0})
+                      </span>
+                    </div>
+
+                    {!report.agentReports || report.agentReports.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-slate-200 px-4 py-4 text-center text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                        {rt.noAgentReports}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                        {report.agentReports.map((ar) => {
+                          const statusBadgeCls =
+                            ar.status === 'error'
+                              ? 'border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/50 dark:text-red-300'
+                              : ar.status === 'warning'
+                                ? 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/50 dark:text-amber-300'
+                                : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/50 dark:text-emerald-300';
+                          return (
+                            <article
+                              key={ar.agentId}
+                              data-testid={`agent-work-report-${ar.agentId}`}
+                              className="rounded-lg border border-slate-200 bg-white p-3.5 text-xs dark:border-slate-800 dark:bg-slate-950"
+                            >
+                              <div className="flex flex-wrap items-start justify-between gap-2">
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100">
+                                    <Bot className="h-3.5 w-3.5 shrink-0 text-blue-600 dark:text-blue-400" />
+                                    <span className="truncate">{ar.agentName}</span>
+                                  </div>
+                                  <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500 dark:text-slate-400">
+                                    <span>{ar.section || ar.role}</span>
+                                    {ar.positionTitle && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span>{ar.positionTitle}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                  {ar.model && (
+                                    <div
+                                      dir="ltr"
+                                      className="mt-1 inline-block rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-900 dark:text-slate-300"
+                                    >
+                                      {ar.provider ? `${ar.provider} · ${ar.model}` : ar.model}
+                                    </div>
+                                  )}
+                                </div>
+                                <span
+                                  className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${statusBadgeCls}`}
+                                >
+                                  {ar.status === 'completed' ? (
+                                    <CheckCircle2 className="h-3 w-3" />
+                                  ) : (
+                                    <AlertTriangle className="h-3 w-3" />
+                                  )}
+                                  <span>{rt.agentStatusText[ar.status]}</span>
+                                </span>
+                              </div>
+
+                              <p className="mt-2 text-[11px] font-medium leading-relaxed text-slate-700 dark:text-slate-300">
+                                {ar.workSummary}
+                              </p>
+
+                              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-600 dark:text-slate-400">
+                                <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono dark:bg-slate-900">
+                                  {rt.agentTurnsLabel}: {ar.roundsSpoken}
+                                </span>
+                                {ar.filesModified.length > 0 && (
+                                  <span className="rounded bg-emerald-50 px-1.5 py-0.5 font-mono text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
+                                    {rt.agentFilesLabel}: {ar.filesModified.length}
+                                  </span>
+                                )}
+                                {ar.commandsExecuted > 0 && (
+                                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono dark:bg-slate-900">
+                                    {rt.agentCommandsLabel}: {ar.commandsExecuted}
+                                  </span>
+                                )}
+                                {ar.repliedToManager && (
+                                  <span className="rounded bg-blue-50 px-1.5 py-0.5 font-semibold text-blue-700 dark:bg-blue-950/50 dark:text-blue-300">
+                                    {rt.repliedToManagerLabel}
+                                  </span>
+                                )}
+                                {ar.delegationsIssued > 0 && (
+                                  <span className="rounded bg-indigo-50 px-1.5 py-0.5 font-mono text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-300">
+                                    {rt.agentDelegationsOutLabel}: {ar.delegationsIssued}
+                                  </span>
+                                )}
+                                {ar.delegationsReceived > 0 && (
+                                  <span className="rounded bg-sky-50 px-1.5 py-0.5 font-mono text-sky-700 dark:bg-sky-950/50 dark:text-sky-300">
+                                    {rt.agentDelegationsInLabel}: {ar.delegationsReceived}
+                                  </span>
+                                )}
+                                {ar.bugsLogged > 0 && (
+                                  <span className="rounded bg-amber-50 px-1.5 py-0.5 font-mono text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+                                    {rt.agentBugsLabel}: {ar.bugsLogged}
+                                  </span>
+                                )}
+                                {ar.errors.length > 0 && (
+                                  <span className="rounded bg-red-50 px-1.5 py-0.5 font-mono text-red-700 dark:bg-red-950/50 dark:text-red-300">
+                                    {rt.agentErrorsLabel}: {ar.errors.length}
+                                  </span>
+                                )}
+                              </div>
+
+                              {ar.filesModified.length > 0 && (
+                                <div dir="ltr" className="mt-2 flex flex-wrap gap-1">
+                                  {ar.filesModified.slice(0, 4).map((fp) => (
+                                    <code
+                                      key={fp}
+                                      className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px] text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+                                    >
+                                      {fp}
+                                    </code>
+                                  ))}
+                                </div>
+                              )}
+
+                              {ar.highlights.length > 0 && (
+                                <p
+                                  dir="auto"
+                                  className="mt-2 line-clamp-2 border-t border-slate-100 pt-1.5 text-[11px] leading-relaxed text-slate-500 dark:border-slate-800 dark:text-slate-400"
+                                >
+                                  {ar.highlights[ar.highlights.length - 1]}
+                                </p>
+                              )}
+
+                              {ar.errors.length > 0 && (
+                                <div
+                                  dir="auto"
+                                  className="mt-2 rounded border border-red-200 bg-red-50/80 px-2.5 py-1.5 text-[11px] text-red-800 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-200"
+                                >
+                                  {ar.errors[0]}
+                                </div>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </section>
 
                   {/* Applied File Changes */}
                   <section>

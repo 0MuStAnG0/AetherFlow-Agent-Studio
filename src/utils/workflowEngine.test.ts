@@ -17,6 +17,7 @@ import {
   extractBugReportsFromReply,
   extractFreeOpenCodeModels,
   extractManagerDelegations,
+  findDomainSpecialistNode,
   findManagerNode,
   getDefaultEdgeLabelForCondition,
   isManagerNode,
@@ -567,3 +568,45 @@ test('computeParallelFanoutTargets detects independent parallel branches vs depe
   });
   assert.deepEqual(singleMatch, []);
 });
+
+test('selectNextSpeaker honors requestedNextAgentId and findDomainSpecialistNode matches custom specialists', () => {
+  const mgr = makeNode('mgr', 'manager', 50);
+  const be = makeNode('be', 'backend', 250);
+  const customDevOps = makeNode('node-devops', 'custom', 450);
+  customDevOps.data.label = 'DevOps & Release Engineer';
+  customDevOps.data.section = 'Cloud & CI/CD';
+  customDevOps.data.positionTitle = 'Site Reliability Lead';
+  customDevOps.data.responsibility = 'Docker, Kubernetes, deployment automation';
+
+  const ordered = [mgr, be, customDevOps];
+  const edges: WorkflowEdge[] = [{ id: 'e1', source: 'mgr', target: 'be' }];
+
+  // Direct requestedNextAgentId overrides static edge order
+  const delegatedStep = selectNextSpeaker({
+    orderedNodes: ordered,
+    edges,
+    currentNodeId: 'mgr',
+    roundIndex: 1,
+    maxRounds: 6,
+    requestedNextAgentId: 'node-devops',
+  });
+  assert.equal(delegatedStep.node?.id, 'node-devops');
+  assert.ok(delegatedStep.reason.includes('DevOps & Release Engineer'));
+
+  // Matching by exact id, label, section, and positionTitle
+  assert.equal(findDomainSpecialistNode(ordered, 'node-devops', 'mgr')?.id, 'node-devops');
+  assert.equal(findDomainSpecialistNode(ordered, 'DevOps & Release Engineer', 'mgr')?.id, 'node-devops');
+  assert.equal(findDomainSpecialistNode(ordered, 'Cloud & CI/CD', 'mgr')?.id, 'node-devops');
+  assert.equal(findDomainSpecialistNode(ordered, 'Site Reliability', 'mgr')?.id, 'node-devops');
+
+  // extractManagerDelegations resolves targetAgent for custom specialists
+  const reply =
+    'بررسی زیرساخت انجام شد.\n' +
+    'DELEGATE: {"targetRole":"custom","targetAgent":"DevOps & Release Engineer","issue":"Fix Dockerfile healthcheck","reason":"Container healthcheck returns 503"}';
+  const parsed = extractManagerDelegations(reply, mgr, ordered, 'review');
+  assert.equal(parsed.delegations.length, 1);
+  assert.equal(parsed.delegations[0].targetAgentId, 'node-devops');
+  assert.equal(parsed.delegations[0].targetAgentName, 'DevOps & Release Engineer');
+  assert.equal(parsed.delegations[0].issue, 'Fix Dockerfile healthcheck');
+});
+

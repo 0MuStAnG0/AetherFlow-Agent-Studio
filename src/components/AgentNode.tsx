@@ -1,5 +1,5 @@
 import { memo } from 'react';
-import { CopyPlus, Pencil, Trash2 } from 'lucide-react';
+import { AlertTriangle, CopyPlus, Pencil, Settings2, Trash2, X } from 'lucide-react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { POWER_LEVEL_META } from '../data/agentTemplates';
 import type { AgentNodeData, AgentPowerLevel } from '../types/workflow';
@@ -34,7 +34,19 @@ export const AgentNode = memo(function AgentNode({
   data,
   selected,
 }: NodeProps & { data: AgentNodeData }) {
-  const { onEditNode, onDuplicateNode, onDeleteNode } = useCanvasActions();
+  const {
+    lang = 'en',
+    onEditNode,
+    onDuplicateNode,
+    onDeleteNode,
+    onDismissAgentError,
+    onReopenAgentError,
+    onInspectAgentError,
+  } = useCanvasActions();
+
+  const isFa = lang === 'fa';
+  const errorAlert = data.errorAlert ?? null;
+  const showErrorPopup = Boolean(errorAlert && !errorAlert.dismissed);
 
   const enabledTools = [
     data.tools.readFile ? 'Read' : null,
@@ -44,29 +56,131 @@ export const AgentNode = memo(function AgentNode({
 
   const isSpeaking = data.status === 'speaking';
   const isWaiting = data.status === 'waiting_approval';
-  const isError = data.status === 'error';
-  const isDone = data.status === 'done';
+  const isError = data.status === 'error' || Boolean(errorAlert);
+  const isDone = data.status === 'done' && !isError;
   const power: AgentPowerLevel = data.powerLevel ?? 'standard';
 
   let borderClass = 'border-slate-200 dark:border-slate-800';
-  if (selected) {
+  if (isError) {
+    borderClass = 'border-red-600 ring-2 ring-red-600/25 dark:border-red-500';
+  } else if (selected) {
     borderClass = 'border-blue-600 ring-2 ring-blue-600/20 dark:border-blue-500';
   } else if (isWaiting) {
     borderClass = 'border-amber-500 ring-2 ring-amber-500/20';
   } else if (isSpeaking) {
     borderClass = 'border-emerald-600 ring-2 ring-emerald-600/20';
-  } else if (isError) {
-    borderClass = 'border-red-600 ring-2 ring-red-600/20';
   } else if (isDone) {
     borderClass = 'border-emerald-500/70 dark:border-emerald-600/70';
   }
 
+  const sourceBadge =
+    errorAlert?.source === 'config'
+      ? isFa
+        ? 'تنظیمات کلید'
+        : 'API Key'
+      : errorAlert?.source === 'tool'
+        ? isFa
+          ? 'ابزار / ترمینال'
+          : 'Tool / Bash'
+        : errorAlert?.source === 'llm'
+          ? 'LLM'
+          : isFa
+            ? 'زمان اجرا'
+            : 'Runtime';
+
   return (
     <div
-      className={`group w-[264px] rounded-xl border bg-white px-4 py-3 text-left transition-shadow dark:bg-slate-900 ${borderClass} shadow-sm`}
+      className={`group relative w-[264px] rounded-xl border bg-white px-4 py-3 text-left transition-shadow dark:bg-slate-900 ${borderClass} shadow-sm`}
       data-testid={`agent-node-${data.role}`}
-      data-status={data.status ?? 'idle'}
+      data-node-id={id}
+      data-status={isError ? 'error' : (data.status ?? 'idle')}
     >
+      {/* Anchored Popup Error Notification directly on this Agent Node */}
+      {showErrorPopup && errorAlert && (
+        <div
+          role="alert"
+          dir={isFa ? 'rtl' : 'ltr'}
+          data-testid={`agent-error-popup-${id}`}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="nodrag nopan nowheel absolute bottom-full left-1/2 z-50 mb-3 w-[300px] -translate-x-1/2 rounded-xl border border-red-300 bg-white text-start shadow-xl ring-4 ring-red-500/10 dark:border-red-800/80 dark:bg-slate-900 dark:ring-red-500/15"
+        >
+          <div className="flex items-center justify-between gap-2 rounded-t-xl border-b border-red-100 bg-red-50/90 px-3 py-2 dark:border-red-900/60 dark:bg-red-950/60">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-red-600 dark:text-red-400" />
+              <span className="truncate text-[11px] font-bold text-red-800 dark:text-red-200">
+                {errorAlert.title || (isFa ? 'خطای ایجنت' : 'Agent Error')}
+              </span>
+              <span className="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-[9px] font-semibold text-red-700 dark:bg-red-900/70 dark:text-red-200">
+                {sourceBadge}
+              </span>
+            </div>
+            {onDismissAgentError && (
+              <button
+                type="button"
+                data-testid={`agent-error-dismiss-${id}`}
+                aria-label={isFa ? 'بستن اعلان خطا' : 'Dismiss error notification'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDismissAgentError(id);
+                }}
+                className="rounded p-0.5 text-red-500 transition-colors hover:bg-red-100 hover:text-red-800 dark:text-red-400 dark:hover:bg-red-900/60 dark:hover:text-red-200"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+
+          <div className="px-3 py-2.5">
+            <p
+              dir="auto"
+              className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-700 dark:text-slate-200"
+            >
+              {errorAlert.message}
+            </p>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-1.5 border-t border-slate-100 pt-2 text-[10px] text-slate-500 dark:border-slate-800 dark:text-slate-400">
+              <span dir="ltr" className="truncate font-mono">
+                {errorAlert.provider ? `${errorAlert.provider}` : data.provider}
+                {errorAlert.model ? ` · ${errorAlert.model}` : ''}
+                {typeof errorAlert.round === 'number' && errorAlert.round > 0
+                  ? ` · R${errorAlert.round}`
+                  : ''}
+              </span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {onInspectAgentError && (
+                  <button
+                    type="button"
+                    data-testid={`agent-error-inspect-${id}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onInspectAgentError(id);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-md bg-red-600 px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-red-700"
+                  >
+                    <Settings2 className="h-3 w-3" />
+                    <span>
+                      {errorAlert.source === 'config'
+                        ? isFa
+                          ? 'تنظیم کلید'
+                          : 'Configure Key'
+                        : isFa
+                          ? 'بررسی ایجنت'
+                          : 'Inspect Agent'}
+                    </span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Caret pointer anchoring popup directly to this agent node */}
+          <div
+            aria-hidden="true"
+            className="absolute -bottom-1.5 left-1/2 h-3 w-3 -translate-x-1/2 rotate-45 border-b border-r border-red-300 bg-white dark:border-red-800/80 dark:bg-slate-900"
+          />
+        </div>
+      )}
+
       <Handle
         type="target"
         position={Position.Left}
@@ -152,22 +266,38 @@ export const AgentNode = memo(function AgentNode({
         <span className="truncate font-mono text-[11px]">{data.model}</span>
       </div>
 
-      <div className="mt-2 flex items-center justify-between border-t border-slate-100 pt-2 text-[11px] text-slate-500 dark:border-slate-800 dark:text-slate-400">
+      <div className="mt-2 flex items-center justify-between gap-1.5 border-t border-slate-100 pt-2 text-[11px] text-slate-500 dark:border-slate-800 dark:text-slate-400">
         <span className="truncate">
           {enabledTools.length > 0 ? `Tools: ${enabledTools.join(' · ')}` : 'Tools: None'}
         </span>
         <span className="font-mono tabular-nums text-[10px]">
           T={Number(data.temperature ?? 0.2).toFixed(2)}
         </span>
-        {isSpeaking && (
+        {isSpeaking && !isError && !errorAlert && (
           <span className="font-medium text-emerald-700 dark:text-emerald-400">Active</span>
         )}
-        {isWaiting && (
+        {isWaiting && !isError && (
           <span className="font-medium text-amber-700 dark:text-amber-400">Approval</span>
         )}
-        {isError && (
-          <span className="font-medium text-red-700 dark:text-red-400">Error</span>
-        )}
+        {errorAlert && errorAlert.dismissed && onReopenAgentError ? (
+          <button
+            type="button"
+            data-testid={`agent-error-reopen-${id}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onReopenAgentError(id);
+            }}
+            className="nodrag nopan inline-flex items-center gap-1 rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-700 transition-colors hover:bg-red-100 dark:bg-red-950/60 dark:text-red-300 dark:hover:bg-red-900/60"
+            title={errorAlert.message}
+          >
+            <AlertTriangle className="h-2.5 w-2.5" />
+            <span>{isFa ? 'مشاهده خطا' : 'View Error'}</span>
+          </button>
+        ) : isError ? (
+          <span className="font-medium text-red-700 dark:text-red-400">
+            {isFa ? 'خطا' : 'Error'}
+          </span>
+        ) : null}
         {isDone && (
           <span className="font-medium text-emerald-700 dark:text-emerald-400">Done</span>
         )}

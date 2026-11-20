@@ -621,7 +621,7 @@ export function ExecutionConsole({
             <div className="space-y-3" data-testid="execution-feed">
               {events.map((evt) => {
                 const isUser = evt.type === 'user_message';
-                const isError = evt.type === 'run_error';
+                const isError = evt.type === 'run_error' || evt.type === 'agent_error';
                 const isDone = evt.type === 'run_completed';
                 const isCancelled = evt.type === 'run_cancelled';
                 const isBugEvt = evt.type === 'bug_reported' && evt.bugReport;
@@ -749,11 +749,21 @@ export function ExecutionConsole({
                     }`}
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="font-semibold">
-                        {evt.agentName ?? 'Orchestrator'}
+                      <span className="inline-flex flex-wrap items-center gap-1.5 font-semibold">
+                        <span>{evt.agentName ?? 'Orchestrator'}</span>
                         {evt.role ? (
-                          <span className="ml-1.5 text-[10px] font-normal text-slate-500 dark:text-slate-400">
+                          <span className="text-[10px] font-normal text-slate-500 dark:text-slate-400">
                             [{roleNames[evt.role] ?? evt.role}]
+                          </span>
+                        ) : null}
+                        {evt.replyingToManager ? (
+                          <span
+                            data-testid="replying-to-manager-badge"
+                            className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/50 dark:text-emerald-300"
+                          >
+                            {lang === 'fa'
+                              ? `پاسخ به ${evt.replyingToManager}`
+                              : `Reply to ${evt.replyingToManager}`}
                           </span>
                         ) : null}
                       </span>

@@ -1,11 +1,15 @@
 import type {
+  AgentRole,
   BugReportItem,
   ExecutionEvent,
   ExecutionRunSummary,
   FileDiffEntry,
+  LLMProvider,
+  RunAgentWorkReport,
   RunChangeFileEntry,
   RunChangeReport,
   RunCommandSummary,
+  WorkflowNode,
 } from '../types/workflow';
 
 const PERSIAN_SCRIPT_REGEX = /[\u0600-\u06FF]/;
@@ -13,6 +17,18 @@ const LATIN_LETTER_REGEX = /[A-Za-z]/;
 
 function normalizeRelPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\/+/, '').trim();
+}
+
+function extractReadableHighlight(rawContent: string): string {
+  const cleaned = (rawContent || '')
+    .replace(/WRITE_FILE:[^\n]+\n```[\s\S]*?```/g, '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/(?:READ_FILE|EXEC_BASH|BUG_REPORT|DELEGATE):[^\n]*/g, '')
+    .replace(/\bTERMINATE\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+  return cleaned.length > 180 ? `${cleaned.slice(0, 177).trimEnd()}...` : cleaned;
 }
 
 export function detectConversationLanguage(params: {
@@ -116,6 +132,87 @@ function translateStatus(
   }
 }
 
+interface MutableAgentAcc {
+  agentId: string;
+  agentName: string;
+  role: AgentRole;
+  section?: string;
+  positionTitle?: string;
+  provider?: LLMProvider;
+  model?: string;
+  roundsSpoken: number;
+  durationMs: number;
+  delegationsIssued: number;
+  delegationsReceived: number;
+  repliedToManager: boolean;
+  filesModified: Set<string>;
+  commandsExecuted: number;
+  bugsLogged: number;
+  errors: string[];
+  highlights: string[];
+}
+
+function buildAgentWorkSummary(acc: MutableAgentAcc, lang: 'en' | 'fa'): string {
+  const parts: string[] = [];
+  if (lang === 'fa') {
+    if (acc.roundsSpoken > 0) {
+      parts.push(`${acc.roundsSpoken} نوبت مشارکت`);
+    }
+    if (acc.filesModified.size > 0) {
+      parts.push(`ویرایش ${acc.filesModified.size} فایل (${Array.from(acc.filesModified).slice(0, 3).join('، ')})`);
+    }
+    if (acc.commandsExecuted > 0) {
+      parts.push(`اجرای ${acc.commandsExecuted} دستور سندباکس`);
+    }
+    if (acc.delegationsIssued > 0) {
+      parts.push(`ارجاع ${acc.delegationsIssued} وظیفه به متخصصان`);
+    }
+    if (acc.delegationsReceived > 0 && acc.repliedToManager) {
+      parts.push(`دریافت وظیفه از مدیر و پاسخ‌گویی مستقیم به مدیر`);
+    } else if (acc.repliedToManager) {
+      parts.push(`پاسخ‌گویی مستقیم به مدیر`);
+    } else if (acc.delegationsReceived > 0) {
+      parts.push(`دریافت ${acc.delegationsReceived} ارجاع از مدیر`);
+    }
+    if (acc.bugsLogged > 0) {
+      parts.push(`ثبت ${acc.bugsLogged} باگ/پیشنهاد`);
+    }
+    if (acc.errors.length > 0) {
+      parts.push(`${acc.errors.length} خطا ثبت شد`);
+    }
+    return parts.length > 0 ? parts.join(' · ') : 'مشارکت در تحلیل و هماهنگی تیم';
+  }
+
+  if (acc.roundsSpoken > 0) {
+    parts.push(`${acc.roundsSpoken} turn${acc.roundsSpoken > 1 ? 's' : ''}`);
+  }
+  if (acc.filesModified.size > 0) {
+    parts.push(
+      `modified ${acc.filesModified.size} file${acc.filesModified.size > 1 ? 's' : ''} (${Array.from(acc.filesModified).slice(0, 3).join(', ')})`,
+    );
+  }
+  if (acc.commandsExecuted > 0) {
+    parts.push(`ran ${acc.commandsExecuted} sandbox command${acc.commandsExecuted > 1 ? 's' : ''}`);
+  }
+  if (acc.delegationsIssued > 0) {
+    parts.push(`delegated ${acc.delegationsIssued} task${acc.delegationsIssued > 1 ? 's' : ''}`);
+  }
+  if (acc.delegationsReceived > 0 && acc.repliedToManager) {
+    parts.push('answered Manager delegation directly');
+  } else if (acc.repliedToManager) {
+    parts.push('replied directly to Manager');
+  } else if (acc.delegationsReceived > 0) {
+    parts.push(`received ${acc.delegationsReceived} delegation${acc.delegationsReceived > 1 ? 's' : ''}`);
+  }
+  if (acc.bugsLogged > 0) {
+    parts.push(`logged ${acc.bugsLogged} issue${acc.bugsLogged > 1 ? 's' : ''}`);
+  }
+  if (acc.errors.length > 0) {
+    parts.push(`${acc.errors.length} error${acc.errors.length > 1 ? 's' : ''} encountered`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : 'Participated in team analysis and coordination';
+}
+
 export function buildRunChangeReport(params: {
   runId: string;
   workflowName: string;
@@ -126,6 +223,7 @@ export function buildRunChangeReport(params: {
   events: ExecutionEvent[];
   diffs: FileDiffEntry[];
   bugReports?: BugReportItem[];
+  workflowNodes?: WorkflowNode[];
   fallbackLanguage?: 'en' | 'fa';
 }): RunChangeReport {
   const {
@@ -138,6 +236,7 @@ export function buildRunChangeReport(params: {
     events,
     diffs,
     bugReports = [],
+    workflowNodes = [],
     fallbackLanguage = 'en',
   } = params;
 
@@ -147,29 +246,168 @@ export function buildRunChangeReport(params: {
     fallbackLanguage,
   });
 
-  // Attribute write_file tool calls to responsible agent names
+  const nodeById = new Map<string, WorkflowNode>(workflowNodes.map((n) => [n.id, n]));
+  const nodeByName = new Map<string, WorkflowNode>(
+    workflowNodes.map((n) => [n.data.label.trim().toLowerCase(), n]),
+  );
+
+  const agentAccMap = new Map<string, MutableAgentAcc>();
+  const ensureAgentAcc = (info: {
+    agentId?: string;
+    agentName?: string;
+    role?: AgentRole;
+    provider?: LLMProvider;
+    model?: string;
+  }): MutableAgentAcc => {
+    const matchedNode =
+      (info.agentId ? nodeById.get(info.agentId) : undefined) ??
+      (info.agentName ? nodeByName.get(info.agentName.trim().toLowerCase()) : undefined);
+    const key =
+      info.agentId ||
+      matchedNode?.id ||
+      (info.agentName ? `name:${info.agentName.trim().toLowerCase()}` : 'team-agent');
+    const existing = agentAccMap.get(key);
+    if (existing) {
+      if (!existing.provider && (info.provider || matchedNode?.data.provider)) {
+        existing.provider = info.provider ?? matchedNode?.data.provider;
+      }
+      if (!existing.model && (info.model || matchedNode?.data.model)) {
+        existing.model = info.model ?? matchedNode?.data.model;
+      }
+      return existing;
+    }
+    const created: MutableAgentAcc = {
+      agentId: info.agentId || matchedNode?.id || key,
+      agentName:
+        info.agentName ||
+        matchedNode?.data.label ||
+        (language === 'fa' ? 'ایجنت تیم' : 'Team Agent'),
+      role: info.role ?? matchedNode?.data.role ?? 'custom',
+      section: matchedNode?.data.section,
+      positionTitle: matchedNode?.data.positionTitle,
+      provider: info.provider ?? matchedNode?.data.provider,
+      model: info.model ?? matchedNode?.data.model,
+      roundsSpoken: 0,
+      durationMs: 0,
+      delegationsIssued: 0,
+      delegationsReceived: 0,
+      repliedToManager: false,
+      filesModified: new Set<string>(),
+      commandsExecuted: 0,
+      bugsLogged: 0,
+      errors: [],
+      highlights: [],
+    };
+    agentAccMap.set(key, created);
+    return created;
+  };
+
+  // Attribute write_file tool calls, commands, errors, delegations, and highlights per agent
   const fileAgentsMap = new Map<string, Set<string>>();
   const commands: RunCommandSummary[] = [];
+  let totalErrors = 0;
 
   for (const evt of events) {
-    if (!evt.toolCalls || evt.toolCalls.length === 0) continue;
-    const actorName = evt.agentName || (language === 'fa' ? 'ایجنت تیم' : 'Team Agent');
-    for (const tc of evt.toolCalls) {
-      if (tc.tool === 'write_file' && (tc.exitCode ?? 0) === 0) {
-        const cleanPath = normalizeRelPath(tc.target);
-        if (!cleanPath) continue;
-        if (!fileAgentsMap.has(cleanPath)) {
-          fileAgentsMap.set(cleanPath, new Set());
+    if (evt.type === 'agent_message') {
+      const acc = ensureAgentAcc({
+        agentId: evt.agentId,
+        agentName: evt.agentName,
+        role: evt.role,
+        provider: evt.provider,
+        model: evt.model,
+      });
+      acc.roundsSpoken += 1;
+      if (typeof evt.durationMs === 'number' && Number.isFinite(evt.durationMs)) {
+        acc.durationMs += Math.max(0, Math.round(evt.durationMs));
+      }
+      if (evt.replyingToManager) {
+        acc.repliedToManager = true;
+      }
+      const highlight = extractReadableHighlight(evt.content);
+      if (highlight && acc.highlights.length < 3 && !acc.highlights.includes(highlight)) {
+        acc.highlights.push(highlight);
+      }
+
+      if (evt.toolCalls && evt.toolCalls.length > 0) {
+        const actorName = acc.agentName;
+        for (const tc of evt.toolCalls) {
+          if (tc.tool === 'write_file' && (tc.exitCode ?? 0) === 0) {
+            const cleanPath = normalizeRelPath(tc.target);
+            if (!cleanPath) continue;
+            if (!fileAgentsMap.has(cleanPath)) {
+              fileAgentsMap.set(cleanPath, new Set());
+            }
+            fileAgentsMap.get(cleanPath)!.add(actorName);
+            acc.filesModified.add(cleanPath);
+          } else if (tc.tool === 'exec_bash') {
+            acc.commandsExecuted += 1;
+            commands.push({
+              command: tc.target,
+              agentName: actorName,
+              exitCode: tc.exitCode,
+              approved: tc.approved,
+              outputPreview: tc.result ? tc.result.slice(0, 260) : undefined,
+            });
+            if (typeof tc.exitCode === 'number' && tc.exitCode !== 0) {
+              totalErrors += 1;
+              const toolErr = `${tc.target} (exit ${tc.exitCode}): ${(tc.result || '').slice(0, 140)}`;
+              if (!acc.errors.includes(toolErr)) acc.errors.push(toolErr);
+            }
+          } else if ((tc.exitCode ?? 0) !== 0) {
+            totalErrors += 1;
+            const toolErr = `${tc.tool}(${tc.target}): ${(tc.result || '').slice(0, 140)}`;
+            if (!acc.errors.includes(toolErr)) acc.errors.push(toolErr);
+          }
         }
-        fileAgentsMap.get(cleanPath)!.add(actorName);
-      } else if (tc.tool === 'exec_bash') {
-        commands.push({
-          command: tc.target,
-          agentName: actorName,
-          exitCode: tc.exitCode,
-          approved: tc.approved,
-          outputPreview: tc.result ? tc.result.slice(0, 260) : undefined,
-        });
+      }
+    } else if (evt.type === 'agent_error' || (evt.type === 'run_error' && (evt.agentId || evt.agentName))) {
+      totalErrors += 1;
+      const acc = ensureAgentAcc({
+        agentId: evt.agentId,
+        agentName: evt.agentName,
+        role: evt.role,
+        provider: evt.provider,
+        model: evt.model,
+      });
+      const errText = (evt.content || '').trim().slice(0, 240);
+      if (errText && !acc.errors.includes(errText)) {
+        acc.errors.push(errText);
+      }
+    } else if (evt.type === 'run_error') {
+      totalErrors += 1;
+    } else if (evt.type === 'manager_delegation' && evt.delegation) {
+      const mgrAcc = ensureAgentAcc({
+        agentId: evt.delegation.managerId,
+        agentName: evt.delegation.managerName,
+        role: 'manager',
+      });
+      mgrAcc.delegationsIssued += 1;
+
+      const targetAcc = ensureAgentAcc({
+        agentId: evt.delegation.targetAgentId,
+        agentName: evt.delegation.targetAgentName,
+        role: evt.delegation.targetRole,
+      });
+      targetAcc.delegationsReceived += 1;
+    } else if (evt.toolCalls && evt.toolCalls.length > 0) {
+      const actorName = evt.agentName || (language === 'fa' ? 'ایجنت تیم' : 'Team Agent');
+      for (const tc of evt.toolCalls) {
+        if (tc.tool === 'write_file' && (tc.exitCode ?? 0) === 0) {
+          const cleanPath = normalizeRelPath(tc.target);
+          if (!cleanPath) continue;
+          if (!fileAgentsMap.has(cleanPath)) {
+            fileAgentsMap.set(cleanPath, new Set());
+          }
+          fileAgentsMap.get(cleanPath)!.add(actorName);
+        } else if (tc.tool === 'exec_bash') {
+          commands.push({
+            command: tc.target,
+            agentName: actorName,
+            exitCode: tc.exitCode,
+            approved: tc.approved,
+            outputPreview: tc.result ? tc.result.slice(0, 260) : undefined,
+          });
+        }
       }
     }
   }
@@ -212,6 +450,8 @@ export function buildRunChangeReport(params: {
       severity: 'critical' | 'high' | 'medium' | 'low';
       status: 'open' | 'acknowledged' | 'resolved';
       agentName: string;
+      agentId?: string;
+      role?: AgentRole;
     }
   >();
 
@@ -223,6 +463,8 @@ export function buildRunChangeReport(params: {
       severity: b.severity,
       status: b.status,
       agentName: b.agentName,
+      agentId: b.agentId,
+      role: b.role,
     });
   }
   for (const evt of events) {
@@ -236,17 +478,53 @@ export function buildRunChangeReport(params: {
           severity: b.severity,
           status: b.status,
           agentName: b.agentName,
+          agentId: b.agentId,
+          role: b.role,
         });
       }
     }
   }
-  const bugs = Array.from(bugMap.values());
+
+  for (const b of bugMap.values()) {
+    const acc = ensureAgentAcc({
+      agentId: b.agentId,
+      agentName: b.agentName,
+      role: b.role,
+    });
+    acc.bugsLogged += 1;
+  }
+
+  const bugs = Array.from(bugMap.values()).map(({ agentId: _aid, role: _r, ...rest }) => rest);
+
+  const agentReports: RunAgentWorkReport[] = Array.from(agentAccMap.values()).map((acc) => {
+    const agentStatus: RunAgentWorkReport['status'] =
+      acc.errors.length > 0 ? (acc.roundsSpoken > 0 ? 'warning' : 'error') : 'completed';
+    return {
+      agentId: acc.agentId,
+      agentName: acc.agentName,
+      role: acc.role,
+      ...(acc.section ? { section: acc.section } : {}),
+      ...(acc.positionTitle ? { positionTitle: acc.positionTitle } : {}),
+      ...(acc.provider ? { provider: acc.provider } : {}),
+      ...(acc.model ? { model: acc.model } : {}),
+      status: agentStatus,
+      roundsSpoken: acc.roundsSpoken,
+      durationMs: acc.durationMs,
+      delegationsIssued: acc.delegationsIssued,
+      delegationsReceived: acc.delegationsReceived,
+      repliedToManager: acc.repliedToManager,
+      filesModified: Array.from(acc.filesModified),
+      commandsExecuted: acc.commandsExecuted,
+      bugsLogged: acc.bugsLogged,
+      errors: acc.errors,
+      highlights: acc.highlights,
+      workSummary: buildAgentWorkSummary(acc, language),
+    };
+  });
 
   const participatingAgents = Array.from(
     new Set(
-      events
-        .filter((e) => e.type === 'agent_message' && e.agentName)
-        .map((e) => e.agentName as string),
+      agentReports.map((a) => a.agentName),
     ),
   );
 
@@ -283,6 +561,15 @@ export function buildRunChangeReport(params: {
         summaryLines.push(
           `• [${actionWord}] ${fc.path}${byAgent} (+${fc.additions} / -${fc.deletions})`,
         );
+      }
+    }
+
+    if (agentReports.length > 0) {
+      summaryLines.push('');
+      summaryLines.push(`گزارش کار هر ایجنت (${agentReports.length}):`);
+      for (const ar of agentReports) {
+        const stFa = ar.status === 'error' ? 'خطا' : ar.status === 'warning' ? 'هشدار' : 'موفق';
+        summaryLines.push(`• ${ar.agentName} [${stFa}]: ${ar.workSummary}`);
       }
     }
 
@@ -329,6 +616,14 @@ export function buildRunChangeReport(params: {
       }
     }
 
+    if (agentReports.length > 0) {
+      summaryLines.push('');
+      summaryLines.push(`Per-Agent Work Reports (${agentReports.length}):`);
+      for (const ar of agentReports) {
+        summaryLines.push(`• ${ar.agentName} [${ar.status.toUpperCase()}]: ${ar.workSummary}`);
+      }
+    }
+
     if (commands.length > 0) {
       summaryLines.push('');
       summaryLines.push(`Executed Sandbox Commands (${commands.length}):`);
@@ -364,10 +659,12 @@ export function buildRunChangeReport(params: {
       totalDeletions,
       totalCommands: commands.length,
       totalBugs: bugs.length,
+      totalErrors,
     },
     fileChanges,
     commands,
     bugs,
+    agentReports,
     generatedAt: new Date().toISOString(),
   };
 }

@@ -116,7 +116,11 @@ import {
 import { createZipBufferFromBundle } from './server/zipBundle.ts';
 import { buildProjectDiffEntries } from './src/utils/diffUtils.ts';
 import { buildRunChangeReport, detectConversationLanguage } from './src/utils/runReportUtils.ts';
-import { compactSandboxOutput, truncateMiddle } from './src/utils/promptOptimizer.ts';
+import {
+  compactSandboxOutput,
+  truncateMiddle,
+  type ActiveManagerAssignment,
+} from './src/utils/promptOptimizer.ts';
 import {
   buildManagerInspectionContext,
   buildStructuredAgentPrompt,
@@ -130,6 +134,7 @@ import {
   extractBugReportsFromReply,
   extractFreeOpenCodeModels,
   extractManagerDelegations,
+  findDomainSpecialistNode,
   findManagerNode,
   isManagerNode,
   orderGroupChatParticipants,
@@ -655,6 +660,7 @@ function finalizeRunWithReport(params: {
     events,
     diffs,
     bugReports,
+    workflowNodes: workflow.nodes,
     fallbackLanguage,
   });
 
@@ -903,13 +909,50 @@ async function runSandboxCommand(
   }
 }
 
+interface RecordedDelegationItem {
+  targetRole: string;
+  targetAgentId: string;
+  targetAgentName: string;
+  issue: string;
+  reason: string;
+  phase: 'test' | 'deploy' | 'review';
+}
+
 function buildDryRunAgentReply(
   node: WorkflowNode,
   taskPrompt: string,
   roundNum: number,
   maxRounds: number,
+  activeAssignment?: ActiveManagerAssignment | null,
 ): string {
   const role = node.data.role;
+  const isFa =
+    /[\u0600-\u06FF]/.test(taskPrompt) ||
+    Boolean(activeAssignment && /[\u0600-\u06FF]/.test(activeAssignment.issue));
+
+  if (activeAssignment && role !== 'manager') {
+    const mgrTag = `@${activeAssignment.managerName}`;
+    const issueLabel = activeAssignment.issue.slice(0, 120);
+    if (role === 'backend') {
+      return isFa
+        ? `${mgrTag} پیام و ارجاع شما درباره «${issueLabel}» دریافت شد. بررسی انجام شد و اصلاح لازم با اعتبارسنجی ورودی و محدودیت نرخ درخواست روی app/service.mjs اعمال گردید. آماده بازبینی و تایید نهایی شما هستم.\n\nWRITE_FILE:app/service.mjs\n\`\`\`javascript\nconst RATE_LIMIT_MAX = 60;\nexport function evaluateTaskHealth(payload) {\n  if (!payload || typeof payload.name !== 'string' || !payload.name.trim() || payload.name.length > 2000) {\n    throw new Error('Invalid task payload: bounded name is required');\n  }\n  return { ok: true, service: payload.name.trim(), rateLimitMax: RATE_LIMIT_MAX, checkedAt: new Date().toISOString() };\n}\n\`\`\``
+        : `${mgrTag} got it—I reviewed your delegation regarding "${issueLabel}" and updated app/service.mjs with bounded input validation and rate-limit configuration. Ready for your review.\n\nWRITE_FILE:app/service.mjs\n\`\`\`javascript\nconst RATE_LIMIT_MAX = 60;\nexport function evaluateTaskHealth(payload) {\n  if (!payload || typeof payload.name !== 'string' || !payload.name.trim() || payload.name.length > 2000) {\n    throw new Error('Invalid task payload: bounded name is required');\n  }\n  return { ok: true, service: payload.name.trim(), rateLimitMax: RATE_LIMIT_MAX, checkedAt: new Date().toISOString() };\n}\n\`\`\``;
+    }
+    if (role === 'frontend') {
+      return isFa
+        ? `${mgrTag} ارجاع شما درباره «${issueLabel}» را بررسی و اعمال کردم. وضعیت Loading و نمایش خطای شفاف در app/Widget.tsx اضافه شد و خروجی برای بررسی شما آماده است.\n\nWRITE_FILE:app/Widget.tsx\n\`\`\`tsx\nexport function StatusPanel({ service, loading = false }: { service: string; loading?: boolean }) {\n  return (\n    <section className="rounded-lg border border-slate-200 p-4">\n      <h3 className="text-sm font-semibold text-slate-900">{service}</h3>\n      <p className="text-xs text-slate-600">{loading ? 'Loading...' : 'Validated and monitored'}</p>\n    </section>\n  );\n}\n\`\`\``
+        : `${mgrTag} received your note on "${issueLabel}". I updated app/Widget.tsx with explicit loading and error boundaries—ready for your sign-off.\n\nWRITE_FILE:app/Widget.tsx\n\`\`\`tsx\nexport function StatusPanel({ service, loading = false }: { service: string; loading?: boolean }) {\n  return (\n    <section className="rounded-lg border border-slate-200 p-4">\n      <h3 className="text-sm font-semibold text-slate-900">{service}</h3>\n      <p className="text-xs text-slate-600">{loading ? 'Loading...' : 'Validated and monitored'}</p>\n    </section>\n  );\n}\n\`\`\``;
+    }
+    if (role === 'security_qa') {
+      return isFa
+        ? `${mgrTag} مورد ارجاع‌شده «${issueLabel}» را مجدداً تست و بازرسی امنیتی کردم. محدودیت طول ورودی و سناریوهای خطا در tests/service.test.mjs پوشش داده شدند و مورد مسدودکننده‌ای باقی نمانده است.`
+        : `${mgrTag} I re-verified "${issueLabel}" from a security and QA standpoint. Input length bounds and negative assertions are covered with no remaining blockers.`;
+    }
+    return isFa
+      ? `${mgrTag} وظیفه ارجاع‌شده «${issueLabel}» توسط ${node.data.label} انجام شد و نتیجه برای تایید نهایی شما آماده است.`
+      : `${mgrTag} I addressed your delegated task "${issueLabel}" as ${node.data.label}. Results are verified and ready for your review.`;
+  }
+
   if (role === 'manager') {
     if (roundNum >= maxRounds || roundNum > 3) {
       return (
@@ -1027,12 +1070,19 @@ function buildDryRunGroupDiscussionReply(params: {
   node: WorkflowNode;
   userMessage: string;
   priorSpeakers: string[];
+  activeAssignment?: ActiveManagerAssignment | null;
 }): string {
-  const { node, userMessage, priorSpeakers } = params;
-  const isFa = /[\u0600-\u06FF]/.test(userMessage);
+  const { node, userMessage, priorSpeakers, activeAssignment } = params;
+  const isFa =
+    /[\u0600-\u06FF]/.test(userMessage) ||
+    Boolean(activeAssignment && /[\u0600-\u06FF]/.test(activeAssignment.issue));
   const prev = priorSpeakers.length > 0 ? priorSpeakers[priorSpeakers.length - 1] : null;
   const role = node.data.role;
   const snippet = userMessage.trim().slice(0, 80);
+
+  if (activeAssignment && role !== 'manager') {
+    return buildDryRunAgentReply(node, userMessage, 2, 6, activeAssignment);
+  }
 
   if (role === 'manager') {
     return isFa
@@ -1064,6 +1114,19 @@ function buildDryRunGroupDiscussionReply(params: {
   return isFa
     ? `تست و بررسی در محیط ایزوله سندباکس انجام شد. @Security & QA Agent باگ ثبت‌شده در محدودیت طول ورودی را تایید می‌کنم و پیشنهاد می‌کنم تست خودکار روی خطاهای ورودی هم اضافه شود.\n\nEXEC_BASH:ls -la\n\nBUG_REPORT: {"category":"improvement","severity":"medium","title":"افزودن تست خودکار برای ورودی‌های مرزی در سندباکس","description":"تست فعلی مسیر موفق را بررسی می‌کند؛ افزودن تست خطای ورودی پایداری را افزایش می‌دهد.","suggestedFix":"افزودن تست assert.throws در فایل tests/service.test.mjs"}`
     : `Sandbox inspection complete. @Security & QA Agent I confirm the payload bound finding and recommend adding automated negative test assertions.\n\nEXEC_BASH:ls -la\n\nBUG_REPORT: {"category":"improvement","severity":"medium","title":"Add negative edge-case tests in sandbox suite","description":"Current sandbox checks cover happy paths but lack malformed-payload assertions.","suggestedFix":"Add assert.throws test cases in tests/service.test.mjs"}`;
+}
+
+function buildDryRunManagerFollowupReply(params: {
+  managerNode: WorkflowNode;
+  userMessage: string;
+  respondedSpecialists: string[];
+}): string {
+  const { managerNode, userMessage, respondedSpecialists } = params;
+  const isFa = /[\u0600-\u06FF]/.test(userMessage) || /[\u0600-\u06FF]/.test(managerNode.data.label);
+  const names = respondedSpecialists.join(isFa ? ' و ' : ' and ');
+  return isFa
+    ? `سپاس ${names}، گزارش و اصلاحات شما را بررسی کردم. تغییرات با ساختار پروژه همسو است و گزارش کار همه اعضای تیم در منوی گزارش اجرا ثبت شد. در صورت نیاز به اصلاح بیشتر بفرمایید.`
+    : `Thanks ${names}—I reviewed your updates and verified they align cleanly with the architecture. Every agent's work report is logged in the run report menu. Let us know if you want another iteration.`;
 }
 
 function processAndBroadcastBugReports(params: {
@@ -1110,7 +1173,7 @@ function processAndBroadcastManagerDelegations(params: {
   phase: 'test' | 'deploy' | 'review';
 }): {
   cleanedReply: string;
-  delegations: Array<{ targetRole: string; targetAgentId: string; targetAgentName: string; issue: string }>;
+  delegations: RecordedDelegationItem[];
 } {
   const { reply, runId, managerNode, nodes, roundNum, phase } = params;
   if (!isManagerNode(managerNode)) {
@@ -1118,12 +1181,7 @@ function processAndBroadcastManagerDelegations(params: {
   }
 
   const parsed = extractManagerDelegations(reply, managerNode, nodes, phase);
-  const recorded: Array<{
-    targetRole: string;
-    targetAgentId: string;
-    targetAgentName: string;
-    issue: string;
-  }> = [];
+  const recorded: RecordedDelegationItem[] = [];
 
   for (const item of parsed.delegations) {
     const delegation = {
@@ -1148,6 +1206,8 @@ function processAndBroadcastManagerDelegations(params: {
       targetAgentId: delegation.targetAgentId,
       targetAgentName: delegation.targetAgentName,
       issue: delegation.issue,
+      reason: delegation.reason,
+      phase: delegation.phase,
     });
   }
 
@@ -1253,15 +1313,10 @@ function applyStructuredMetaTools(params: {
   nodes: WorkflowNode[];
   roundNum: number;
   phase: 'test' | 'deploy' | 'review';
-}): Array<{ targetRole: string; targetAgentId: string; targetAgentName: string; issue: string }> {
+}): RecordedDelegationItem[] {
   const { structuredTools, runId, workflowId, node, nodes, roundNum, phase } = params;
   if (!structuredTools || structuredTools.length === 0) return [];
-  const delegations: Array<{
-    targetRole: string;
-    targetAgentId: string;
-    targetAgentName: string;
-    issue: string;
-  }> = [];
+  const delegations: RecordedDelegationItem[] = [];
 
   for (const call of structuredTools) {
     if (call.name === 'report_bug') {
@@ -1304,12 +1359,14 @@ function applyStructuredMetaTools(params: {
         timestamp: saved.createdAt,
       });
     } else if (call.name === 'delegate_agent' && isManagerNode(node)) {
+      const targetAgentRaw = String(call.args.targetAgent || '').trim();
       const targetRoleRaw = String(call.args.targetRole || '').trim();
       const issue = String(call.args.issue || '').trim();
-      if (!targetRoleRaw || !issue) continue;
+      if ((!targetAgentRaw && !targetRoleRaw) || !issue) continue;
       const reason = String(call.args.reason || issue).trim();
       const targetNode =
-        nodes.find((n) => n.data.role === targetRoleRaw) ??
+        (targetAgentRaw ? findDomainSpecialistNode(nodes, targetAgentRaw, node.id) : null) ??
+        (targetRoleRaw ? findDomainSpecialistNode(nodes, targetRoleRaw, node.id) : null) ??
         nodes.find((n) => n.id !== node.id) ??
         node;
       const delegation = {
@@ -1341,6 +1398,8 @@ function applyStructuredMetaTools(params: {
         targetAgentId: delegation.targetAgentId,
         targetAgentName: delegation.targetAgentName,
         issue: delegation.issue,
+        reason: delegation.reason,
+        phase: delegation.phase,
       });
     }
   }
@@ -1684,11 +1743,43 @@ async function executeWorkflowRun(params: {
   captureRunBaseline(runId, workflow.projectContext?.projectId);
 
   if (mode === 'live' && !canWorkflowRunLive(ordered, bootSettings)) {
+    const missingNodes = ordered.filter((n) => !canNodeRunLive(n, bootSettings));
+    const failedTargets = missingNodes.length > 0 ? missingNodes : ordered.slice(0, 1);
+    for (const badNode of failedTargets) {
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'agent_error',
+        round: 0,
+        agentId: badNode.id,
+        agentName: badNode.data.label,
+        role: badNode.data.role,
+        provider: badNode.data.provider,
+        model: badNode.data.model,
+        errorSource: 'config',
+        content:
+          bootSettings.language === 'fa'
+            ? `کلید API برای ${badNode.data.label} (${badNode.data.provider} · ${badNode.data.envSecretRef}) تنظیم نشده است. از بخش تنظیمات کلید را وارد کنید یا حالت اجرا را به Sandbox Dry-Run تغییر دهید.`
+            : `No live API key configured for ${badNode.data.label} (${badNode.data.provider} · ${badNode.data.envSecretRef}). Add it in Settings or switch Execution Mode to Sandbox Dry-Run.`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    const primaryBad = failedTargets[0];
     const errEvt: ExecutionEvent = {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: 0,
+      ...(primaryBad
+        ? {
+            agentId: primaryBad.id,
+            agentName: primaryBad.data.label,
+            role: primaryBad.data.role,
+            provider: primaryBad.data.provider,
+            model: primaryBad.data.model,
+            errorSource: 'config' as const,
+          }
+        : {}),
       content:
         'No live LLM API key is configured for the selected agents. Open Settings to add a Gemini, OpenAI, Anthropic, or OpenCode API key, or switch Execution Mode to Sandbox Dry-Run.',
       timestamp: new Date().toISOString(),
@@ -1735,11 +1826,13 @@ async function executeWorkflowRun(params: {
 
   const allToolCalls: ToolCallLog[] = [];
   const delegatedKeys = new Set<string>();
-  let pendingDelegatedRole: string | undefined;
+  const pendingDelegations: Array<RecordedDelegationItem & { managerName: string }> = [];
   let forceManagerAudit = false;
   let managerReviewedPostTest = false;
   let lastTurnHadError = false;
   let lastReply = '';
+  let successfulTurns = 0;
+  let agentErrorCount = 0;
 
   if (runStage === 'test_and_deploy') {
     const preflightLogs = await runDeployVerificationChecks();
@@ -1777,14 +1870,16 @@ async function executeWorkflowRun(params: {
     speaker: WorkflowNode;
     roundNum: number;
     historySnapshot: Array<{ role: string; content: string }>;
+    activeAssignment?: ActiveManagerAssignment | null;
   }): Promise<{
     reply: string;
     toolCalls: ToolCallLog[];
     hadError: boolean;
-    delegatedRole?: string;
+    agentFailed?: boolean;
+    delegations: RecordedDelegationItem[];
     delegationCount: number;
   }> {
-    const { speaker, roundNum, historySnapshot } = paramsTurn;
+    const { speaker, roundNum, historySnapshot, activeAssignment = null } = paramsTurn;
     const turnStartedAt = Date.now();
     const isMgr = isManagerNode(speaker);
     const currentSandboxFiles = listSandboxFiles(runId);
@@ -1813,150 +1908,183 @@ async function executeWorkflowRun(params: {
       totalTokens: 0,
       estimated: false,
     };
-    let delegatedRole: string | undefined;
-    let delegationCount = 0;
+    const allTurnDelegations: RecordedDelegationItem[] = [];
 
     const maxInnerSteps = mode === 'live' && canNodeRunLive(speaker, getAppSettings()) ? 2 : 0;
-    for (let innerStep = 0; innerStep <= maxInnerSteps; innerStep++) {
-      if (abortController.signal.aborted) break;
+    try {
+      for (let innerStep = 0; innerStep <= maxInnerSteps; innerStep++) {
+        if (abortController.signal.aborted) break;
 
-      let rawReply: string;
-      let structuredTools: StructuredToolInvocation[] = [];
-      let stepUsage: TokenUsage;
+        let rawReply: string;
+        let structuredTools: StructuredToolInvocation[] = [];
+        let stepUsage: TokenUsage;
 
-      if (mode === 'live' && canNodeRunLive(speaker, getAppSettings())) {
-        const liveResult = await generateLiveAgentReply({
-          ai,
+        if (mode === 'live' && canNodeRunLive(speaker, getAppSettings())) {
+          const liveResult = await generateLiveAgentReply({
+            ai,
+            node: speaker,
+            history: localHistory,
+            managerName: managerNode?.data.label,
+            activeAssignment,
+            inspectionSnapshot: inspection?.summaryText,
+            delegationPhase: phase,
+            signal: abortController.signal,
+            onChunk: (accumulatedText) => {
+              broadcastEvent(runId, {
+                id: `chunk-${runId}-${speaker.id}-${roundNum}-${innerStep}`,
+                runId,
+                type: 'agent_chunk',
+                round: roundNum,
+                agentId: speaker.id,
+                agentName: speaker.data.label,
+                role: speaker.data.role,
+                provider: speaker.data.provider,
+                model: speaker.data.model,
+                content: accumulatedText,
+                timestamp: new Date().toISOString(),
+              });
+            },
+          });
+          rawReply = liveResult.text;
+          structuredTools = liveResult.structuredTools;
+          stepUsage = liveResult.tokenUsage;
+        } else {
+          rawReply =
+            isMgr && (runStage === 'test_and_deploy' || allToolCalls.length > 0 || roundNum > 1)
+              ? buildDryRunManagerAuditReply({
+                  managerNode: speaker,
+                  nodes: ordered,
+                  taskPrompt,
+                  sandboxFiles: currentSandboxFiles,
+                  toolCalls: allToolCalls,
+                  openBugs: currentOpenBugs,
+                  alreadyDelegatedKeys: delegatedKeys,
+                  phase,
+                  allowTerminate: roundNum >= 2,
+                })
+              : buildDryRunAgentReply(speaker, taskPrompt, roundNum, maxRounds, activeAssignment);
+          stepUsage = estimateTokenUsage(taskPrompt, rawReply);
+        }
+
+        if (abortController.signal.aborted) break;
+
+        totalTurnUsage = {
+          promptTokens: totalTurnUsage.promptTokens + stepUsage.promptTokens,
+          completionTokens: totalTurnUsage.completionTokens + stepUsage.completionTokens,
+          totalTokens: totalTurnUsage.totalTokens + stepUsage.totalTokens,
+          estimated: Boolean(totalTurnUsage.estimated || stepUsage.estimated),
+          ...((totalTurnUsage.savedTokens ?? 0) + (stepUsage.savedTokens ?? 0) > 0
+            ? { savedTokens: (totalTurnUsage.savedTokens ?? 0) + (stepUsage.savedTokens ?? 0) }
+            : {}),
+        };
+
+        const withoutBugs = processAndBroadcastBugReports({
+          reply: rawReply,
+          runId,
+          workflowId: workflow.id,
           node: speaker,
-          history: localHistory,
-          inspectionSnapshot: inspection?.summaryText,
-          delegationPhase: phase,
-          signal: abortController.signal,
-          onChunk: (accumulatedText) => {
-            broadcastEvent(runId, {
-              id: `chunk-${runId}-${speaker.id}-${roundNum}-${innerStep}`,
-              runId,
-              type: 'agent_chunk',
-              round: roundNum,
-              agentId: speaker.id,
-              agentName: speaker.data.label,
-              role: speaker.data.role,
-              provider: speaker.data.provider,
-              model: speaker.data.model,
-              content: accumulatedText,
-              timestamp: new Date().toISOString(),
-            });
-          },
+          roundNum,
         });
-        rawReply = liveResult.text;
-        structuredTools = liveResult.structuredTools;
-        stepUsage = liveResult.tokenUsage;
-      } else {
-        rawReply =
-          isMgr && (runStage === 'test_and_deploy' || allToolCalls.length > 0 || roundNum > 1)
-            ? buildDryRunManagerAuditReply({
-                managerNode: speaker,
-                nodes: ordered,
-                taskPrompt,
-                sandboxFiles: currentSandboxFiles,
-                toolCalls: allToolCalls,
-                openBugs: currentOpenBugs,
-                alreadyDelegatedKeys: delegatedKeys,
-                phase,
-                allowTerminate: roundNum >= 2,
-              })
-            : buildDryRunAgentReply(speaker, taskPrompt, roundNum, maxRounds);
-        stepUsage = estimateTokenUsage(taskPrompt, rawReply);
+
+        const delegationResult = processAndBroadcastManagerDelegations({
+          reply: withoutBugs,
+          runId,
+          managerNode: speaker,
+          nodes: ordered,
+          roundNum,
+          phase,
+        });
+
+        const structuredDelegations = applyStructuredMetaTools({
+          structuredTools,
+          runId,
+          workflowId: workflow.id,
+          node: speaker,
+          nodes: ordered,
+          roundNum,
+          phase,
+        });
+
+        const mergedDelegations = [...delegationResult.delegations, ...structuredDelegations];
+        if (mergedDelegations.length > 0) {
+          allTurnDelegations.push(...mergedDelegations);
+        }
+
+        const stepReply = delegationResult.cleanedReply.trim()
+          ? delegationResult.cleanedReply
+          : structuredTools.length > 0
+            ? `${speaker.data.label} executed ${structuredTools.map((s) => s.name).join(', ')}.`
+            : '';
+        finalReply = finalReply ? `${finalReply}\n\n${stepReply}` : stepReply;
+
+        const settings = getAppSettings();
+        const stepToolCalls = await processAgentTools({
+          runId,
+          workflow,
+          node: speaker,
+          reply: stepReply,
+          structuredTools,
+          roundNum,
+          mode,
+          settings,
+        });
+        turnToolCalls.push(...stepToolCalls);
+
+        const shouldFollowUpReAct =
+          mode === 'live' &&
+          innerStep < maxInnerSteps &&
+          stepToolCalls.some((tc) => tc.tool === 'read_file' || tc.tool === 'exec_bash');
+
+        if (!shouldFollowUpReAct) break;
+
+        localHistory.push({
+          role: speaker.data.label,
+          content: truncateMiddle(stepReply, 450),
+        });
+        localHistory.push({
+          role: 'sandbox',
+          content: stepToolCalls
+            .map(
+              (t) =>
+                `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${compactSandboxOutput(t.result, 320)}`,
+            )
+            .join('\n'),
+        });
       }
-
-      if (abortController.signal.aborted) break;
-
-      totalTurnUsage = {
-        promptTokens: totalTurnUsage.promptTokens + stepUsage.promptTokens,
-        completionTokens: totalTurnUsage.completionTokens + stepUsage.completionTokens,
-        totalTokens: totalTurnUsage.totalTokens + stepUsage.totalTokens,
-        estimated: Boolean(totalTurnUsage.estimated || stepUsage.estimated),
-        ...((totalTurnUsage.savedTokens ?? 0) + (stepUsage.savedTokens ?? 0) > 0
-          ? { savedTokens: (totalTurnUsage.savedTokens ?? 0) + (stepUsage.savedTokens ?? 0) }
-          : {}),
+    } catch (turnErr) {
+      if (abortController.signal.aborted) {
+        throw turnErr;
+      }
+      agentErrorCount += 1;
+      const formatted = formatGeminiApiError(turnErr, getAppSettings().language);
+      const errMsg = formatted.message || (turnErr instanceof Error ? turnErr.message : 'Agent turn failed');
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'agent_error',
+        round: roundNum,
+        agentId: speaker.id,
+        agentName: speaker.data.label,
+        role: speaker.data.role,
+        provider: speaker.data.provider,
+        model: speaker.data.model,
+        errorSource: 'llm',
+        content: errMsg,
+        durationMs: Date.now() - turnStartedAt,
+        timestamp: new Date().toISOString(),
+      });
+      return {
+        reply: `[ERROR from ${speaker.data.label}]: ${errMsg}`,
+        toolCalls: turnToolCalls,
+        hadError: true,
+        agentFailed: true,
+        delegations: allTurnDelegations,
+        delegationCount: allTurnDelegations.length,
       };
-
-      const withoutBugs = processAndBroadcastBugReports({
-        reply: rawReply,
-        runId,
-        workflowId: workflow.id,
-        node: speaker,
-        roundNum,
-      });
-
-      const delegationResult = processAndBroadcastManagerDelegations({
-        reply: withoutBugs,
-        runId,
-        managerNode: speaker,
-        nodes: ordered,
-        roundNum,
-        phase,
-      });
-
-      const structuredDelegations = applyStructuredMetaTools({
-        structuredTools,
-        runId,
-        workflowId: workflow.id,
-        node: speaker,
-        nodes: ordered,
-        roundNum,
-        phase,
-      });
-
-      const mergedDelegations = [...delegationResult.delegations, ...structuredDelegations];
-      if (mergedDelegations.length > 0) {
-        delegatedRole = mergedDelegations[0].targetRole;
-        delegationCount += mergedDelegations.length;
-      }
-
-      const stepReply = delegationResult.cleanedReply.trim()
-        ? delegationResult.cleanedReply
-        : structuredTools.length > 0
-          ? `${speaker.data.label} executed ${structuredTools.map((s) => s.name).join(', ')}.`
-          : '';
-      finalReply = finalReply ? `${finalReply}\n\n${stepReply}` : stepReply;
-
-      const settings = getAppSettings();
-      const stepToolCalls = await processAgentTools({
-        runId,
-        workflow,
-        node: speaker,
-        reply: stepReply,
-        structuredTools,
-        roundNum,
-        mode,
-        settings,
-      });
-      turnToolCalls.push(...stepToolCalls);
-
-      const shouldFollowUpReAct =
-        mode === 'live' &&
-        innerStep < maxInnerSteps &&
-        stepToolCalls.some((tc) => tc.tool === 'read_file' || tc.tool === 'exec_bash');
-
-      if (!shouldFollowUpReAct) break;
-
-      localHistory.push({
-        role: speaker.data.label,
-        content: truncateMiddle(stepReply, 450),
-      });
-      localHistory.push({
-        role: 'sandbox',
-        content: stepToolCalls
-          .map(
-            (t) =>
-              `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${compactSandboxOutput(t.result, 320)}`,
-          )
-          .join('\n'),
-      });
     }
 
     const hadError = turnToolCalls.some((t) => (t.exitCode ?? 0) !== 0);
+    successfulTurns += 1;
 
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
@@ -1968,6 +2096,7 @@ async function executeWorkflowRun(params: {
       role: speaker.data.role,
       provider: speaker.data.provider,
       model: speaker.data.model,
+      ...(activeAssignment && !isMgr ? { replyingToManager: activeAssignment.managerName } : {}),
       content: finalReply,
       durationMs: Date.now() - turnStartedAt,
       tokenUsage: totalTurnUsage,
@@ -1979,8 +2108,8 @@ async function executeWorkflowRun(params: {
       reply: finalReply,
       toolCalls: turnToolCalls,
       hadError,
-      delegatedRole,
-      delegationCount,
+      delegations: allTurnDelegations,
+      delegationCount: allTurnDelegations.length,
     };
   }
 
@@ -1989,7 +2118,31 @@ async function executeWorkflowRun(params: {
       if (abortController.signal.aborted) break;
 
       let speaker: WorkflowNode | null = null;
-      if (forceManagerAudit && managerNode && managerNode.id !== currentNodeId) {
+      let activeAssignment: ActiveManagerAssignment | null = null;
+
+      if (pendingDelegations.length > 0) {
+        const nextDelegation = pendingDelegations.shift()!;
+        const next = selectNextSpeaker({
+          orderedNodes: ordered,
+          edges: workflow.edges,
+          currentNodeId,
+          roundIndex: i,
+          maxRounds,
+          requestedNextAgentId: nextDelegation.targetAgentId,
+          requestedNextRole: nextDelegation.targetRole,
+          lastTurnHadError,
+          lastReply,
+        });
+        speaker = next.node;
+        if (speaker && !isManagerNode(speaker)) {
+          activeAssignment = {
+            managerName: nextDelegation.managerName,
+            issue: nextDelegation.issue,
+            reason: nextDelegation.reason,
+            phase: nextDelegation.phase,
+          };
+        }
+      } else if (forceManagerAudit && managerNode && managerNode.id !== currentNodeId) {
         speaker = managerNode;
         forceManagerAudit = false;
       } else {
@@ -1999,12 +2152,10 @@ async function executeWorkflowRun(params: {
           currentNodeId,
           roundIndex: i,
           maxRounds,
-          requestedNextRole: pendingDelegatedRole,
           lastTurnHadError,
           lastReply,
         });
         speaker = next.node;
-        pendingDelegatedRole = undefined;
       }
 
       if (!speaker) break;
@@ -2017,6 +2168,7 @@ async function executeWorkflowRun(params: {
         speaker,
         roundNum: roundsExecuted,
         historySnapshot: history,
+        activeAssignment,
       });
       if (abortController.signal.aborted) break;
 
@@ -2024,8 +2176,15 @@ async function executeWorkflowRun(params: {
       lastTurnHadError = outcome.hadError;
       lastReply = outcome.reply;
 
-      if (outcome.delegatedRole) {
-        pendingDelegatedRole = outcome.delegatedRole;
+      if (outcome.delegations.length > 0) {
+        for (const d of outcome.delegations) {
+          if (d.targetAgentId !== speaker.id) {
+            pendingDelegations.push({
+              ...d,
+              managerName: speaker.data.label,
+            });
+          }
+        }
         managerReviewedPostTest = false;
       }
 
@@ -2033,7 +2192,9 @@ async function executeWorkflowRun(params: {
       if (
         managerNode &&
         !isMgr &&
-        (lastTurnHadError ||
+        (activeAssignment !== null ||
+          outcome.agentFailed ||
+          lastTurnHadError ||
           speaker.data.role === 'executor' ||
           speaker.data.role === 'security_qa')
       ) {
@@ -2063,7 +2224,7 @@ async function executeWorkflowRun(params: {
       }
 
       // Execute independent DAG sibling branches in parallel wave if eligible
-      if (!forceManagerAudit && !pendingDelegatedRole && i + 1 < maxRounds) {
+      if (!forceManagerAudit && pendingDelegations.length === 0 && i + 1 < maxRounds) {
         const fanoutTargets = computeParallelFanoutTargets({
           orderedNodes: ordered,
           edges: workflow.edges,
@@ -2107,6 +2268,7 @@ async function executeWorkflowRun(params: {
               managerNode &&
               !isManagerNode(branchNode) &&
               (res.hadError ||
+                res.agentFailed ||
                 branchNode.data.role === 'executor' ||
                 branchNode.data.role === 'security_qa')
             ) {
@@ -2169,82 +2331,125 @@ async function executeWorkflowRun(params: {
         toolCalls: allToolCalls,
         openBugs: finalBugs,
       });
-      let rawFinalMgr: string;
-      let finalMgrStructured: StructuredToolInvocation[] = [];
-      let finalMgrUsage: TokenUsage;
-      if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
-        const liveMgr = await generateLiveAgentReply({
-          ai,
-          node: managerNode,
-          history,
-          inspectionSnapshot: finalCtx.summaryText,
-          delegationPhase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
-          signal: abortController.signal,
-          onChunk: (accumulatedText) => {
-            broadcastEvent(runId, {
-              id: `chunk-${runId}-${managerNode.id}-${roundsExecuted}`,
-              runId,
-              type: 'agent_chunk',
-              round: roundsExecuted,
-              agentId: managerNode.id,
-              agentName: managerNode.data.label,
-              role: managerNode.data.role,
-              provider: managerNode.data.provider,
-              model: managerNode.data.model,
-              content: accumulatedText,
-              timestamp: new Date().toISOString(),
-            });
-          },
-        });
-        rawFinalMgr = liveMgr.text;
-        finalMgrStructured = liveMgr.structuredTools;
-        finalMgrUsage = liveMgr.tokenUsage;
-      } else {
-        rawFinalMgr = buildDryRunManagerAuditReply({
+      try {
+        let rawFinalMgr: string;
+        let finalMgrStructured: StructuredToolInvocation[] = [];
+        let finalMgrUsage: TokenUsage;
+        if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
+          const liveMgr = await generateLiveAgentReply({
+            ai,
+            node: managerNode,
+            history,
+            inspectionSnapshot: finalCtx.summaryText,
+            delegationPhase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
+            signal: abortController.signal,
+            onChunk: (accumulatedText) => {
+              broadcastEvent(runId, {
+                id: `chunk-${runId}-${managerNode.id}-${roundsExecuted}`,
+                runId,
+                type: 'agent_chunk',
+                round: roundsExecuted,
+                agentId: managerNode.id,
+                agentName: managerNode.data.label,
+                role: managerNode.data.role,
+                provider: managerNode.data.provider,
+                model: managerNode.data.model,
+                content: accumulatedText,
+                timestamp: new Date().toISOString(),
+              });
+            },
+          });
+          rawFinalMgr = liveMgr.text;
+          finalMgrStructured = liveMgr.structuredTools;
+          finalMgrUsage = liveMgr.tokenUsage;
+        } else {
+          rawFinalMgr = buildDryRunManagerAuditReply({
+            managerNode,
+            nodes: ordered,
+            taskPrompt,
+            sandboxFiles: finalFiles,
+            toolCalls: allToolCalls,
+            openBugs: finalBugs,
+            alreadyDelegatedKeys: delegatedKeys,
+            phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
+            allowTerminate: true,
+          });
+          finalMgrUsage = estimateTokenUsage(finalCtx.summaryText, rawFinalMgr);
+        }
+        const finalMgrClean = processAndBroadcastManagerDelegations({
+          reply: rawFinalMgr,
+          runId,
           managerNode,
           nodes: ordered,
-          taskPrompt,
-          sandboxFiles: finalFiles,
-          toolCalls: allToolCalls,
-          openBugs: finalBugs,
-          alreadyDelegatedKeys: delegatedKeys,
+          roundNum: roundsExecuted,
           phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
-          allowTerminate: true,
+        }).cleanedReply;
+        applyStructuredMetaTools({
+          structuredTools: finalMgrStructured,
+          runId,
+          workflowId: workflow.id,
+          node: managerNode,
+          nodes: ordered,
+          roundNum: roundsExecuted,
+          phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
         });
-        finalMgrUsage = estimateTokenUsage(finalCtx.summaryText, rawFinalMgr);
+        successfulTurns += 1;
+        broadcastEvent(runId, {
+          id: crypto.randomUUID(),
+          runId,
+          type: 'agent_message',
+          round: roundsExecuted,
+          agentId: managerNode.id,
+          agentName: managerNode.data.label,
+          role: managerNode.data.role,
+          provider: managerNode.data.provider,
+          model: managerNode.data.model,
+          content: finalMgrClean,
+          durationMs: Date.now() - mgrStartedAt,
+          tokenUsage: finalMgrUsage,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (mgrErr) {
+        if (abortController.signal.aborted) throw mgrErr;
+        agentErrorCount += 1;
+        const formatted = formatGeminiApiError(mgrErr, getAppSettings().language);
+        const errMsg = formatted.message || (mgrErr instanceof Error ? mgrErr.message : 'Manager audit failed');
+        broadcastEvent(runId, {
+          id: crypto.randomUUID(),
+          runId,
+          type: 'agent_error',
+          round: roundsExecuted,
+          agentId: managerNode.id,
+          agentName: managerNode.data.label,
+          role: managerNode.data.role,
+          provider: managerNode.data.provider,
+          model: managerNode.data.model,
+          errorSource: 'llm',
+          content: errMsg,
+          durationMs: Date.now() - mgrStartedAt,
+          timestamp: new Date().toISOString(),
+        });
       }
-      const finalMgrClean = processAndBroadcastManagerDelegations({
-        reply: rawFinalMgr,
-        runId,
-        managerNode,
-        nodes: ordered,
-        roundNum: roundsExecuted,
-        phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
-      }).cleanedReply;
-      applyStructuredMetaTools({
-        structuredTools: finalMgrStructured,
-        runId,
-        workflowId: workflow.id,
-        node: managerNode,
-        nodes: ordered,
-        roundNum: roundsExecuted,
-        phase: runStage === 'test_and_deploy' ? 'deploy' : 'test',
-      });
+    }
+
+    if (successfulTurns === 0 && agentErrorCount > 0) {
       broadcastEvent(runId, {
         id: crypto.randomUUID(),
         runId,
-        type: 'agent_message',
+        type: 'run_error',
         round: roundsExecuted,
-        agentId: managerNode.id,
-        agentName: managerNode.data.label,
-        role: managerNode.data.role,
-        provider: managerNode.data.provider,
-        model: managerNode.data.model,
-        content: finalMgrClean,
-        durationMs: Date.now() - mgrStartedAt,
-        tokenUsage: finalMgrUsage,
+        content: `Workflow stopped: ${agentErrorCount} agent error(s) prevented any successful turn.`,
         timestamp: new Date().toISOString(),
       });
+      finalizeRunWithReport({
+        runId,
+        workflow,
+        taskPrompt,
+        status: 'failed',
+        roundsExecuted,
+        events: runEventBuffers.get(runId) ?? [],
+      });
+      return;
     }
 
     broadcastEvent(runId, {
@@ -2293,11 +2498,38 @@ async function executeWorkflowRun(params: {
     const settings = getAppSettings();
     const formatted = formatGeminiApiError(err, settings.language);
     const message = formatted.message || (err instanceof Error ? err.message : 'Unexpected execution failure');
+    const failedNode = currentNodeId ? ordered.find((n) => n.id === currentNodeId) : undefined;
+    if (failedNode) {
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'agent_error',
+        round: roundsExecuted,
+        agentId: failedNode.id,
+        agentName: failedNode.data.label,
+        role: failedNode.data.role,
+        provider: failedNode.data.provider,
+        model: failedNode.data.model,
+        errorSource: 'runtime',
+        content: message,
+        timestamp: new Date().toISOString(),
+      });
+    }
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: roundsExecuted,
+      ...(failedNode
+        ? {
+            agentId: failedNode.id,
+            agentName: failedNode.data.label,
+            role: failedNode.data.role,
+            provider: failedNode.data.provider,
+            model: failedNode.data.model,
+            errorSource: 'runtime' as const,
+          }
+        : {}),
       content: `Agent execution error: ${message}`,
       timestamp: new Date().toISOString(),
     });
@@ -3837,19 +4069,21 @@ app.get('/api/runs/:id/report', (req, res) => {
   const fallbackLanguage = getAppSettings().language;
 
   const changeReport =
-    summary.changeReport ??
-    buildRunChangeReport({
-      runId,
-      workflowName: summary.workflowName,
-      taskPrompt: summary.taskPrompt,
-      status: summary.status,
-      roundsExecuted: summary.roundsExecuted,
-      durationMs: summary.durationMs,
-      events,
-      diffs,
-      bugReports,
-      fallbackLanguage,
-    });
+    summary.changeReport && Array.isArray(summary.changeReport.agentReports)
+      ? summary.changeReport
+      : buildRunChangeReport({
+          runId,
+          workflowName: summary.workflowName,
+          taskPrompt: summary.taskPrompt,
+          status: summary.status,
+          roundsExecuted: summary.roundsExecuted,
+          durationMs: summary.durationMs,
+          events,
+          diffs,
+          bugReports,
+          workflowNodes: wf?.nodes ?? [],
+          fallbackLanguage,
+        });
 
   res.json({
     run: summary,
@@ -4261,13 +4495,36 @@ async function executeDirectAgentTurn(params: {
 
   const settingsForDirect = getAppSettings();
   if (mode === 'live' && !canNodeRunLive(targetNode, settingsForDirect)) {
+    const missingMsg =
+      settingsForDirect.language === 'fa'
+        ? `کلید API برای ${targetNode.data.label} (${targetNode.data.provider} · ${targetNode.data.envSecretRef}) تنظیم نشده است. در تنظیمات کلید را اضافه کنید یا به حالت Sandbox Dry-Run بروید.`
+        : `No API key configured for ${targetNode.data.label} (${targetNode.data.provider} · ${targetNode.data.envSecretRef}). Add the API key in Settings or switch to Sandbox Dry-Run.`;
+    broadcastEvent(runId, {
+      id: crypto.randomUUID(),
+      runId,
+      type: 'agent_error',
+      round: roundNum,
+      agentId: targetNode.id,
+      agentName: targetNode.data.label,
+      role: targetNode.data.role,
+      provider: targetNode.data.provider,
+      model: targetNode.data.model,
+      errorSource: 'config',
+      content: missingMsg,
+      timestamp: new Date().toISOString(),
+    });
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: roundNum,
-      content:
-        `No API key configured for ${targetNode.data.label} (${targetNode.data.provider}). Add the API key in Settings or switch to Sandbox Dry-Run.`,
+      agentId: targetNode.id,
+      agentName: targetNode.data.label,
+      role: targetNode.data.role,
+      provider: targetNode.data.provider,
+      model: targetNode.data.model,
+      errorSource: 'config',
+      content: missingMsg,
       timestamp: new Date().toISOString(),
     });
     finalizeRunWithReport({
@@ -4295,6 +4552,7 @@ async function executeDirectAgentTurn(params: {
       history.push({ role: 'user', content: userMessage });
     }
 
+    const managerNode = findManagerNode(workflow.nodes);
     const turnStartedAt = Date.now();
     let rawReply: string;
     let structuredTools: StructuredToolInvocation[] = [];
@@ -4304,6 +4562,7 @@ async function executeDirectAgentTurn(params: {
         ai,
         node: targetNode,
         history,
+        managerName: managerNode?.data.label,
         onChunk: (accumulatedText) => {
           broadcastEvent(runId, {
             id: `chunk-${runId}-${targetNode.id}-${roundNum}`,
@@ -4388,8 +4647,28 @@ async function executeDirectAgentTurn(params: {
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
+      type: 'agent_error',
+      round: roundNum,
+      agentId: targetNode.id,
+      agentName: targetNode.data.label,
+      role: targetNode.data.role,
+      provider: targetNode.data.provider,
+      model: targetNode.data.model,
+      errorSource: 'llm',
+      content: message,
+      timestamp: new Date().toISOString(),
+    });
+    broadcastEvent(runId, {
+      id: crypto.randomUUID(),
+      runId,
       type: 'run_error',
       round: roundNum,
+      agentId: targetNode.id,
+      agentName: targetNode.data.label,
+      role: targetNode.data.role,
+      provider: targetNode.data.provider,
+      model: targetNode.data.model,
+      errorSource: 'llm',
       content: `Agent execution error: ${message}`,
       timestamp: new Date().toISOString(),
     });
@@ -4430,11 +4709,43 @@ async function executeGroupDiscussionRound(params: {
   const ai = mode === 'live' ? getAiClient() : null;
   const groupSettings = getAppSettings();
   if (mode === 'live' && !canWorkflowRunLive(activeSpeakers, groupSettings)) {
+    const missingSpeakers = activeSpeakers.filter((n) => !canNodeRunLive(n, groupSettings));
+    const failedTargets = missingSpeakers.length > 0 ? missingSpeakers : activeSpeakers.slice(0, 1);
+    for (const badNode of failedTargets) {
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'agent_error',
+        round: baseRound,
+        agentId: badNode.id,
+        agentName: badNode.data.label,
+        role: badNode.data.role,
+        provider: badNode.data.provider,
+        model: badNode.data.model,
+        errorSource: 'config',
+        content:
+          groupSettings.language === 'fa'
+            ? `کلید API برای ${badNode.data.label} (${badNode.data.provider} · ${badNode.data.envSecretRef}) تنظیم نشده است.`
+            : `No live API key configured for ${badNode.data.label} (${badNode.data.provider} · ${badNode.data.envSecretRef}).`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    const primaryBad = failedTargets[0];
     broadcastEvent(runId, {
       id: crypto.randomUUID(),
       runId,
       type: 'run_error',
       round: baseRound,
+      ...(primaryBad
+        ? {
+            agentId: primaryBad.id,
+            agentName: primaryBad.data.label,
+            role: primaryBad.data.role,
+            provider: primaryBad.data.provider,
+            model: primaryBad.data.model,
+            errorSource: 'config' as const,
+          }
+        : {}),
       content:
         'No live LLM API key is configured. Add an API key in Settings or switch to Sandbox Dry-Run.',
       timestamp: new Date().toISOString(),
@@ -4452,6 +4763,8 @@ async function executeGroupDiscussionRound(params: {
 
   let currentRound = baseRound;
   const priorSpeakers: string[] = [];
+  let successfulSpeakers = 0;
+  let failedSpeakerErrors = 0;
 
   try {
     const existingEvents = runEventBuffers.get(runId) ?? getRunEvents(runId);
@@ -4470,135 +4783,185 @@ async function executeGroupDiscussionRound(params: {
     const turnToolCalls: ToolCallLog[] = [];
     const managerNode = findManagerNode(activeSpeakers) ?? findManagerNode(workflow.nodes);
     const delegatedKeys = new Set<string>();
+    const pendingAssignmentsByAgentId = new Map<string, ActiveManagerAssignment>();
 
     for (let idx = 0; idx < activeSpeakers.length; idx++) {
       const speaker = activeSpeakers[idx];
       currentRound = baseRound + idx;
       const turnStartedAt = Date.now();
+      const speakerAssignment = !isManagerNode(speaker)
+        ? (pendingAssignmentsByAgentId.get(speaker.id) ?? null)
+        : null;
+      if (speakerAssignment) {
+        pendingAssignmentsByAgentId.delete(speaker.id);
+      }
 
-      let rawReply: string;
-      let structuredTools: StructuredToolInvocation[] = [];
-      let turnTokenUsage: TokenUsage;
-      if (mode === 'live' && canNodeRunLive(speaker, groupSettings)) {
-        const liveRes = await generateLiveAgentReply({
-          ai,
+      try {
+        let rawReply: string;
+        let structuredTools: StructuredToolInvocation[] = [];
+        let turnTokenUsage: TokenUsage;
+        if (mode === 'live' && canNodeRunLive(speaker, groupSettings)) {
+          const liveRes = await generateLiveAgentReply({
+            ai,
+            node: speaker,
+            history,
+            isGroupDiscussion: true,
+            managerName: managerNode?.data.label,
+            activeAssignment: speakerAssignment,
+            teammates: activeSpeakers
+              .filter((n) => n.id !== speaker.id)
+              .map((n) => `${n.data.label} (${n.data.role})`),
+            onChunk: (accumulatedText) => {
+              broadcastEvent(runId, {
+                id: `chunk-${runId}-${speaker.id}-${currentRound}`,
+                runId,
+                type: 'agent_chunk',
+                round: currentRound,
+                agentId: speaker.id,
+                agentName: speaker.data.label,
+                role: speaker.data.role,
+                provider: speaker.data.provider,
+                model: speaker.data.model,
+                content: accumulatedText,
+                timestamp: new Date().toISOString(),
+              });
+            },
+          });
+          rawReply = liveRes.text;
+          structuredTools = liveRes.structuredTools;
+          turnTokenUsage = liveRes.tokenUsage;
+        } else {
+          rawReply = buildDryRunGroupDiscussionReply({
+            node: speaker,
+            userMessage,
+            priorSpeakers,
+            activeAssignment: speakerAssignment,
+          });
+          turnTokenUsage = estimateTokenUsage(userMessage, rawReply);
+        }
+
+        const withoutBugs = processAndBroadcastBugReports({
+          reply: rawReply,
+          runId,
+          workflowId: workflow.id,
           node: speaker,
-          history,
-          isGroupDiscussion: true,
-          teammates: activeSpeakers
-            .filter((n) => n.id !== speaker.id)
-            .map((n) => `${n.data.label} (${n.data.role})`),
-          onChunk: (accumulatedText) => {
-            broadcastEvent(runId, {
-              id: `chunk-${runId}-${speaker.id}-${currentRound}`,
+          roundNum: currentRound,
+        });
+
+        const textDelegations = isManagerNode(speaker)
+          ? processAndBroadcastManagerDelegations({
+              reply: withoutBugs,
               runId,
-              type: 'agent_chunk',
-              round: currentRound,
-              agentId: speaker.id,
-              agentName: speaker.data.label,
-              role: speaker.data.role,
-              provider: speaker.data.provider,
-              model: speaker.data.model,
-              content: accumulatedText,
-              timestamp: new Date().toISOString(),
-            });
-          },
-        });
-        rawReply = liveRes.text;
-        structuredTools = liveRes.structuredTools;
-        turnTokenUsage = liveRes.tokenUsage;
-      } else {
-        rawReply = buildDryRunGroupDiscussionReply({
+              managerNode: speaker,
+              nodes: workflow.nodes,
+              roundNum: currentRound,
+              phase: 'review',
+            })
+          : { cleanedReply: withoutBugs, delegations: [] };
+
+        const reply = textDelegations.cleanedReply;
+
+        const structuredDelegations = applyStructuredMetaTools({
+          structuredTools,
+          runId,
+          workflowId: workflow.id,
           node: speaker,
-          userMessage,
-          priorSpeakers,
+          nodes: workflow.nodes,
+          roundNum: currentRound,
+          phase: 'review',
         });
-        turnTokenUsage = estimateTokenUsage(userMessage, rawReply);
-      }
 
-      const withoutBugs = processAndBroadcastBugReports({
-        reply: rawReply,
-        runId,
-        workflowId: workflow.id,
-        node: speaker,
-        roundNum: currentRound,
-      });
+        for (const d of [...textDelegations.delegations, ...structuredDelegations]) {
+          if (d.targetAgentId !== speaker.id) {
+            pendingAssignmentsByAgentId.set(d.targetAgentId, {
+              managerName: speaker.data.label,
+              issue: d.issue,
+              reason: d.reason,
+              phase: d.phase,
+            });
+          }
+        }
 
-      const reply = isManagerNode(speaker)
-        ? processAndBroadcastManagerDelegations({
-            reply: withoutBugs,
-            runId,
-            managerNode: speaker,
-            nodes: workflow.nodes,
-            roundNum: currentRound,
-            phase: 'review',
-          }).cleanedReply
-        : withoutBugs;
+        const settings = getAppSettings();
+        const toolCalls = await processAgentTools({
+          runId,
+          workflow,
+          node: speaker,
+          reply,
+          structuredTools,
+          roundNum: currentRound,
+          mode,
+          settings,
+        });
+        turnToolCalls.push(...toolCalls);
 
-      applyStructuredMetaTools({
-        structuredTools,
-        runId,
-        workflowId: workflow.id,
-        node: speaker,
-        nodes: workflow.nodes,
-        roundNum: currentRound,
-        phase: 'review',
-      });
+        successfulSpeakers += 1;
+        priorSpeakers.push(speaker.data.label);
+        history.push({ role: speaker.data.label, content: reply });
+        if (toolCalls.length > 0) {
+          history.push({
+            role: 'sandbox',
+            content: toolCalls
+              .map((t) => `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${t.result}`)
+              .join('\n'),
+          });
+        }
 
-      const settings = getAppSettings();
-      const toolCalls = await processAgentTools({
-        runId,
-        workflow,
-        node: speaker,
-        reply,
-        structuredTools,
-        roundNum: currentRound,
-        mode,
-        settings,
-      });
-      turnToolCalls.push(...toolCalls);
+        broadcastEvent(runId, {
+          id: crypto.randomUUID(),
+          runId,
+          type: 'agent_message',
+          round: currentRound,
+          agentId: speaker.id,
+          agentName: speaker.data.label,
+          role: speaker.data.role,
+          provider: speaker.data.provider,
+          model: speaker.data.model,
+          ...(speakerAssignment ? { replyingToManager: speakerAssignment.managerName } : {}),
+          content: reply,
+          durationMs: Date.now() - turnStartedAt,
+          tokenUsage: turnTokenUsage,
+          toolCalls,
+          timestamp: new Date().toISOString(),
+        });
 
-      priorSpeakers.push(speaker.data.label);
-      history.push({ role: speaker.data.label, content: reply });
-      if (toolCalls.length > 0) {
+        updateRunRecord({
+          id: runId,
+          status: 'running',
+          roundsExecuted: currentRound,
+          events: runEventBuffers.get(runId) ?? [],
+        });
+
+        if (mode === 'dry_run') {
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      } catch (speakerErr) {
+        failedSpeakerErrors += 1;
+        const formatted = formatGeminiApiError(speakerErr, getAppSettings().language);
+        const errMsg = formatted.message || (speakerErr instanceof Error ? speakerErr.message : 'Agent turn failed');
+        broadcastEvent(runId, {
+          id: crypto.randomUUID(),
+          runId,
+          type: 'agent_error',
+          round: currentRound,
+          agentId: speaker.id,
+          agentName: speaker.data.label,
+          role: speaker.data.role,
+          provider: speaker.data.provider,
+          model: speaker.data.model,
+          errorSource: 'llm',
+          content: errMsg,
+          durationMs: Date.now() - turnStartedAt,
+          timestamp: new Date().toISOString(),
+        });
         history.push({
-          role: 'sandbox',
-          content: toolCalls
-            .map((t) => `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${t.result}`)
-            .join('\n'),
+          role: 'system',
+          content: `[Notice] ${speaker.data.label} encountered an error and could not reply this turn: ${errMsg}`,
         });
-      }
-
-      broadcastEvent(runId, {
-        id: crypto.randomUUID(),
-        runId,
-        type: 'agent_message',
-        round: currentRound,
-        agentId: speaker.id,
-        agentName: speaker.data.label,
-        role: speaker.data.role,
-        provider: speaker.data.provider,
-        model: speaker.data.model,
-        content: reply,
-        durationMs: Date.now() - turnStartedAt,
-        tokenUsage: turnTokenUsage,
-        toolCalls,
-        timestamp: new Date().toISOString(),
-      });
-
-      updateRunRecord({
-        id: runId,
-        status: 'running',
-        roundsExecuted: currentRound,
-        events: runEventBuffers.get(runId) ?? [],
-      });
-
-      if (mode === 'dry_run') {
-        await new Promise((r) => setTimeout(r, 180));
       }
     }
 
-    // Automatic Manager Team Audit & Domain Delegation after specialists respond
+    // Automatic Manager Team Audit, Closed-Loop Specialist Replies, & Manager Confirmation
     if (managerNode) {
       const runBugs = listBugReports({ runId });
       const ctx = buildManagerInspectionContext({
@@ -4606,91 +4969,359 @@ async function executeGroupDiscussionRound(params: {
         toolCalls: turnToolCalls,
         openBugs: runBugs,
       });
-      if (ctx.hasIssues || turnToolCalls.length > 0 || runBugs.length > 0) {
+      if (ctx.hasIssues || turnToolCalls.length > 0 || runBugs.length > 0 || failedSpeakerErrors > 0) {
         currentRound += 1;
         const mgrStartedAt = Date.now();
-        let rawAudit: string;
-        let auditStructured: StructuredToolInvocation[] = [];
-        let auditTokenUsage: TokenUsage;
-        if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
-          const liveAudit = await generateLiveAgentReply({
-            ai,
-            node: managerNode,
-            history,
-            isGroupDiscussion: true,
-            inspectionSnapshot: ctx.summaryText,
-            delegationPhase: 'review',
-            teammates: activeSpeakers
-              .filter((n) => n.id !== managerNode.id)
-              .map((n) => `${n.data.label} (${n.data.role})`),
-            onChunk: (accumulatedText) => {
-              broadcastEvent(runId, {
-                id: `chunk-${runId}-${managerNode.id}-${currentRound}`,
-                runId,
-                type: 'agent_chunk',
-                round: currentRound,
-                agentId: managerNode.id,
-                agentName: managerNode.data.label,
-                role: managerNode.data.role,
-                provider: managerNode.data.provider,
-                model: managerNode.data.model,
-                content: accumulatedText,
-                timestamp: new Date().toISOString(),
-              });
-            },
-          });
-          rawAudit = liveAudit.text;
-          auditStructured = liveAudit.structuredTools;
-          auditTokenUsage = liveAudit.tokenUsage;
-        } else {
-          rawAudit = buildDryRunManagerAuditReply({
+        let auditDelegations: RecordedDelegationItem[] = [];
+        try {
+          let rawAudit: string;
+          let auditStructured: StructuredToolInvocation[] = [];
+          let auditTokenUsage: TokenUsage;
+          if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
+            const liveAudit = await generateLiveAgentReply({
+              ai,
+              node: managerNode,
+              history,
+              isGroupDiscussion: true,
+              inspectionSnapshot: ctx.summaryText,
+              delegationPhase: 'review',
+              teammates: activeSpeakers
+                .filter((n) => n.id !== managerNode.id)
+                .map((n) => `${n.data.label} (${n.data.role})`),
+              onChunk: (accumulatedText) => {
+                broadcastEvent(runId, {
+                  id: `chunk-${runId}-${managerNode.id}-${currentRound}`,
+                  runId,
+                  type: 'agent_chunk',
+                  round: currentRound,
+                  agentId: managerNode.id,
+                  agentName: managerNode.data.label,
+                  role: managerNode.data.role,
+                  provider: managerNode.data.provider,
+                  model: managerNode.data.model,
+                  content: accumulatedText,
+                  timestamp: new Date().toISOString(),
+                });
+              },
+            });
+            rawAudit = liveAudit.text;
+            auditStructured = liveAudit.structuredTools;
+            auditTokenUsage = liveAudit.tokenUsage;
+          } else {
+            rawAudit = buildDryRunManagerAuditReply({
+              managerNode,
+              nodes: workflow.nodes,
+              taskPrompt: userMessage,
+              sandboxFiles: listSandboxFiles(runId),
+              toolCalls: turnToolCalls,
+              openBugs: runBugs,
+              alreadyDelegatedKeys: delegatedKeys,
+              phase: 'review',
+              allowTerminate: false,
+            });
+            auditTokenUsage = estimateTokenUsage(ctx.summaryText, rawAudit);
+          }
+
+          const auditTextResult = processAndBroadcastManagerDelegations({
+            reply: rawAudit,
+            runId,
             managerNode,
             nodes: workflow.nodes,
-            taskPrompt: userMessage,
-            sandboxFiles: listSandboxFiles(runId),
-            toolCalls: turnToolCalls,
-            openBugs: runBugs,
-            alreadyDelegatedKeys: delegatedKeys,
+            roundNum: currentRound,
             phase: 'review',
-            allowTerminate: false,
           });
-          auditTokenUsage = estimateTokenUsage(ctx.summaryText, rawAudit);
+          const auditStructuredResult = applyStructuredMetaTools({
+            structuredTools: auditStructured,
+            runId,
+            workflowId: workflow.id,
+            node: managerNode,
+            nodes: workflow.nodes,
+            roundNum: currentRound,
+            phase: 'review',
+          });
+          auditDelegations = [...auditTextResult.delegations, ...auditStructuredResult];
+          successfulSpeakers += 1;
+          history.push({ role: managerNode.data.label, content: auditTextResult.cleanedReply });
+
+          broadcastEvent(runId, {
+            id: crypto.randomUUID(),
+            runId,
+            type: 'agent_message',
+            round: currentRound,
+            agentId: managerNode.id,
+            agentName: managerNode.data.label,
+            role: managerNode.data.role,
+            provider: managerNode.data.provider,
+            model: managerNode.data.model,
+            content: auditTextResult.cleanedReply,
+            durationMs: Date.now() - mgrStartedAt,
+            tokenUsage: auditTokenUsage,
+            timestamp: new Date().toISOString(),
+          });
+        } catch (mgrAuditErr) {
+          failedSpeakerErrors += 1;
+          const formatted = formatGeminiApiError(mgrAuditErr, getAppSettings().language);
+          const errMsg = formatted.message || (mgrAuditErr instanceof Error ? mgrAuditErr.message : 'Manager audit failed');
+          broadcastEvent(runId, {
+            id: crypto.randomUUID(),
+            runId,
+            type: 'agent_error',
+            round: currentRound,
+            agentId: managerNode.id,
+            agentName: managerNode.data.label,
+            role: managerNode.data.role,
+            provider: managerNode.data.provider,
+            model: managerNode.data.model,
+            errorSource: 'llm',
+            content: errMsg,
+            durationMs: Date.now() - mgrStartedAt,
+            timestamp: new Date().toISOString(),
+          });
         }
 
-        const auditCleaned = processAndBroadcastManagerDelegations({
-          reply: rawAudit,
-          runId,
-          managerNode,
-          nodes: workflow.nodes,
-          roundNum: currentRound,
-          phase: 'review',
-        }).cleanedReply;
-        applyStructuredMetaTools({
-          structuredTools: auditStructured,
-          runId,
-          workflowId: workflow.id,
-          node: managerNode,
-          nodes: workflow.nodes,
-          roundNum: currentRound,
-          phase: 'review',
-        });
+        // Closed-loop specialist response turns: every delegated specialist replies directly to Manager!
+        const respondedSpecialists: string[] = [];
+        const uniqueDelegations: RecordedDelegationItem[] = [];
+        const seenTargetIds = new Set<string>();
+        for (const d of auditDelegations) {
+          if (d.targetAgentId !== managerNode.id && !seenTargetIds.has(d.targetAgentId)) {
+            seenTargetIds.add(d.targetAgentId);
+            uniqueDelegations.push(d);
+          }
+          if (uniqueDelegations.length >= 2) break;
+        }
 
-        broadcastEvent(runId, {
-          id: crypto.randomUUID(),
-          runId,
-          type: 'agent_message',
-          round: currentRound,
-          agentId: managerNode.id,
-          agentName: managerNode.data.label,
-          role: managerNode.data.role,
-          provider: managerNode.data.provider,
-          model: managerNode.data.model,
-          content: auditCleaned,
-          durationMs: Date.now() - mgrStartedAt,
-          tokenUsage: auditTokenUsage,
-          timestamp: new Date().toISOString(),
-        });
+        for (const delegation of uniqueDelegations) {
+          const targetNode = workflow.nodes.find((n) => n.id === delegation.targetAgentId);
+          if (!targetNode) continue;
+          currentRound += 1;
+          const followStartedAt = Date.now();
+          const assignment: ActiveManagerAssignment = {
+            managerName: managerNode.data.label,
+            issue: delegation.issue,
+            reason: delegation.reason,
+            phase: delegation.phase,
+          };
+
+          try {
+            let rawFollow: string;
+            let followStructured: StructuredToolInvocation[] = [];
+            let followUsage: TokenUsage;
+            if (mode === 'live' && canNodeRunLive(targetNode, getAppSettings())) {
+              const liveFollow = await generateLiveAgentReply({
+                ai,
+                node: targetNode,
+                history,
+                isGroupDiscussion: true,
+                managerName: managerNode.data.label,
+                activeAssignment: assignment,
+                teammates: activeSpeakers
+                  .filter((n) => n.id !== targetNode.id)
+                  .map((n) => `${n.data.label} (${n.data.role})`),
+                onChunk: (accumulatedText) => {
+                  broadcastEvent(runId, {
+                    id: `chunk-${runId}-${targetNode.id}-${currentRound}`,
+                    runId,
+                    type: 'agent_chunk',
+                    round: currentRound,
+                    agentId: targetNode.id,
+                    agentName: targetNode.data.label,
+                    role: targetNode.data.role,
+                    provider: targetNode.data.provider,
+                    model: targetNode.data.model,
+                    content: accumulatedText,
+                    timestamp: new Date().toISOString(),
+                  });
+                },
+              });
+              rawFollow = liveFollow.text;
+              followStructured = liveFollow.structuredTools;
+              followUsage = liveFollow.tokenUsage;
+            } else {
+              rawFollow = buildDryRunGroupDiscussionReply({
+                node: targetNode,
+                userMessage,
+                priorSpeakers: [...priorSpeakers, managerNode.data.label],
+                activeAssignment: assignment,
+              });
+              followUsage = estimateTokenUsage(delegation.issue, rawFollow);
+            }
+
+            const followReply = processAndBroadcastBugReports({
+              reply: rawFollow,
+              runId,
+              workflowId: workflow.id,
+              node: targetNode,
+              roundNum: currentRound,
+            });
+            applyStructuredMetaTools({
+              structuredTools: followStructured,
+              runId,
+              workflowId: workflow.id,
+              node: targetNode,
+              nodes: workflow.nodes,
+              roundNum: currentRound,
+              phase: delegation.phase,
+            });
+
+            const followToolCalls = await processAgentTools({
+              runId,
+              workflow,
+              node: targetNode,
+              reply: followReply,
+              structuredTools: followStructured,
+              roundNum: currentRound,
+              mode,
+              settings: getAppSettings(),
+            });
+            turnToolCalls.push(...followToolCalls);
+
+            respondedSpecialists.push(targetNode.data.label);
+            successfulSpeakers += 1;
+            history.push({ role: targetNode.data.label, content: followReply });
+            if (followToolCalls.length > 0) {
+              history.push({
+                role: 'sandbox',
+                content: followToolCalls
+                  .map((t) => `${t.tool}(${t.target}) [exit=${t.exitCode ?? 0}]: ${t.result}`)
+                  .join('\n'),
+              });
+            }
+
+            broadcastEvent(runId, {
+              id: crypto.randomUUID(),
+              runId,
+              type: 'agent_message',
+              round: currentRound,
+              agentId: targetNode.id,
+              agentName: targetNode.data.label,
+              role: targetNode.data.role,
+              provider: targetNode.data.provider,
+              model: targetNode.data.model,
+              replyingToManager: managerNode.data.label,
+              content: followReply,
+              durationMs: Date.now() - followStartedAt,
+              tokenUsage: followUsage,
+              toolCalls: followToolCalls,
+              timestamp: new Date().toISOString(),
+            });
+
+            if (mode === 'dry_run') {
+              await new Promise((r) => setTimeout(r, 120));
+            }
+          } catch (followErr) {
+            failedSpeakerErrors += 1;
+            const formatted = formatGeminiApiError(followErr, getAppSettings().language);
+            const errMsg = formatted.message || (followErr instanceof Error ? followErr.message : 'Specialist follow-up failed');
+            broadcastEvent(runId, {
+              id: crypto.randomUUID(),
+              runId,
+              type: 'agent_error',
+              round: currentRound,
+              agentId: targetNode.id,
+              agentName: targetNode.data.label,
+              role: targetNode.data.role,
+              provider: targetNode.data.provider,
+              model: targetNode.data.model,
+              errorSource: 'llm',
+              content: errMsg,
+              durationMs: Date.now() - followStartedAt,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+
+        // Manager acknowledges the specialist(s)' reply to close the conversational loop cleanly
+        if (respondedSpecialists.length > 0) {
+          currentRound += 1;
+          const confirmStartedAt = Date.now();
+          try {
+            let confirmReply: string;
+            let confirmUsage: TokenUsage;
+            if (mode === 'live' && canNodeRunLive(managerNode, getAppSettings())) {
+              const liveConfirm = await generateLiveAgentReply({
+                ai,
+                node: managerNode,
+                history: [
+                  ...history,
+                  {
+                    role: 'system',
+                    content: `Specialists (${respondedSpecialists.join(', ')}) have replied directly to your delegation. Acknowledge their response briefly in the user's language, confirm whether the fix is satisfactory, and summarize next steps without repeating long code.`,
+                  },
+                ],
+                isGroupDiscussion: true,
+                delegationPhase: 'review',
+                teammates: activeSpeakers
+                  .filter((n) => n.id !== managerNode.id)
+                  .map((n) => `${n.data.label} (${n.data.role})`),
+              });
+              confirmReply = liveConfirm.text;
+              confirmUsage = liveConfirm.tokenUsage;
+            } else {
+              confirmReply = buildDryRunManagerFollowupReply({
+                managerNode,
+                userMessage,
+                respondedSpecialists,
+              });
+              confirmUsage = estimateTokenUsage(userMessage, confirmReply);
+            }
+
+            broadcastEvent(runId, {
+              id: crypto.randomUUID(),
+              runId,
+              type: 'agent_message',
+              round: currentRound,
+              agentId: managerNode.id,
+              agentName: managerNode.data.label,
+              role: managerNode.data.role,
+              provider: managerNode.data.provider,
+              model: managerNode.data.model,
+              content: confirmReply,
+              durationMs: Date.now() - confirmStartedAt,
+              tokenUsage: confirmUsage,
+              timestamp: new Date().toISOString(),
+            });
+          } catch (confirmErr) {
+            const formatted = formatGeminiApiError(confirmErr, getAppSettings().language);
+            const errMsg = formatted.message || (confirmErr instanceof Error ? confirmErr.message : 'Manager confirmation failed');
+            broadcastEvent(runId, {
+              id: crypto.randomUUID(),
+              runId,
+              type: 'agent_error',
+              round: currentRound,
+              agentId: managerNode.id,
+              agentName: managerNode.data.label,
+              role: managerNode.data.role,
+              provider: managerNode.data.provider,
+              model: managerNode.data.model,
+              errorSource: 'llm',
+              content: errMsg,
+              durationMs: Date.now() - confirmStartedAt,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
       }
+    }
+
+    if (successfulSpeakers === 0 && failedSpeakerErrors > 0) {
+      broadcastEvent(runId, {
+        id: crypto.randomUUID(),
+        runId,
+        type: 'run_error',
+        round: currentRound,
+        content: `Group chat failed: ${failedSpeakerErrors} agent error(s) occurred with no successful replies.`,
+        timestamp: new Date().toISOString(),
+      });
+      finalizeRunWithReport({
+        runId,
+        workflow,
+        taskPrompt: userMessage,
+        status: 'failed',
+        roundsExecuted: currentRound,
+        events: runEventBuffers.get(runId) ?? [],
+      });
+      return;
     }
 
     broadcastEvent(runId, {
@@ -4698,7 +5329,7 @@ async function executeGroupDiscussionRound(params: {
       runId,
       type: 'run_completed',
       round: currentRound,
-      content: `Team discussion turn completed (${activeSpeakers.length} specialists replied). You can continue replying below.`,
+      content: `Team discussion turn completed (${successfulSpeakers} agent turns completed). You can continue replying below.`,
       timestamp: new Date().toISOString(),
     });
 

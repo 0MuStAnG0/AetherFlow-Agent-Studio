@@ -124,3 +124,46 @@ test('buildCompactSystemPrompt omits prose tool syntax when native tools active 
   assert.ok(fallbackCompact.systemPrompt.includes('BUG_REPORT:'));
   assert.ok(compactPromptText(fallbackCompact.systemPrompt).length > 40);
 });
+
+test('compactConversationHistory preserves latest Manager directive when Manager turn falls out of recent window', () => {
+  const history = [
+    { role: 'user', content: 'Build payment webhook verification.' },
+    { role: 'Manager Lead', content: 'Directive: Use HMAC-SHA256 with raw body buffer and return 401 on mismatch.' },
+    { role: 'Backend', content: 'Drafted initial route.' },
+    { role: 'Frontend', content: 'Added webhook settings UI.' },
+    { role: 'QA', content: 'Checking signature replay window.' },
+    { role: 'Executor', content: 'Ran integration tests.' },
+    { role: 'Security', content: 'Verified constant-time comparison.' },
+    { role: 'user', content: 'Please finalize the fix.' },
+  ];
+
+  const ultra = compactConversationHistory(history, { mode: 'ultra_compact' });
+  const contextEntry = ultra.messages.find((m) => m.role === 'context');
+  assert.ok(contextEntry, 'Expected omitted context marker');
+  assert.ok(
+    contextEntry!.content.includes('HMAC-SHA256'),
+    `Expected Manager directive carryover in context marker, got: ${contextEntry!.content}`,
+  );
+});
+
+test('buildCompactSystemPrompt injects activeManagerAssignment and human-like Manager reply guidance', () => {
+  const backend = makeAgentNode({ label: 'Backend Engineer', role: 'backend' });
+  const built = buildCompactSystemPrompt({
+    node: backend,
+    mode: 'ultra_compact',
+    nativeToolsEnabled: true,
+    isManager: false,
+    managerName: 'مدیر فنی پروژه',
+    activeAssignment: {
+      managerName: 'مدیر فنی پروژه',
+      issue: 'Validate refresh token signature expiry',
+      reason: 'Unit test failed with 500 on expired token',
+      phase: 'test',
+    },
+  });
+
+  assert.ok(built.systemPrompt.includes('مدیر فنی پروژه'));
+  assert.ok(built.systemPrompt.includes('Validate refresh token signature expiry'));
+  assert.ok(built.systemPrompt.includes('Unit test failed with 500 on expired token'));
+});
+

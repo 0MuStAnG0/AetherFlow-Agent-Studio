@@ -199,3 +199,124 @@ test('buildRunChangeReport produces English report when chat was in English', ()
   assert.ok(report.summaryText.includes('Complete Applied Changes Report'));
   assert.ok(report.summaryText.includes('[MODIFIED] README.md'));
 });
+
+test('buildRunChangeReport builds per-agent work reports with delegations, manager replies, and agent errors', () => {
+  const events: ExecutionEvent[] = [
+    {
+      id: 'u1',
+      runId: 'run-team-fa',
+      type: 'user_message',
+      round: 1,
+      content: 'سرویس پرداخت را پیاده‌سازی و بررسی کن',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'm1',
+      runId: 'run-team-fa',
+      type: 'agent_message',
+      round: 1,
+      agentId: 'node-mgr',
+      agentName: 'مدیر فنی',
+      role: 'manager',
+      provider: 'gemini',
+      model: 'gemini-2.5-flash',
+      durationMs: 650,
+      content: 'معماری سرویس پرداخت مشخص شد و وظیفه به بک‌اند ارجاع داده شد.',
+      timestamp: '2026-01-01T00:00:01.000Z',
+    },
+    {
+      id: 'del-1',
+      runId: 'run-team-fa',
+      type: 'manager_delegation',
+      round: 1,
+      agentId: 'node-mgr',
+      agentName: 'مدیر فنی',
+      role: 'manager',
+      delegation: {
+        id: 'dlg-1',
+        managerId: 'node-mgr',
+        managerName: 'مدیر فنی',
+        targetAgentId: 'node-be',
+        targetAgentName: 'Backend Engineer',
+        targetRole: 'backend',
+        issue: 'اعتبارسنجی امضای وب‌هوک پرداخت',
+        reason: 'نیاز به بررسی امضای HMAC در سرور',
+        phase: 'review',
+        timestamp: '2026-01-01T00:00:02.000Z',
+      },
+      content: 'Manager delegated to Backend Engineer',
+      timestamp: '2026-01-01T00:00:02.000Z',
+    },
+    {
+      id: 'be1',
+      runId: 'run-team-fa',
+      type: 'agent_message',
+      round: 2,
+      agentId: 'node-be',
+      agentName: 'Backend Engineer',
+      role: 'backend',
+      provider: 'openai',
+      model: 'gpt-4o',
+      durationMs: 1200,
+      replyingToManager: 'مدیر فنی',
+      content: '@مدیر فنی اعتبارسنجی HMAC پیاده‌سازی شد و تست واحد پاس شد.',
+      toolCalls: [
+        { id: 'tc-1', tool: 'write_file', target: 'server/payment.ts', result: 'Wrote 400 bytes', exitCode: 0 },
+      ],
+      timestamp: '2026-01-01T00:00:04.000Z',
+    },
+    {
+      id: 'err-1',
+      runId: 'run-team-fa',
+      type: 'agent_error',
+      round: 2,
+      agentId: 'node-qa',
+      agentName: 'Security QA',
+      role: 'security_qa',
+      provider: 'anthropic',
+      model: 'claude-3-7-sonnet-latest',
+      errorSource: 'config',
+      content: 'Missing ANTHROPIC_API_KEY in Provider Vault',
+      timestamp: '2026-01-01T00:00:05.000Z',
+    },
+  ];
+
+  const report = buildRunChangeReport({
+    runId: 'run-team-fa',
+    workflowName: 'Payment Pipeline',
+    taskPrompt: 'سرویس پرداخت را پیاده‌سازی و بررسی کن',
+    status: 'completed',
+    roundsExecuted: 2,
+    durationMs: 5000,
+    events,
+    diffs: [],
+    fallbackLanguage: 'en',
+  });
+
+  assert.equal(report.language, 'fa');
+  assert.equal(report.stats.totalErrors, 1);
+  assert.ok(Array.isArray(report.agentReports));
+  assert.equal(report.agentReports!.length, 3);
+
+  const mgrReport = report.agentReports!.find((r) => r.agentId === 'node-mgr');
+  assert.ok(mgrReport);
+  assert.equal(mgrReport!.delegationsIssued, 1);
+  assert.equal(mgrReport!.status, 'completed');
+
+  const beReport = report.agentReports!.find((r) => r.agentId === 'node-be');
+  assert.ok(beReport);
+  assert.equal(beReport!.delegationsReceived, 1);
+  assert.equal(beReport!.repliedToManager, true);
+  assert.deepEqual(beReport!.filesModified, ['server/payment.ts']);
+  assert.equal(beReport!.status, 'completed');
+  assert.ok(beReport!.workSummary.includes('پاسخ‌گویی مستقیم به مدیر'));
+
+  const qaReport = report.agentReports!.find((r) => r.agentId === 'node-qa');
+  assert.ok(qaReport);
+  assert.equal(qaReport!.status, 'error');
+  assert.equal(qaReport!.errors.length, 1);
+  assert.ok(qaReport!.errors[0].includes('ANTHROPIC_API_KEY'));
+  assert.ok(report.summaryText.includes('گزارش کار هر ایجنت'));
+  assert.ok(report.summaryText.includes('Security QA'));
+});
+
